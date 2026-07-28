@@ -122,3 +122,80 @@ func TestGroupResolvingLocked(t *testing.T) {
 		t.Fatal("group 8 falsely reported resolving")
 	}
 }
+
+// TestPickRotationGroupLocked_TiedGroupsRotateFairly pins down the
+// 2026-07-28 stuck-first-quote bug: groupStalenessLocked returns the zero
+// time.Time for any group with no active leg yet, so a large batch of
+// never-quoted groups (the normal state right after startup, or any time no
+// ticks are flowing, e.g. outside RTH) all tie at the same score. The old
+// picker always started scanning at index 0 and never replaced a tie
+// (score.Before is strict), so group 0 won every single tick forever and no
+// other group ever got its first resolution attempt. The fix must cycle
+// through tied groups instead of freezing on the first one.
+func TestPickRotationGroupLocked_TiedGroupsRotateFairly(t *testing.T) {
+	s := newRotationTestSession(nil)
+	s.optChain.rotation = []optResGroup{
+		{groupID: 0, symbol: "AAA"},
+		{groupID: 1, symbol: "BBB"},
+		{groupID: 2, symbol: "CCC"},
+	}
+	// No active legs and no book entries for any of them — every group's
+	// groupStalenessLocked score is the tied zero value.
+
+	seen := map[string]int{}
+	for i := 0; i < 6; i++ {
+		s.optChain.mu.Lock()
+		g, ok := s.pickRotationGroupLocked()
+		s.optChain.mu.Unlock()
+		if !ok {
+			t.Fatalf("pick %d: expected a group, got none", i)
+		}
+		seen[g.symbol]++
+	}
+
+	for _, sym := range []string{"AAA", "BBB", "CCC"} {
+		if seen[sym] != 2 {
+			t.Errorf("symbol %s picked %d times over 6 ticks, want 2 (fair rotation through 3 tied groups)", sym, seen[sym])
+		}
+	}
+}
+
+// TestPickRotationGroupLocked_SkipsResolvingGroups verifies a group with an
+// in-flight conId/chain/delta resolution is never returned, even when it
+// would otherwise tie for staleness.
+func TestPickRotationGroupLocked_SkipsResolvingGroups(t *testing.T) {
+	s := newRotationTestSession(nil)
+	s.optChain.rotation = []optResGroup{
+		{groupID: 0, symbol: "AAA"},
+		{groupID: 1, symbol: "BBB"},
+	}
+	s.optChain.conIDReqs[500] = &optConIDReq{groupID: 0}
+
+	for i := 0; i < 4; i++ {
+		s.optChain.mu.Lock()
+		g, ok := s.pickRotationGroupLocked()
+		s.optChain.mu.Unlock()
+		if !ok {
+			t.Fatalf("pick %d: expected BBB, got none", i)
+		}
+		if g.symbol != "BBB" {
+			t.Fatalf("pick %d: got %s, want BBB — AAA is still resolving", i, g.symbol)
+		}
+	}
+}
+
+// TestPickRotationGroupLocked_EmptyWhenAllResolving verifies the picker
+// returns ok=false (rather than forcing a still-resolving group through,
+// as the old !found fallback did) when nothing is eligible.
+func TestPickRotationGroupLocked_EmptyWhenAllResolving(t *testing.T) {
+	s := newRotationTestSession(nil)
+	s.optChain.rotation = []optResGroup{{groupID: 0, symbol: "AAA"}}
+	s.optChain.conIDReqs[500] = &optConIDReq{groupID: 0}
+
+	s.optChain.mu.Lock()
+	_, ok := s.pickRotationGroupLocked()
+	s.optChain.mu.Unlock()
+	if ok {
+		t.Fatal("expected no group when the only group is still resolving")
+	}
+}

@@ -54,6 +54,7 @@ type optConIDReq struct {
 	targetDeltaCall float64
 	targetDeltaPut  float64
 	busIdxs         []int
+	requestedAt     time.Time
 }
 
 // optChainReq tracks one pending reqSecDefOptParams call. IBKR may send
@@ -68,6 +69,7 @@ type optChainReq struct {
 	busIdxs         []int
 	expirations     []string
 	strikes         []float64
+	requestedAt     time.Time
 }
 
 // optMktReq maps one option market data reqID → contract details + live prices.
@@ -359,6 +361,7 @@ func (s *Session) resolveOptionGroup(g optResGroup) {
 		groupID: g.groupID, symbol: g.symbol, currency: g.currency,
 		optionDelay: g.optionDelay, targetDeltaCall: g.targetDeltaCall,
 		targetDeltaPut: g.targetDeltaPut, busIdxs: g.busIdxs,
+		requestedAt: time.Now(),
 	}
 	s.optChain.mu.Unlock()
 
@@ -372,6 +375,7 @@ func (s *Session) resolveOptionGroup(g optResGroup) {
 // advances the cursor. Driven by a steady ticker so ATM strike renewal is a
 // permanent slow rotation rather than a synchronized burst.
 func (s *Session) rotateOptionStrikes() {
+	s.reapStuckChainRequests()
 	s.optChain.mu.Lock()
 	g, ok := s.pickRotationGroupLocked()
 	s.optChain.mu.Unlock()
@@ -381,6 +385,50 @@ func (s *Session) rotateOptionStrikes() {
 	s.resolveOptionGroup(g)
 }
 
+// chainResolutionMaxAge bounds how long a conId lookup or chain-params
+// request may stay pending before reapStuckChainRequests gives up on it and
+// frees the group for another attempt. A healthy round trip completes in
+// low single-digit seconds; this is a generous multiple of that so it only
+// fires when IB never responded at all — most likely a pacing rejection
+// from firing every configured group's initial resolution nearly
+// simultaneously at startup (requestOptionChains), which produces neither a
+// success nor an error callback, so nothing else ever clears the entry.
+// Without this, that group's "resolving" flag never clears, permanently
+// excluding it from pickRotationGroupLocked's oldest-first pick and leaving
+// it stuck at zero background lines for the rest of the session — while the
+// handful of groups that did resolve become the only eligible candidates
+// and get endlessly re-picked instead.
+const chainResolutionMaxAge = 20 * time.Second
+
+// reapStuckChainRequests frees any conId-lookup or chain-params request
+// older than chainResolutionMaxAge whose IB response never arrived, so the
+// next rotateOptionStrikes tick can retry that group instead of leaving it
+// stuck "resolving" forever. Logs each one loudly — this indicates a
+// request IB silently dropped, not routine behavior.
+func (s *Session) reapStuckChainRequests() {
+	now := time.Now()
+	s.optChain.mu.Lock()
+	var stuck []string
+	for reqID, req := range s.optChain.conIDReqs {
+		if now.Sub(req.requestedAt) < chainResolutionMaxAge {
+			continue
+		}
+		stuck = append(stuck, fmt.Sprintf("%s (conId lookup, reqID=%d)", req.symbol, reqID))
+		delete(s.optChain.conIDReqs, reqID)
+	}
+	for reqID, req := range s.optChain.chainReqs {
+		if now.Sub(req.requestedAt) < chainResolutionMaxAge {
+			continue
+		}
+		stuck = append(stuck, fmt.Sprintf("%s (chain params, reqID=%d)", req.symbol, reqID))
+		delete(s.optChain.chainReqs, reqID)
+	}
+	s.optChain.mu.Unlock()
+	for _, desc := range stuck {
+		s.optionLog.Printf("Option: WARNING reaped stuck resolution for %s — IB never responded within %s, freeing group for retry", desc, chainResolutionMaxAge)
+	}
+}
+
 // pickRotationGroupLocked chooses the next option group to refresh, oldest
 // data first. Must be called with s.optChain.mu held.
 func (s *Session) pickRotationGroupLocked() (optResGroup, bool) {
@@ -388,23 +436,40 @@ func (s *Session) pickRotationGroupLocked() (optResGroup, bool) {
 	if n == 0 {
 		return optResGroup{}, false
 	}
+	// Scanning starts at rotateCursor (wrapping) rather than always at index
+	// 0. groupStalenessLocked returns the zero time.Time for a group that
+	// has never quoted, so a large batch of never-quoted groups — the common
+	// startup case, or any time the market has no ticks flowing (e.g.
+	// outside RTH) — all tie at the same score. score.Before(bestScore) is
+	// strict, so a tie never replaces the current best; starting the scan at
+	// index 0 every time therefore let group 0 win every single tie forever,
+	// starving every other group's very first resolution attempt for the
+	// rest of the session (the 2026-07-28 stuck-first-quote investigation:
+	// one group got re-picked every 3s tick while dozens of others never
+	// got a turn). Starting from the cursor and always advancing it past
+	// whichever group is returned makes ties resolve in fair round-robin
+	// order while a genuinely staler group (a strictly earlier real
+	// timestamp, found anywhere in the scan) still wins over one that's
+	// merely next in line.
 	var best optResGroup
+	var bestIdx int
 	var bestScore time.Time
 	found := false
-	for _, g := range s.optChain.rotation {
+	for i := 0; i < n; i++ {
+		idx := (s.optChain.rotateCursor + i) % n
+		g := s.optChain.rotation[idx]
 		if s.groupResolvingLocked(g.groupID) {
 			continue
 		}
 		score := s.groupStalenessLocked(g)
 		if !found || score.Before(bestScore) {
-			found, best, bestScore = true, g, score
+			found, best, bestIdx, bestScore = true, g, idx, score
 		}
 	}
 	if !found {
-		g := s.optChain.rotation[s.optChain.rotateCursor%n]
-		s.optChain.rotateCursor = (s.optChain.rotateCursor + 1) % n
-		return g, true
+		return optResGroup{}, false
 	}
+	s.optChain.rotateCursor = (bestIdx + 1) % n
 	return best, true
 }
 
@@ -498,7 +563,7 @@ func (s *Session) handleConIDContractDetailsEnd(reqID int64) bool {
 	s.optChain.chainReqs[chainReqID] = &optChainReq{
 		groupID: req.groupID, symbol: symbol, optionDelay: req.optionDelay,
 		targetDeltaCall: req.targetDeltaCall, targetDeltaPut: req.targetDeltaPut,
-		busIdxs: req.busIdxs,
+		busIdxs: req.busIdxs, requestedAt: time.Now(),
 	}
 	s.optChain.mu.Unlock()
 
@@ -1213,6 +1278,23 @@ func (s *Session) subscribeOptionMarketData(groupID int, busIdxs []int, symbol s
 // reqID was an option market data request, false otherwise.
 func (s *Session) handleOptionMktError(reqID int64, errStr string) bool {
 	s.optChain.mu.Lock()
+
+	// An explicit IB rejection (e.g. "no security definition found") of the
+	// conId lookup or chain-params request — clean it up immediately rather
+	// than waiting for reapStuckChainRequests' timeout, which exists for the
+	// silent-drop case (no callback at all), not this one.
+	if req, ok := s.optChain.conIDReqs[reqID]; ok {
+		delete(s.optChain.conIDReqs, reqID)
+		s.optChain.mu.Unlock()
+		s.optionLog.Printf("Option: conId lookup FAILED for %s (group=%d, reqID=%d) — %s", req.symbol, req.groupID, reqID, errStr)
+		return true
+	}
+	if req, ok := s.optChain.chainReqs[reqID]; ok {
+		delete(s.optChain.chainReqs, reqID)
+		s.optChain.mu.Unlock()
+		s.optionLog.Printf("Option: chain params FAILED for %s (group=%d, reqID=%d) — %s", req.symbol, req.groupID, reqID, errStr)
+		return true
+	}
 
 	if cand, ok := s.optChain.deltaCands[reqID]; ok {
 		delete(s.optChain.deltaCands, cand.reqID)
