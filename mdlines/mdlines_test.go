@@ -307,6 +307,82 @@ func TestLedger_ReapSnapshots(t *testing.T) {
 	}
 }
 
+// TestLedger_ReapProbes verifies the backstop reaper frees only probe lines
+// older than maxAge, mirroring TestLedger_ReapSnapshots — a probe whose
+// owning resolution never released it must not sit stuck for the rest of the
+// TCP session.
+func TestLedger_ReapProbes(t *testing.T) {
+	l := NewLedger(100, 50)
+
+	l.GrantGuaranteed(1, CategoryStock) // non-probe — must never be reaped
+	evicted, ok := l.GrantProbe(100)    // fresh probe — must survive
+	if !ok || evicted != 0 {
+		t.Fatalf("GrantProbe(100) = (%d,%v), want (0,true)", evicted, ok)
+	}
+	if _, ok := l.GrantProbe(101); !ok { // will be aged past maxAge — must be reaped
+		t.Fatal("GrantProbe(101) refused")
+	}
+	if _, ok := l.GrantProbe(102); !ok { // will be aged past maxAge — must be reaped
+		t.Fatal("GrantProbe(102) refused")
+	}
+
+	old := time.Now().Add(-5 * time.Minute)
+	l.probeAt[101] = old
+	l.probeAt[102] = old
+
+	reaped := l.ReapProbes(time.Minute)
+
+	if len(reaped) != 2 {
+		t.Fatalf("reaped %d lines (%v), want 2 (101,102)", len(reaped), reaped)
+	}
+	got := map[int64]bool{reaped[0]: true, reaped[1]: true}
+	if !got[101] || !got[102] {
+		t.Errorf("reaped = %v, want exactly {101,102}", reaped)
+	}
+	if _, _, _, _, _, probe := l.CategoryCounts(); probe != 1 {
+		t.Errorf("probe count = %d after reap, want 1 (the fresh one)", probe)
+	}
+	if used := func() int { u, _ := l.Status(); return u }(); used != 2 {
+		t.Errorf("used = %d after reap, want 2 (1 stock + 1 fresh probe)", used)
+	}
+	if _, ok := l.probeAt[100]; !ok {
+		t.Error("fresh probe 100 was dropped from probeAt")
+	}
+	if _, ok := l.probeAt[101]; ok {
+		t.Error("reaped probe 101 still in probeAt")
+	}
+	// A second reap with nothing stale returns nothing.
+	if again := l.ReapProbes(time.Minute); len(again) != 0 {
+		t.Errorf("second reap returned %v, want none", again)
+	}
+}
+
+// TestLedger_ReclassifyClearsProbeAge verifies a probe promoted to a
+// background line via Reclassify (the winning delta candidate) stops being
+// probe-aged, so it is never later swept up by ReapProbes even though it
+// keeps the same reqID and stays in the ledger indefinitely as a real
+// subscription.
+func TestLedger_ReclassifyClearsProbeAge(t *testing.T) {
+	l := NewLedger(100, 50)
+
+	if _, ok := l.GrantProbe(1); !ok {
+		t.Fatal("GrantProbe(1) refused")
+	}
+	l.Reclassify(1, CategoryDiscretionaryNew)
+	if _, ok := l.probeAt[1]; ok {
+		t.Fatal("probeAt[1] still set after Reclassify out of CategoryProbe")
+	}
+
+	l.probeAt[1] = time.Now().Add(-time.Hour) // simulate stale bookkeeping, should be inert
+	reaped := l.ReapProbes(time.Minute)
+	if len(reaped) != 0 {
+		t.Errorf("ReapProbes reaped %v, want none — line 1 is no longer CategoryProbe", reaped)
+	}
+	if _, _, discNew, _, _, _ := l.CategoryCounts(); discNew != 1 {
+		t.Errorf("discretionaryNew count = %d, want 1 — Reclassify must not have been undone", discNew)
+	}
+}
+
 // TestLedger_AllReqIDs verifies the teardown enumeration returns every
 // market-data line reqID (all categories) but keeps the keep-up-to-date
 // historical streams in the separate AllHistReqIDs set.

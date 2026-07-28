@@ -483,6 +483,10 @@ func (s *Session) Run(subs []Subscriber, stop time.Time) (bool, error) {
 				for _, reqID := range s.mdLines.ReapSnapshots(mdlines.SnapshotMaxAge) {
 					client.CancelMktData(reqID)
 				}
+				for _, reqID := range s.mdLines.ReapProbes(mdlines.ProbeMaxAge) {
+					client.CancelMktData(reqID)
+					s.releaseOrphanedProbeCandidate(reqID)
+				}
 				s.refreshPositions()
 			case <-ctx.Done():
 				return

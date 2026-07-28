@@ -120,6 +120,12 @@ type OptionQuote struct {
 	Ask    float64
 	Last   float64
 	Delta  float64
+	// BidTime/AskTime record when each side last actually ticked (not when this
+	// struct was built) — the freshness signal callers use to tell a genuinely
+	// live quote from a stale one that just hasn't been overwritten yet on a thin
+	// contract. Zero when the source couldn't provide it.
+	BidTime time.Time
+	AskTime time.Time
 }
 
 // Valid reports whether this quote carries a usable two-sided price for a

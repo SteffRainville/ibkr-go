@@ -723,6 +723,21 @@ func (s *Session) activeLegLocked(symbol, right string) (*optMktReq, bool) {
 	return nil, false
 }
 
+// mergeBusIdxsLocked adds any of newIdxs not already present in req.busIdxs,
+// mutating req in place (it is a pointer into s.optChain.mktReqs), and
+// returns just the newly-added indices. Must be called with s.optChain.mu
+// held.
+func mergeBusIdxsLocked(req *optMktReq, newIdxs []int) []int {
+	var added []int
+	for _, idx := range newIdxs {
+		if !slices.Contains(req.busIdxs, idx) {
+			req.busIdxs = append(req.busIdxs, idx)
+			added = append(added, idx)
+		}
+	}
+	return added
+}
+
 // replaceStalePendingLocked cancels any OTHER pending mktReqs legs for
 // (symbol, right) — leaving the active leg and keepReqID untouched. Must be
 // called with s.optChain.mu held.
@@ -768,9 +783,31 @@ func (s *Session) subscribeOptionLeg(groupID int, busIdxs []int, symbol, right s
 	s.optChain.mu.Lock()
 	active, hasActive := s.activeLegLocked(symbol, right)
 	if hasActive && active.strike == strike {
+		added := mergeBusIdxsLocked(active, busIdxs)
+		snapshot := *active
 		s.optChain.mu.Unlock()
-		s.optionLog.Printf("Option: skipping background refresh %s %s (group=%d) — estimate strike unchanged at %.2f",
-			symbol, right, groupID, strike)
+		if len(added) > 0 {
+			// A later-resolving group (e.g. a second robot whose independent
+			// delta estimate happened to land on the same strike) reused an
+			// already-active leg instead of opening a duplicate subscription.
+			// Without this, the joining group's busIdxs would never be added
+			// to the leg, so its hub would never receive this option's data
+			// — the strike would silently stay blank forever, even though
+			// the market data feed for the contract already exists.
+			s.optionLog.Printf("Option: skipping background refresh %s %s (group=%d) — estimate strike unchanged at %.2f, joining existing subscription (bus=%v)",
+				symbol, right, groupID, strike, added)
+			s.publishTo(added, eventbus.Event{
+				Kind: eventbus.KindOptionData,
+				Payload: eventbus.OptionData{
+					Symbol: symbol, Right: right, Strike: snapshot.strike, Expiry: snapshot.expiry,
+					Price: snapshot.price, Bid: snapshot.bid, Ask: snapshot.ask, Delta: snapshot.delta,
+					DeltaSource: snapshot.deltaSource,
+				},
+			})
+		} else {
+			s.optionLog.Printf("Option: skipping background refresh %s %s (group=%d) — estimate strike unchanged at %.2f",
+				symbol, right, groupID, strike)
+		}
 		return
 	}
 	mktReqID := s.optChain.nextMktID
@@ -818,6 +855,22 @@ func (s *Session) subscribeOptionLeg(groupID int, busIdxs []int, symbol, right s
 				Symbol: symbol, Right: right, Strike: strike, Expiry: expiry, DeltaSource: deltaSource,
 			},
 		})
+	}
+}
+
+// releaseOrphanedProbeCandidate drops a deltaCands entry for a reqID the
+// mdlines reaper just freed (ReapProbes) — its owning resolution never
+// reached its own release path, so this stops a stray late tick from
+// mutating a *deltaCandidate no code will ever read again. Safe to call for
+// an unknown reqID (no-op); resolveDeltaCandidates, if it later runs anyway,
+// still calls mdLines.Release on the same reqID, which is a no-op too.
+func (s *Session) releaseOrphanedProbeCandidate(reqID int64) {
+	s.optChain.mu.Lock()
+	_, ok := s.optChain.deltaCands[reqID]
+	delete(s.optChain.deltaCands, reqID)
+	s.optChain.mu.Unlock()
+	if ok {
+		s.optionLog.Printf("Option: dropped orphaned delta candidate (reqID=%d) reaped by mdlines", reqID)
 	}
 }
 
@@ -917,7 +970,11 @@ func (s *Session) resolveDeltaCandidates(groupID int, symbol, right string) (Opt
 		})
 	}
 
-	return OptionQuote{Strike: best.strike, Expiry: best.expiry, Bid: best.bid, Ask: best.ask, Delta: best.delta}, true
+	// best.bid/best.ask arrived during this synchronous, bounded probe (within
+	// entryDeltaProbeTimeout), so "now" is an accurate freshness stamp for them —
+	// there is no separate per-tick timestamp cached on deltaCandidate to read back.
+	now := time.Now()
+	return OptionQuote{Strike: best.strike, Expiry: best.expiry, Bid: best.bid, Ask: best.ask, Delta: best.delta, BidTime: now, AskTime: now}, true
 }
 
 // groupForSymbolLocked returns the resolution group for symbol. Caller must
@@ -975,7 +1032,17 @@ func (s *Session) CurrentLeg(symbol, right string) (OptionQuote, bool) {
 	if math.Abs(math.Abs(active.delta)-target) > deltaDriftTolerance {
 		return OptionQuote{}, false
 	}
-	return OptionQuote{Strike: active.strike, Expiry: active.expiry, Bid: active.bid, Ask: active.ask, Last: active.price, Delta: active.delta}, true
+	q := OptionQuote{Strike: active.strike, Expiry: active.expiry, Bid: active.bid, Ask: active.ask, Last: active.price, Delta: active.delta}
+	// active (optMktReq) caches raw tick values but not when each side last
+	// ticked; the Book is already written on every tick (handleOptionTick →
+	// bookOption) for this exact contract, so read the timestamps back from
+	// there rather than tracking a second, parallel copy.
+	if s.book != nil {
+		if bq, ok := s.book.Option(quotes.ContractKey{Symbol: symbol, Right: right, Strike: active.strike, Expiry: active.expiry}); ok {
+			q.BidTime, q.AskTime = bq.BidTime, bq.AskTime
+		}
+	}
+	return q, true
 }
 
 // ResolveEntryStrike runs a synchronous, bounded, real IB delta probe for
@@ -988,6 +1055,7 @@ func (s *Session) ResolveEntryStrike(symbol, right string, timeout time.Duration
 	s.optChain.mu.Lock()
 	group, hasGroup := s.groupForSymbolLocked(symbol)
 	info, hasInfo := s.optChain.lastChainInfo[symbol]
+	_, inFlight := s.optChain.deltaRes[retryKeyLeg(group.groupID, right)]
 	s.optChain.mu.Unlock()
 	if !hasGroup || !hasInfo || len(info.strikes) == 0 {
 		return OptionQuote{}, false
@@ -995,6 +1063,19 @@ func (s *Session) ResolveEntryStrike(symbol, right string, timeout time.Duration
 
 	if q, ok := s.sharedResolvedEntry(group.groupID, symbol, right); ok {
 		return q, true
+	}
+
+	// A sibling subscriber configured identically (same symbol, option_delay,
+	// target_delta — the group key) is already probing this exact contract.
+	// Don't duplicate the ReqMktData candidate probes and race it for scarce
+	// mdlines probe-tier slots; wait for its result and share it instead. This
+	// is what makes two robots that get the same crossover on the same
+	// underlying converge on the identical strike (or identical failure)
+	// rather than one silently losing the race and skipping the entry — see
+	// the 2026-07-27 SPY put incident where VWmacdOptionDataRobot's larger
+	// symbol universe made it more likely to lose exactly this race.
+	if inFlight {
+		return s.waitForEntryResolution(group.groupID, symbol, right, timeout)
 	}
 
 	targetDelta := group.targetDeltaCall
@@ -1086,11 +1167,36 @@ func (s *Session) sharedResolvedEntry(groupID int, symbol, right string) (Option
 	if !ok {
 		return OptionQuote{}, false
 	}
-	q := OptionQuote{Strike: leg.strike, Expiry: leg.expiry, Bid: bq.Bid, Ask: bq.Ask, Last: bq.Last, Delta: leg.delta}
+	q := OptionQuote{Strike: leg.strike, Expiry: leg.expiry, Bid: bq.Bid, Ask: bq.Ask, Last: bq.Last, Delta: leg.delta, BidTime: bq.BidTime, AskTime: bq.AskTime}
 	if !q.Valid() {
 		return OptionQuote{}, false
 	}
 	return q, true
+}
+
+// waitForEntryResolution is ResolveEntryStrike's path for a caller that found
+// deltaRes[groupID|right] already owned by a concurrent sibling call. Rather
+// than launching a duplicate set of candidate probes, it polls (same cadence
+// the owning call's own loop uses) for that entry to clear — which happens
+// the instant resolveDeltaCandidates finishes processing it, success or not —
+// then reads the result via the same sharedResolvedEntry fast path the owner
+// populates on success. If the owner's probe failed, resolvedEntry stays
+// empty and this returns the same (OptionQuote{}, false) the owner got,
+// rather than spending a second probe chasing the same answer.
+func (s *Session) waitForEntryResolution(groupID int, symbol, right string, timeout time.Duration) (OptionQuote, bool) {
+	resKey := retryKeyLeg(groupID, right)
+	const pollInterval = 100 * time.Millisecond
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		s.optChain.mu.Lock()
+		_, stillOwned := s.optChain.deltaRes[resKey]
+		s.optChain.mu.Unlock()
+		if !stillOwned {
+			break
+		}
+		time.Sleep(pollInterval)
+	}
+	return s.sharedResolvedEntry(groupID, symbol, right)
 }
 
 // subscribeOptionMarketData subscribes to streaming market data for both

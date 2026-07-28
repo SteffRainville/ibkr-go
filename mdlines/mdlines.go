@@ -78,6 +78,16 @@ const ReserveChurn = 25
 // reaper frees it.
 const SnapshotMaxAge = 60 * time.Second
 
+// ProbeMaxAge is how old a CategoryProbe line may get before the reaper frees
+// it. A healthy probe resolves within its caller's own timeout (entry-side,
+// currently 10s) and is released by resolveDeltaCandidates the moment that
+// caller's poll loop exits — this is a generous multiple of that, so it only
+// fires when the owning resolution goroutine itself got stuck (e.g. blocked
+// elsewhere) and never reached its own release path. Without this, such a
+// line has no other way back into the pool for the rest of the TCP session,
+// unlike CategorySnapshot which has always had ReapSnapshots as a backstop.
+const ProbeMaxAge = 30 * time.Second
+
 // Ledger tracks active market-data lines against the account's simultaneous-
 // line cap. It is a leaf lock: its methods never call back into the broker
 // client, so callers may hold their own locks across a Ledger call without
@@ -93,6 +103,10 @@ type Ledger struct {
 	// ReapSnapshots can free a transient snapshot whose terminal callback
 	// never arrived.
 	snapAt map[int64]time.Time
+
+	// probeAt records when each CategoryProbe line was granted, so ReapProbes
+	// can free one whose owning resolution never released it.
+	probeAt map[int64]time.Time
 
 	// histLines tracks keep-up-to-date historical bar subscriptions, which
 	// IB-style brokers govern under a SEPARATE hard ceiling independent of
@@ -118,6 +132,7 @@ func NewLedger(max, histMax int) *Ledger {
 		max:       max,
 		lines:     make(map[int64]Category),
 		snapAt:    make(map[int64]time.Time),
+		probeAt:   make(map[int64]time.Time),
 		histLines: make(map[int64]struct{}),
 		histMax:   histMax,
 	}
@@ -240,6 +255,7 @@ func (l *Ledger) GrantProbe(reqID int64) (evicted int64, ok bool) {
 	place := func() {
 		l.lines[reqID] = CategoryProbe
 		l.byCat[CategoryProbe]++
+		l.probeAt[reqID] = time.Now()
 	}
 
 	if len(l.lines) < l.max-Buffer {
@@ -341,7 +357,8 @@ func (l *Ledger) Release(reqID int64) {
 	}
 	delete(l.lines, reqID)
 	l.byCat[cat]--
-	delete(l.snapAt, reqID) // no-op unless reqID was a snapshot
+	delete(l.snapAt, reqID)  // no-op unless reqID was a snapshot
+	delete(l.probeAt, reqID) // no-op unless reqID was a probe
 	l.mu.Unlock()
 	l.notify()
 }
@@ -358,6 +375,9 @@ func (l *Ledger) Reclassify(reqID int64, cat Category) {
 	l.byCat[old]--
 	l.lines[reqID] = cat
 	l.byCat[cat]++
+	if old == CategoryProbe {
+		delete(l.probeAt, reqID) // graduated to a tracked background line — no longer probe-aged
+	}
 	l.mu.Unlock()
 	l.notify()
 }
@@ -383,6 +403,41 @@ func (l *Ledger) ReapSnapshots(maxAge time.Duration) []int64 {
 	l.mu.Unlock()
 	if len(reaped) > 0 {
 		log.Printf("mdlines: reaped %d orphaned snapshot line(s) older than %s", len(reaped), maxAge)
+		l.notify()
+	}
+	return reaped
+}
+
+// ReapProbes releases any CategoryProbe line older than maxAge and returns
+// the reaped reqIDs so the caller can cancel each — a defensive backstop
+// against a probe whose owning resolution goroutine got stuck and never
+// reached its own release path. Unlike an orphaned snapshot (an expected,
+// occasional broker-side miss), a reaped probe indicates a bug elsewhere;
+// callers should log it loudly.
+func (l *Ledger) ReapProbes(maxAge time.Duration) []int64 {
+	now := time.Now()
+	l.mu.Lock()
+	var reaped []int64
+	for reqID, at := range l.probeAt {
+		if now.Sub(at) < maxAge {
+			continue
+		}
+		// Reclassify (a resolved winner graduating to a background line)
+		// always clears probeAt in the same critical section it changes
+		// category in, so this mismatch should never happen — checked anyway
+		// so a stale probeAt entry can never reap an unrelated live line.
+		cat, ok := l.lines[reqID]
+		delete(l.probeAt, reqID)
+		if !ok || cat != CategoryProbe {
+			continue
+		}
+		delete(l.lines, reqID)
+		l.byCat[cat]--
+		reaped = append(reaped, reqID)
+	}
+	l.mu.Unlock()
+	if len(reaped) > 0 {
+		log.Printf("mdlines: WARNING reaped %d stuck probe line(s) older than %s — a resolution never released its probe", len(reaped), maxAge)
 		l.notify()
 	}
 	return reaped
