@@ -8,6 +8,7 @@
 package eventbus
 
 import (
+	"maps"
 	"sync"
 	"time"
 )
@@ -149,27 +150,53 @@ type Event struct {
 }
 
 // Bus is a non-blocking, fan-out publish/subscribe bus.
-// Publish never blocks — slow subscribers drop events (16-event buffer per subscriber).
+// Publish never blocks — slow subscribers drop events (16-event buffer per
+// subscriber by default; see SubscribeBuffered for a caller-sized buffer, and
+// DropStats to detect drops when they happen).
 type Bus struct {
 	mu   sync.RWMutex
 	subs map[Kind][]chan Event
+
+	dropMu  sync.Mutex
+	dropped map[Kind]uint64
 }
 
 // New creates a ready-to-use Bus.
 func New() *Bus {
-	return &Bus{subs: make(map[Kind][]chan Event)}
+	return &Bus{subs: make(map[Kind][]chan Event), dropped: make(map[Kind]uint64)}
 }
 
-// Subscribe returns a channel that receives events of the requested kinds.
-// The caller must eventually call Unsubscribe to avoid a goroutine/channel leak.
+// Subscribe returns a channel that receives events of the requested kinds,
+// buffered to the default 16 slots. The caller must eventually call
+// Unsubscribe to avoid a goroutine/channel leak.
 func (b *Bus) Subscribe(kinds ...Kind) <-chan Event {
-	ch := make(chan Event, 16)
+	return b.SubscribeBuffered(16, kinds...)
+}
+
+// SubscribeBuffered is like Subscribe but lets the caller size the channel's
+// buffer explicitly instead of the default 16. Use a dedicated, larger buffer
+// for a Kind whose loss is unrecoverable (e.g. one Kind feeds a continuously-
+// accumulating consumer with no reset) and that must not share headroom with
+// a high-volume Kind subscribed on the same call.
+func (b *Bus) SubscribeBuffered(size int, kinds ...Kind) <-chan Event {
+	ch := make(chan Event, size)
 	b.mu.Lock()
 	for _, k := range kinds {
 		b.subs[k] = append(b.subs[k], ch)
 	}
 	b.mu.Unlock()
 	return ch
+}
+
+// DropStats returns a snapshot of cumulative, per-Kind counts of events this
+// Bus discarded because a subscriber channel was full (see safeSend). It is
+// monotonic — callers should diff successive snapshots to get a rate.
+func (b *Bus) DropStats() map[Kind]uint64 {
+	b.dropMu.Lock()
+	defer b.dropMu.Unlock()
+	out := make(map[Kind]uint64, len(b.dropped))
+	maps.Copy(out, b.dropped)
+	return out
 }
 
 // Unsubscribe removes ch from all subscriber lists and closes it once.
@@ -194,20 +221,24 @@ func (b *Bus) Unsubscribe(ch <-chan Event) {
 }
 
 // Publish fans out evt to every subscriber registered for evt.Kind.
-// Each send is non-blocking; a full or closed subscriber channel drops the event.
+// Each send is non-blocking; a full or closed subscriber channel drops the
+// event and increments DropStats()[evt.Kind].
 func (b *Bus) Publish(evt Event) {
 	b.mu.RLock()
 	list := append([]chan Event(nil), b.subs[evt.Kind]...)
 	b.mu.RUnlock()
 	for _, ch := range list {
-		safeSend(ch, evt)
+		b.safeSend(ch, evt)
 	}
 }
 
-func safeSend(ch chan Event, evt Event) {
+func (b *Bus) safeSend(ch chan Event, evt Event) {
 	defer func() { recover() }() //nolint:errcheck // closed channel → drop silently
 	select {
 	case ch <- evt:
 	default:
+		b.dropMu.Lock()
+		b.dropped[evt.Kind]++
+		b.dropMu.Unlock()
 	}
 }
