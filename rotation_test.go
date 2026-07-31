@@ -1,6 +1,11 @@
 package ibkr
 
-import "testing"
+import (
+	"testing"
+	"time"
+
+	"github.com/SteffRainville/ibkr-go/quotes"
+)
 
 // newRotationTestSession builds a Session (via NewSession, so every logger
 // field is a real io.Discard-backed *log.Logger rather than a nil one that
@@ -197,5 +202,72 @@ func TestPickRotationGroupLocked_EmptyWhenAllResolving(t *testing.T) {
 	s.optChain.mu.Unlock()
 	if ok {
 		t.Fatal("expected no group when the only group is still resolving")
+	}
+}
+
+// TestPickRotationGroupLocked_UnquotedLegDoesNotStarveForever pins down the
+// 2026-07-31 stuck-at-31 "Background ATM — first quote" bug, a sequel to the
+// 2026-07-28 tied-groups bug above. This one isn't a tie: a group with an
+// active leg that never receives a book quote (e.g. IB never sends ticks for
+// a thin/illiquid strike) scored the zero time.Time forever, which beats
+// every group with a real, recent quote timestamp unconditionally — not just
+// on ties. That let a single chronically-unquoted leg monopolize every
+// rotation tick permanently, starving every other group's churn (in
+// production: GLD/HOOD/INTC alone took 96/50/39 of the rotation picks in a
+// 14-minute window while 12 of 21 configured groups got none). The fix
+// records when a group was last actually attempted (lastAttempt) and uses
+// that as the fallback score instead of the zero value, so a group ages
+// forward after its shot even if it never gets a quote — a genuinely never-
+// touched group still wins first (matching the tied-groups test above), but
+// a group that already had its turn and failed can't freeze at "more stale
+// than the dawn of time" and lock out everyone else.
+func TestPickRotationGroupLocked_UnquotedLegDoesNotStarveForever(t *testing.T) {
+	s := newRotationTestSession(nil)
+	s.book = quotes.NewBook()
+	s.optChain.rotation = []optResGroup{
+		{groupID: 0, symbol: "STUCK"},
+		{groupID: 1, symbol: "GOOD"},
+	}
+
+	// GOOD has a real, recent book quote.
+	s.optChain.mktReqs[10] = &optMktReq{groupID: 1, symbol: "GOOD", right: "call", strike: 100}
+	s.book.SetOptionBid(quotes.ContractKey{Symbol: "GOOD", Right: "call", Strike: 100}, 1.0)
+	goodQuotedAt := time.Now()
+
+	// STUCK has an active leg (already attempted once, hence it exists) but
+	// has never received a book tick — the illiquid-strike case.
+	s.optChain.mktReqs[20] = &optMktReq{groupID: 0, symbol: "STUCK", right: "call", strike: 50}
+
+	time.Sleep(2 * time.Millisecond) // ensure strictly-ordered timestamps below
+
+	// First pick: STUCK has never been recorded in lastAttempt, so it still
+	// correctly scores as maximally stale and goes first — a never-quoted
+	// leg should get its shot before an already-flowing one is re-churned.
+	s.optChain.mu.Lock()
+	g, ok := s.pickRotationGroupLocked()
+	s.optChain.mu.Unlock()
+	if !ok || g.symbol != "STUCK" {
+		t.Fatalf("first pick = %v (ok=%v), want STUCK", g.symbol, ok)
+	}
+
+	// Simulate resolveOptionGroup committing to that attempt (it still gets
+	// no quote — the strike stays illiquid).
+	s.optChain.mu.Lock()
+	s.optChain.lastAttempt[0] = time.Now()
+	s.optChain.mu.Unlock()
+
+	if !s.optChain.lastAttempt[0].After(goodQuotedAt) {
+		t.Fatal("test setup: STUCK's attempt must be after GOOD's quote for this to prove anything")
+	}
+
+	// Second pick: STUCK already had its attempt and is now "fresher" than
+	// GOOD's now-older quote, so GOOD — the one actually due for a refresh —
+	// must win. Before the fix, STUCK would still score zero and win again,
+	// forever.
+	s.optChain.mu.Lock()
+	g, ok = s.pickRotationGroupLocked()
+	s.optChain.mu.Unlock()
+	if !ok || g.symbol != "GOOD" {
+		t.Fatalf("second pick = %v (ok=%v), want GOOD — STUCK must not win indefinitely after its own attempt", g.symbol, ok)
 	}
 }

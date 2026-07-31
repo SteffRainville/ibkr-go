@@ -326,6 +326,7 @@ func NewSession(opts Options, book *quotes.Book, cs *candlestore.Store) *Session
 			lastChainInfo:   make(map[string]chainSnapshot),
 			resolvedEntry:   make(map[string]resolvedEntryLeg),
 			lastProbeLaunch: make(map[string]time.Time),
+			lastAttempt:     make(map[int]time.Time),
 		},
 		onDemand: onDemandTracker{
 			nextID:    reqIDOnDemandHistBase,

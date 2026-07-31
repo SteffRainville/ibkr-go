@@ -227,6 +227,23 @@ type optionChainTracker struct {
 	// re-polling a stuck symbol every 5s and two robots each independently
 	// probing the same group are the same failure mode from IB's perspective.
 	lastProbeLaunch map[string]time.Time
+
+	// lastAttempt records when rotateOptionStrikes last committed to
+	// resolving groupID — i.e. resolveOptionGroup got past the
+	// groupResolvingLocked guard and actually fired a request, as opposed to
+	// being skipped because a resolution was already in flight. Read by
+	// groupStalenessLocked as the fallback score for a leg whose book entry
+	// has no quote yet (see that function for why: without this, such a leg
+	// scores the zero time.Time forever, which beats every real timestamp
+	// unconditionally and lets one chronically-unquotable leg — e.g. an
+	// illiquid strike IB never sends ticks for — monopolize every rotation
+	// tick permanently, starving every other group's churn. The 2026-07-31
+	// stuck-at-31 investigation: GLD/HOOD/INTC alone took 96/50/39 of the
+	// rotation picks in a 14-minute window while 12 of 21 groups got none).
+	// Keyed separately from the per-leg mktReqs pendingSince because it must
+	// persist even across a "skip — estimate strike unchanged" cycle, which
+	// creates no new mktReqs entry at all.
+	lastAttempt map[int]time.Time
 }
 
 // resolvedEntryLeg is one group's most recently resolved entry contract
@@ -373,6 +390,7 @@ func (s *Session) resolveOptionGroup(g optResGroup) {
 		s.optionLog.Printf("Option: skipping strike refresh for %s (group=%d) — previous resolution still in flight", g.symbol, g.groupID)
 		return
 	}
+	s.optChain.lastAttempt[g.groupID] = time.Now()
 	reqID := s.optChain.nextConIDID
 	s.optChain.nextConIDID++
 	s.optChain.conIDReqs[reqID] = &optConIDReq{
@@ -493,6 +511,23 @@ func (s *Session) pickRotationGroupLocked() (optResGroup, bool) {
 
 // groupStalenessLocked returns the freshness of a group's stalest active
 // option leg. Must be called with s.optChain.mu held.
+//
+// A leg with an active subscription but no book quote yet falls back to
+// s.optChain.lastAttempt[g.groupID] rather than the zero time.Time. The zero
+// value would otherwise score as "infinitely stale," which does not merely
+// win ties (pickRotationGroupLocked's round-robin cursor already handles
+// that) but beats every group with a real, recent quote timestamp
+// unconditionally, every single tick. A leg IB simply never sends ticks for
+// (thin liquidity, a stale estimate strike, etc.) would then monopolize the
+// rotation forever, starving every other group's churn — the 2026-07-31
+// stuck-at-31 "Background ATM — first quote" investigation: three symbols
+// alone (GLD/HOOD/INTC) took 96/50/39 of the rotation picks in a 14-minute
+// window while 12 of 21 configured groups got none. lastAttempt still
+// reports the zero value for a group that has genuinely never been
+// resolved at all, so a fresh, never-touched group keeps the same
+// highest-priority treatment it always had — only a group that has already
+// had its shot and failed to get a quote ages forward like everyone else
+// instead of being frozen at "more stale than the dawn of time."
 func (s *Session) groupStalenessLocked(g optResGroup) time.Time {
 	var score time.Time
 	first := true
@@ -501,13 +536,16 @@ func (s *Session) groupStalenessLocked(g optResGroup) time.Time {
 		if !ok {
 			continue
 		}
-		var t time.Time
+		t := s.optChain.lastAttempt[g.groupID]
 		if s.book != nil {
 			key := quotes.ContractKey{Symbol: g.symbol, Right: right, Strike: leg.strike, Expiry: leg.expiry}
 			if q, ok := s.book.Option(key); ok {
-				t = q.AskTime
-				if q.BidTime.After(t) {
-					t = q.BidTime
+				bookT := q.AskTime
+				if q.BidTime.After(bookT) {
+					bookT = q.BidTime
+				}
+				if bookT.After(t) {
+					t = bookT
 				}
 			}
 		}
