@@ -216,6 +216,17 @@ type optionChainTracker struct {
 	// resolving the SAME group within resolvedEntryTTL reuses the identical
 	// strike instead of running its own probe.
 	resolvedEntry map[string]resolvedEntryLeg
+
+	// lastProbeLaunch records when ResolveEntryStrike last became the OWNER
+	// of a fresh set of delta-candidate probes for "groupID|right" — i.e.
+	// launched new ReqMktData calls, as opposed to reusing sharedResolvedEntry
+	// or joining an in-flight sibling via waitForEntryResolution (neither of
+	// which costs a new IB round trip and so neither is throttled by this).
+	// Scoped per group rather than per caller so it protects the group as a
+	// whole regardless of which subscriber last launched — a single robot
+	// re-polling a stuck symbol every 5s and two robots each independently
+	// probing the same group are the same failure mode from IB's perspective.
+	lastProbeLaunch map[string]time.Time
 }
 
 // resolvedEntryLeg is one group's most recently resolved entry contract
@@ -240,6 +251,13 @@ func retryKeyLeg(groupID int, r string) string { return fmt.Sprintf("g%d|%s", gr
 // resolvedEntryTTL bounds how long a resolved entry contract is shared
 // across subscribers in a group.
 const resolvedEntryTTL = 5 * time.Second
+
+// entryProbeLaunchCooldown bounds how often ResolveEntryStrike may become the
+// OWNER of a fresh delta-candidate probe for a given "groupID|right" — i.e.
+// actually launch new ReqMktData calls. It does not gate sharedResolvedEntry
+// reads or joining an already-in-flight sibling probe, since neither of those
+// paths issues a new IB request.
+const entryProbeLaunchCooldown = 15 * time.Second
 
 // requestOptionChains fires ReqContractDetails for each distinct option
 // resolution group across all subscribers. option_delay and target_delta
@@ -1120,7 +1138,8 @@ func (s *Session) ResolveEntryStrike(symbol, right string, timeout time.Duration
 	s.optChain.mu.Lock()
 	group, hasGroup := s.groupForSymbolLocked(symbol)
 	info, hasInfo := s.optChain.lastChainInfo[symbol]
-	_, inFlight := s.optChain.deltaRes[retryKeyLeg(group.groupID, right)]
+	resKey := retryKeyLeg(group.groupID, right)
+	_, inFlight := s.optChain.deltaRes[resKey]
 	s.optChain.mu.Unlock()
 	if !hasGroup || !hasInfo || len(info.strikes) == 0 {
 		return OptionQuote{}, false
@@ -1143,6 +1162,19 @@ func (s *Session) ResolveEntryStrike(symbol, right string, timeout time.Duration
 		return s.waitForEntryResolution(group.groupID, symbol, right, timeout)
 	}
 
+	// No sibling to share with or join — becoming the owner means launching a
+	// fresh batch of ReqMktData candidate probes, a real IB round trip. Throttle
+	// that specifically (not the free reads/joins above) so a symbol sitting in
+	// a zone with no obtainable quote can't spin the caller's event loop on
+	// back-to-back probes, and so two robots in the same group can't each
+	// independently re-launch within the other's cooldown window.
+	s.optChain.mu.Lock()
+	sinceLaunch := time.Since(s.optChain.lastProbeLaunch[resKey])
+	s.optChain.mu.Unlock()
+	if sinceLaunch < entryProbeLaunchCooldown {
+		return OptionQuote{}, false
+	}
+
 	targetDelta := group.targetDeltaCall
 	if right == "put" {
 		targetDelta = group.targetDeltaPut
@@ -1158,7 +1190,6 @@ func (s *Session) ResolveEntryStrike(symbol, right string, timeout time.Duration
 	}
 
 	groupID := group.groupID
-	resKey := retryKeyLeg(groupID, right)
 
 	s.optChain.mu.Lock()
 	res := &deltaResolution{
@@ -1193,6 +1224,7 @@ func (s *Session) ResolveEntryStrike(symbol, right string, timeout time.Duration
 		return OptionQuote{}, false
 	}
 	s.optChain.deltaRes[resKey] = res
+	s.optChain.lastProbeLaunch[resKey] = time.Now()
 	s.optChain.mu.Unlock()
 
 	const pollInterval = 100 * time.Millisecond

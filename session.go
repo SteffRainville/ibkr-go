@@ -126,9 +126,9 @@ type orderTracker struct {
 
 // posTracker accumulates position data from IB Position() callbacks.
 type posTracker struct {
-	posMapMu    sync.Mutex
-	posMap      map[string]PositionInfo
-	initialDone bool
+	posMapMu     sync.Mutex
+	posMap       map[string]PositionInfo
+	initialDone  bool
 	pendingClose map[string]PositionInfo
 }
 
@@ -209,14 +209,14 @@ type Session struct {
 	tradingAccount string
 	accountsReady  chan []string
 
-	mktData marketData
-	orders  orderTracker
-	pos     posTracker
-	errors  errTracker
-	scanner scanTracker
+	mktData  marketData
+	orders   orderTracker
+	pos      posTracker
+	errors   errTracker
+	scanner  scanTracker
 	optChain optionChainTracker
 	onDemand onDemandTracker
-	acct    acctTracker
+	acct     acctTracker
 
 	mdLines *mdlines.Ledger
 
@@ -310,21 +310,22 @@ func NewSession(opts Options, book *quotes.Book, cs *candlestore.Store) *Session
 			cdReqIDs:   make(map[int64][]int64),
 		},
 		optChain: optionChainTracker{
-			nextConIDID:   reqIDOptConIDBase,
-			nextChainID:   reqIDOptChainBase,
-			nextMktID:     reqIDOptMktBase,
-			nextPosID:     reqIDPosMktBase,
-			conIDReqs:     make(map[int64]*optConIDReq),
-			chainReqs:     make(map[int64]*optChainReq),
-			mktReqs:       make(map[int64]*optMktReq),
-			posSubs:       make(map[int64]*posStrikeSub),
-			posSubKeys:    make(map[string]int64),
-			retries:       make(map[string]*optStrikeRetry),
-			deltaCands:    make(map[int64]*deltaCandidate),
-			deltaRes:      make(map[string]*deltaResolution),
-			lastIV:        make(map[string]float64),
-			lastChainInfo: make(map[string]chainSnapshot),
-			resolvedEntry: make(map[string]resolvedEntryLeg),
+			nextConIDID:     reqIDOptConIDBase,
+			nextChainID:     reqIDOptChainBase,
+			nextMktID:       reqIDOptMktBase,
+			nextPosID:       reqIDPosMktBase,
+			conIDReqs:       make(map[int64]*optConIDReq),
+			chainReqs:       make(map[int64]*optChainReq),
+			mktReqs:         make(map[int64]*optMktReq),
+			posSubs:         make(map[int64]*posStrikeSub),
+			posSubKeys:      make(map[string]int64),
+			retries:         make(map[string]*optStrikeRetry),
+			deltaCands:      make(map[int64]*deltaCandidate),
+			deltaRes:        make(map[string]*deltaResolution),
+			lastIV:          make(map[string]float64),
+			lastChainInfo:   make(map[string]chainSnapshot),
+			resolvedEntry:   make(map[string]resolvedEntryLeg),
+			lastProbeLaunch: make(map[string]time.Time),
 		},
 		onDemand: onDemandTracker{
 			nextID:    reqIDOnDemandHistBase,
