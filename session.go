@@ -670,10 +670,16 @@ func (s *Session) resolveReqID(reqID int64) string {
 // Error is called when IB sends an error or warning message.
 func (s *Session) Error(reqID int64, errTime int64, errCode int64, errString string, advancedOrderRejectJSON string) {
 	sym := s.resolveReqID(reqID)
-	s.logger.Printf("IB Error: reqID=%d symbol=%s code=%d msg=%s", reqID, sym, errCode, errString)
+	// Codes in [2000,10000) are IB's informational/warning band (farm
+	// connection notices and the like); everything outside it is a real
+	// error. Both are logged, but only the latter is labelled as such, so the
+	// severity is greppable. This used to emit a second, byte-identical line
+	// for real errors, which distinguished nothing and just doubled them.
+	label := "IB Notice"
 	if errCode < 2000 || errCode >= 10000 {
-		s.logger.Printf("reqID=%d symbol=%s code=%d msg=%s", reqID, sym, errCode, errString)
+		label = "IB Error"
 	}
+	s.logger.Printf("%s: reqID=%d symbol=%s code=%d msg=%s", label, reqID, sym, errCode, errString)
 
 	if errCode == 200 {
 		if s.handleOptionMktError(reqID, errString) {
