@@ -32,7 +32,7 @@ func TestSubscribeOptionLeg_SkipsChurnWhenStrikeUnchanged(t *testing.T) {
 		groupID: 5, symbol: "QQQ", right: "call", strike: 480, expiry: "20260727", pending: false,
 	}
 
-	s.subscribeOptionLeg(5, []int{0}, "QQQ", "call", 480, "20260727", true)
+	s.subscribeOptionLeg(5, []int{0}, "QQQ", "call", 480, "20260727", true, false)
 
 	if len(s.optChain.mktReqs) != 1 {
 		t.Fatalf("mktReqs has %d entries, want 1 (no new entry for an unchanged strike)", len(s.optChain.mktReqs))
@@ -62,7 +62,7 @@ func TestSubscribeOptionLeg_ChurnRefusedAtChurnThreshold(t *testing.T) {
 	s.optChain.mktReqs[1] = &optMktReq{
 		groupID: 5, symbol: "QQQ", right: "call", strike: 480, expiry: "20260727", pending: false,
 	}
-	s.subscribeOptionLeg(5, []int{0}, "QQQ", "call", 485, "20260727", true)
+	s.subscribeOptionLeg(5, []int{0}, "QQQ", "call", 485, "20260727", true, false)
 
 	if len(s.optChain.mktReqs) != 1 {
 		t.Fatalf("mktReqs has %d entries, want 1 (refused churn request must not add an entry)", len(s.optChain.mktReqs))
@@ -96,7 +96,7 @@ func TestSubscribeOptionLeg_JoiningGroupGetsAddedToActiveLeg(t *testing.T) {
 	// A different group (bus 1), whose own estimate independently landed on
 	// the same strike, "subscribes" — it must join the existing leg rather
 	// than being silently dropped.
-	s.subscribeOptionLeg(6, []int{1}, "QQQ", "call", 480, "20260727", true)
+	s.subscribeOptionLeg(6, []int{1}, "QQQ", "call", 480, "20260727", true, false)
 
 	req := s.optChain.mktReqs[1]
 	if len(req.busIdxs) != 2 || req.busIdxs[0] != 0 || req.busIdxs[1] != 1 {

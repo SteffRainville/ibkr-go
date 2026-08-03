@@ -47,6 +47,8 @@ var ErrReady = errors.New("connected but TWS did not become ready")
 //	8001 …         — ReqContractDetails for option underlying conId lookup
 //	9001           — account summary request
 //	10001 …        — position-pinned option market data subscriptions
+//	11001 …        — ad-hoc option chain query: ReqContractDetails (conId lookup)
+//	12001 …        — ad-hoc option chain query: reqSecDefOptParams
 const (
 	reqIDHistBase         int64 = 1001
 	reqIDStreamBase       int64 = 2001
@@ -58,6 +60,8 @@ const (
 	reqIDOptConIDBase     int64 = 8001
 	reqIDAcctSummary      int64 = 9001
 	reqIDPosMktBase       int64 = 10001
+	reqIDOptQueryConIDBase int64 = 11001
+	reqIDOptQueryChainBase int64 = 12001
 )
 
 const bidAskMaxAge = 30 * time.Second
@@ -215,6 +219,7 @@ type Session struct {
 	errors   errTracker
 	scanner  scanTracker
 	optChain optionChainTracker
+	optQuery optionQueryTracker
 	onDemand onDemandTracker
 	acct     acctTracker
 
@@ -327,11 +332,18 @@ func NewSession(opts Options, book *quotes.Book, cs *candlestore.Store) *Session
 			resolvedEntry:   make(map[string]resolvedEntryLeg),
 			lastProbeLaunch: make(map[string]time.Time),
 			lastAttempt:     make(map[int]time.Time),
+			forcedResub:     make(map[string]resubState),
 		},
 		onDemand: onDemandTracker{
 			nextID:    reqIDOnDemandHistBase,
 			reqSymbol: make(map[int64]string),
 			done:      make(map[int64]chan error),
+		},
+		optQuery: optionQueryTracker{
+			nextConID:   reqIDOptQueryConIDBase,
+			nextChainID: reqIDOptQueryChainBase,
+			conIDReqs:   make(map[int64]*optQueryReq),
+			chainReqs:   make(map[int64]*optQueryReq),
 		},
 		acct: acctTracker{accounts: make(map[string]AccountSummary)},
 

@@ -271,3 +271,91 @@ func TestPickRotationGroupLocked_UnquotedLegDoesNotStarveForever(t *testing.T) {
 		t.Fatalf("second pick = %v (ok=%v), want GOOD — STUCK must not win indefinitely after its own attempt", g.symbol, ok)
 	}
 }
+
+// TestPickRotationGroupLocked_OverdueLiquidGroupWins pins down the 2026-08-03
+// scoring inversion.
+//
+// The picker used to score a group by how fresh its option QUOTES were, which
+// made "this group has good data" count as "this group is up to date". Those
+// are different claims, and conflating them starved exactly the wrong groups:
+// a continuously-quoting underlying scored ~now on every tick and therefore
+// lost to any group serviced even fractionally earlier, forever. In production
+// that gave SPY, QQQ and IWM — the three most liquid underlyings, whose ATM
+// strike moves fastest and matters most — zero rotation picks in two hours,
+// while NVDA (the group least able to obtain a quote at all, 532 delta misses)
+// consumed 794 log lines re-estimating futilely.
+//
+// Timestamps here are explicit rather than wall-clock. An earlier version of
+// this test drove real picks in a loop and passed against the buggy scorer,
+// because the whole loop completed inside one clock granule and every
+// comparison collapsed into a tie that the round-robin cursor then resolved
+// fairly. The bug is a ranking between two specific instants, so the test has
+// to state those instants.
+func TestPickRotationGroupLocked_OverdueLiquidGroupWins(t *testing.T) {
+	s := newRotationTestSession(nil)
+	s.book = quotes.NewBook()
+	now := time.Now()
+
+	s.optChain.rotation = []optResGroup{
+		{groupID: 0, symbol: "LIQUID"},
+		{groupID: 1, symbol: "THIN"},
+	}
+	s.optChain.mktReqs[10] = &optMktReq{groupID: 0, symbol: "LIQUID", right: "call", strike: 100}
+	s.optChain.mktReqs[20] = &optMktReq{groupID: 1, symbol: "THIN", right: "call", strike: 50}
+
+	// LIQUID is badly overdue for a strike re-estimate; THIN was serviced a
+	// moment ago. On need alone LIQUID must win.
+	s.optChain.lastAttempt[0] = now.Add(-10 * time.Second)
+	s.optChain.lastAttempt[1] = now.Add(-1 * time.Second)
+
+	// ...but LIQUID is quoting continuously, which is what used to disqualify
+	// it: max(lastAttempt, bookTime) made its score ~now, later than THIN's
+	// one-second-old service time, so THIN won despite being ten times more
+	// recently serviced.
+	s.book.SetOptionBid(quotes.ContractKey{Symbol: "LIQUID", Right: "call", Strike: 100}, 1.25)
+
+	s.optChain.mu.Lock()
+	g, ok := s.pickRotationGroupLocked()
+	s.optChain.mu.Unlock()
+
+	if !ok {
+		t.Fatal("expected a group, got none")
+	}
+	if g.symbol != "LIQUID" {
+		t.Fatalf("picked %s, want LIQUID — a group 10s overdue must not lose to one serviced 1s ago just because its quotes are fresh", g.symbol)
+	}
+}
+
+// TestPickRotationGroupLocked_LeglessGroupDoesNotMonopolize covers the
+// opposite starvation the old quote-based scorer had: it skipped every right
+// with no active leg, so a group with NO legs never entered the comparison at
+// all and returned the zero time.Time — beating every real timestamp, every
+// tick, forever. That state is reachable in production, since
+// handleOptionMktError drops a leg on error 200 and returns without
+// resubscribing when no ATM retry record exists.
+func TestPickRotationGroupLocked_LeglessGroupDoesNotMonopolize(t *testing.T) {
+	s := newRotationTestSession(nil)
+	now := time.Now()
+
+	s.optChain.rotation = []optResGroup{
+		{groupID: 0, symbol: "LEGLESS"},
+		{groupID: 1, symbol: "NORMAL"},
+	}
+	// LEGLESS has no mktReqs entry at all; NORMAL has one.
+	s.optChain.mktReqs[20] = &optMktReq{groupID: 1, symbol: "NORMAL", right: "call", strike: 50}
+
+	// LEGLESS was serviced most recently, so NORMAL is the one due.
+	s.optChain.lastAttempt[0] = now.Add(-1 * time.Second)
+	s.optChain.lastAttempt[1] = now.Add(-10 * time.Second)
+
+	s.optChain.mu.Lock()
+	g, ok := s.pickRotationGroupLocked()
+	s.optChain.mu.Unlock()
+
+	if !ok {
+		t.Fatal("expected a group, got none")
+	}
+	if g.symbol != "NORMAL" {
+		t.Fatalf("picked %s, want NORMAL — a group with zero legs must age like any other, not score as infinitely stale", g.symbol)
+	}
+}

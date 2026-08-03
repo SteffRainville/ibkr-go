@@ -52,6 +52,39 @@ func TestStockBidTimeAdvancesOnlyOnChange(t *testing.T) {
 	}
 }
 
+// TestOptionBidTimeAdvancesOnlyOnChange is the option analogue of the stock
+// test above, and exists to document the exact property that makes these
+// timestamps unusable as a liveness signal: an unchanged re-tick leaves the
+// clock alone, so a contract that is quoting steadily at a flat price is
+// indistinguishable here from one IB has stopped serving entirely. That is
+// deliberate — BidTime/AskTime answer "how current is this VALUE" — but it is
+// why dead-leg detection carries its own per-leg lastTickAt (see deadleg.go)
+// rather than reusing these.
+func TestOptionBidTimeAdvancesOnlyOnChange(t *testing.T) {
+	b := NewBook()
+	key := ContractKey{Symbol: "QQQ", Right: "put", Strike: 693, Expiry: "20260805"}
+
+	b.SetOptionBid(key, 9.26)
+	q1, ok := b.Option(key)
+	if !ok {
+		t.Fatal("option quote missing after first write")
+	}
+
+	time.Sleep(2 * time.Millisecond)
+	b.SetOptionBid(key, 9.26) // unchanged — a live but flat quote
+	q2, _ := b.Option(key)
+	if !q2.BidTime.Equal(q1.BidTime) {
+		t.Fatal("BidTime advanced on an unchanged re-tick")
+	}
+
+	time.Sleep(2 * time.Millisecond)
+	b.SetOptionBid(key, 12.69) // changed
+	q3, _ := b.Option(key)
+	if !q3.BidTime.After(q1.BidTime) {
+		t.Fatal("BidTime did not advance on a changed tick")
+	}
+}
+
 func TestNonPositiveWritesIgnored(t *testing.T) {
 	b := NewBook()
 	b.SetStockBid("QQQ", 0)

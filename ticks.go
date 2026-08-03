@@ -154,6 +154,16 @@ func (s *Session) TickString(reqID int64, tickType int64, value string) {
 
 // TickSize handles size ticks. Captures daily volume for scanner enrichment snapshots.
 func (s *Session) TickSize(reqID int64, tickType int64, size ibapi.Decimal) {
+	// Stamp option-leg liveness first, in its OWN critical section. This must
+	// not be folded into the logging call below: s.resolveReqID takes
+	// optChain.mu itself, so nesting the two would self-deadlock. Size ticks
+	// are the most valuable liveness signal available — they keep arriving on
+	// a liquid option whose price is flat, which is precisely the case the
+	// Book's advance-on-change timestamps cannot distinguish from a dead line.
+	s.optChain.mu.Lock()
+	s.touchOptionLegLocked(reqID, time.Now())
+	s.optChain.mu.Unlock()
+
 	s.logger.Printf("TickSize: symbol=%s reqID=%d tickType=%d size=%s", s.resolveReqID(reqID), reqID, tickType, ibapi.DecimalMaxString(size))
 
 	switch tickType {
@@ -175,6 +185,10 @@ func (s *Session) TickOptionComputation(reqID int64, tickType int64, tickAttrib 
 	}
 
 	s.optChain.mu.Lock()
+
+	// A leg can receive greeks without a price tick; without this stamp such
+	// a leg would look dead to the reaper while IB is actively serving it.
+	s.touchOptionLegLocked(reqID, time.Now())
 
 	if impliedVol > 0 {
 		if s.optChain.lastIV == nil {
@@ -234,6 +248,11 @@ func (s *Session) TickOptionComputation(reqID int64, tickType int64, tickAttrib 
 // name. Tick type 49 is the halt status: 0=not halted, 1=general halt,
 // 2=volatility halt.
 func (s *Session) TickGeneric(reqID int64, tickType int64, value float64) {
+	// Separate critical section — see the TickSize note on resolveReqID.
+	s.optChain.mu.Lock()
+	s.touchOptionLegLocked(reqID, time.Now())
+	s.optChain.mu.Unlock()
+
 	s.logger.Printf("TickGeneric: symbol=%s reqID=%d tickType=%d value=%g", s.resolveReqID(reqID), reqID, tickType, value)
 	if tickType == 49 {
 		s.scanner.mu.Lock()

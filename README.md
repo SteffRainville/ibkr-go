@@ -51,7 +51,7 @@ type Subscriber interface {
 }
 ```
 
-The library publishes generic events on each subscriber's bus — `KindCandle`, `KindLiveTick`, `KindOrderFilled`, `KindCommissionReport`, `KindOrderRejected`, `KindOrderQtyMismatch`, `KindOptionData` — and exposes `Session.OpenPosition` / `ClosePosition` for order placement, `Session.ResolveEntryStrike` / `CurrentLeg` / `SubscribePositionStrike` for option chain work, and `Session.RunScanner` / `FetchHistorical` for the rest.
+The library publishes generic events on each subscriber's bus — `KindCandle`, `KindLiveTick`, `KindOrderFilled`, `KindCommissionReport`, `KindOrderRejected`, `KindOrderQtyMismatch`, `KindOptionData` — and exposes `Session.OpenPosition` / `ClosePosition` for order placement, `Session.ResolveEntryStrike` / `SubscribePositionStrike` for option chain work, and `Session.RunScanner` / `FetchHistorical` for the rest.
 
 ## What this library deliberately does not do
 

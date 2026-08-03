@@ -77,7 +77,22 @@ func (s *Session) HistoricalDataEnd(reqID int64, startDateStr string, endDateStr
 // HistoricalDataUpdate is called repeatedly while a live bar is forming.
 // Each call is a partial update; the candle store assembles them into
 // completed 30-second bars as bar boundaries are crossed.
+//
+// On-demand keepUpToDate streams (SubscribeOptionBars — reqID tracked in
+// s.onDemand, not s.reqSymbol) are routed here too. They only feed the
+// candle store: no eventbus publish, no book/position-price update, and no
+// bar-feed watchdog stamp — an ad-hoc option chart subscription must never
+// look like (or count as) live trading-symbol data flow.
 func (s *Session) HistoricalDataUpdate(reqId int64, bar *ibapi.Bar) {
+	s.onDemand.mu.Lock()
+	odSym, isOD := s.onDemand.reqSymbol[reqId]
+	s.onDemand.mu.Unlock()
+	if isOD {
+		date := FormatBarDate(bar.Date)
+		s.Candles.UpdateLive(odSym, date, bar.Open, bar.High, bar.Low, bar.Close, bar.Volume.Float(), bar.Wap.Float(), bar.BarCount)
+		return
+	}
+
 	// Stamp the bar-feed watchdog liveness signal.
 	s.lastBarNano.Store(time.Now().UnixNano())
 

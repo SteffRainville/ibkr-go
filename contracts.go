@@ -24,6 +24,9 @@ func (s *Session) ContractDetails(reqID int64, contractDetails *ibapi.ContractDe
 	if s.handleConIDContractDetails(reqID, contractDetails) {
 		return
 	}
+	if s.handleOptionQueryContractDetails(reqID, contractDetails) {
+		return
+	}
 
 	s.scanner.mu.Lock()
 	entry, ok := s.scanner.cdData[reqID]
@@ -83,6 +86,9 @@ func (s *Session) ContractDetails(reqID int64, contractDetails *ibapi.ContractDe
 // ReqContractDetails request have been delivered.
 func (s *Session) ContractDetailsEnd(reqID int64) {
 	if s.handleConIDContractDetailsEnd(reqID) {
+		return
+	}
+	if s.handleOptionQueryContractDetailsEnd(reqID) {
 		return
 	}
 

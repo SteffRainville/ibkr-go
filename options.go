@@ -98,6 +98,18 @@ type optMktReq struct {
 	// active once it carries a complete quote, or after pendingPromoteGrace.
 	pending      bool
 	pendingSince time.Time
+
+	// subscribedAt is when ReqMktData was issued for this reqID, and
+	// lastTickAt when IB last delivered ANY message for it (zero = never).
+	// These are liveness, deliberately distinct from the quotes.Book's
+	// BidTime/AskTime, which advance only when a price actually CHANGES
+	// (quotes/book.go) and therefore cannot tell "alive but unchanged" from
+	// "dead". Without a separate liveness clock a leg IB has silently
+	// stopped serving is indistinguishable from a quiet one, which is how
+	// the 2026-08-03 QQQ/SPY/IWM legs sat frozen for two hours while the
+	// dashboard showed a plausible price 35% away from the real market.
+	subscribedAt time.Time
+	lastTickAt   time.Time
 }
 
 // pendingPromoteGrace bounds how long a replacement option leg may stay
@@ -135,6 +147,13 @@ type posStrikeSub struct {
 	// deltaSource mirrors optMktReq.deltaSource — copied from the matching
 	// ATM leg at pin time, if one exists.
 	deltaSource string
+
+	// subscribedAt / lastTickAt mirror optMktReq's liveness clocks. These
+	// matter more here than on a background leg: a frozen pinned leg means
+	// stop-loss and trailing-stop are evaluating a stale price, so it either
+	// never trips or trips on a stale extreme.
+	subscribedAt time.Time
+	lastTickAt   time.Time
 }
 
 // deltaCandidate tracks one strike subscription used during delta-based
@@ -244,6 +263,27 @@ type optionChainTracker struct {
 	// persist even across a "skip — estimate strike unchanged" cycle, which
 	// creates no new mktReqs entry at all.
 	lastAttempt map[int]time.Time
+
+	// lastAnyOptionTick is the most recent moment ANY option reqID received
+	// a message from IB. It is what separates "this one leg died" from "the
+	// whole option feed is quiet" — off-RTH, a halt, a broker outage. Judging
+	// a leg dead only while its peers are demonstrably alive collapses all of
+	// those false-positive cases into a single rule, and stops a market-wide
+	// lull from condemning every leg at once and triggering a re-subscribe
+	// storm against a broker that is not answering anyway.
+	lastAnyOptionTick time.Time
+
+	// forcedResub tracks per-leg forced re-subscribe attempts so a contract
+	// IB will never quote (delisted, bad expiry) cannot burn a market-data
+	// line every tick forever. Keyed by retryKeyLeg for background legs and
+	// by the posSubKeys format for pinned ones.
+	forcedResub map[string]resubState
+}
+
+// resubState is one leg's forced-re-subscribe backoff record.
+type resubState struct {
+	last     time.Time
+	attempts int
 }
 
 // resolvedEntryLeg is one group's most recently resolved entry contract
@@ -412,6 +452,7 @@ func (s *Session) resolveOptionGroup(g optResGroup) {
 // permanent slow rotation rather than a synchronized burst.
 func (s *Session) rotateOptionStrikes() {
 	s.reapStuckChainRequests()
+	s.reapDeadOptionLegs()
 	s.optChain.mu.Lock()
 	g, ok := s.pickRotationGroupLocked()
 	s.optChain.mu.Unlock()
@@ -473,31 +514,29 @@ func (s *Session) pickRotationGroupLocked() (optResGroup, bool) {
 		return optResGroup{}, false
 	}
 	// Scanning starts at rotateCursor (wrapping) rather than always at index
-	// 0. groupStalenessLocked returns the zero time.Time for a group that
-	// has never quoted, so a large batch of never-quoted groups — the common
-	// startup case, or any time the market has no ticks flowing (e.g.
-	// outside RTH) — all tie at the same score. score.Before(bestScore) is
-	// strict, so a tie never replaces the current best; starting the scan at
-	// index 0 every time therefore let group 0 win every single tie forever,
-	// starving every other group's very first resolution attempt for the
-	// rest of the session (the 2026-07-28 stuck-first-quote investigation:
-	// one group got re-picked every 3s tick while dozens of others never
-	// got a turn). Starting from the cursor and always advancing it past
-	// whichever group is returned makes ties resolve in fair round-robin
-	// order while a genuinely staler group (a strictly earlier real
-	// timestamp, found anywhere in the scan) still wins over one that's
-	// merely next in line.
+	// 0. groupLastServicedLocked returns the zero time.Time for a group that
+	// has never been resolved, so a large batch of them — the common startup
+	// case — all tie at the same score. score.Before(bestScore) is strict, so
+	// a tie never replaces the current best; starting the scan at index 0
+	// every time therefore let group 0 win every single tie forever, starving
+	// every other group's very first resolution attempt for the rest of the
+	// session (the 2026-07-28 stuck-first-quote investigation: one group got
+	// re-picked every 3s tick while dozens of others never got a turn).
+	// Starting from the cursor and always advancing it past whichever group
+	// is returned makes ties resolve in fair round-robin order while a
+	// genuinely staler group (a strictly earlier real timestamp, found
+	// anywhere in the scan) still wins over one that's merely next in line.
 	var best optResGroup
 	var bestIdx int
 	var bestScore time.Time
 	found := false
-	for i := 0; i < n; i++ {
+	for i := range n {
 		idx := (s.optChain.rotateCursor + i) % n
 		g := s.optChain.rotation[idx]
 		if s.groupResolvingLocked(g.groupID) {
 			continue
 		}
-		score := s.groupStalenessLocked(g)
+		score := s.groupLastServicedLocked(g)
 		if !found || score.Before(bestScore) {
 			found, best, bestIdx, bestScore = true, g, idx, score
 		}
@@ -509,51 +548,32 @@ func (s *Session) pickRotationGroupLocked() (optResGroup, bool) {
 	return best, true
 }
 
-// groupStalenessLocked returns the freshness of a group's stalest active
-// option leg. Must be called with s.optChain.mu held.
+// groupLastServicedLocked returns when the rotation last actually resolved
+// this group — the zero time.Time if it never has, so a brand-new group is
+// served first. Must be called with s.optChain.mu held.
 //
-// A leg with an active subscription but no book quote yet falls back to
-// s.optChain.lastAttempt[g.groupID] rather than the zero time.Time. The zero
-// value would otherwise score as "infinitely stale," which does not merely
-// win ties (pickRotationGroupLocked's round-robin cursor already handles
-// that) but beats every group with a real, recent quote timestamp
-// unconditionally, every single tick. A leg IB simply never sends ticks for
-// (thin liquidity, a stale estimate strike, etc.) would then monopolize the
-// rotation forever, starving every other group's churn — the 2026-07-31
-// stuck-at-31 "Background ATM — first quote" investigation: three symbols
-// alone (GLD/HOOD/INTC) took 96/50/39 of the rotation picks in a 14-minute
-// window while 12 of 21 configured groups got none. lastAttempt still
-// reports the zero value for a group that has genuinely never been
-// resolved at all, so a fresh, never-touched group keeps the same
-// highest-priority treatment it always had — only a group that has already
-// had its shot and failed to get a quote ages forward like everyone else
-// instead of being frozen at "more stale than the dawn of time."
-func (s *Session) groupStalenessLocked(g optResGroup) time.Time {
-	var score time.Time
-	first := true
-	for _, right := range [...]string{"call", "put"} {
-		leg, ok := s.activeLegLocked(g.symbol, right)
-		if !ok {
-			continue
-		}
-		t := s.optChain.lastAttempt[g.groupID]
-		if s.book != nil {
-			key := quotes.ContractKey{Symbol: g.symbol, Right: right, Strike: leg.strike, Expiry: leg.expiry}
-			if q, ok := s.book.Option(key); ok {
-				bookT := q.AskTime
-				if q.BidTime.After(bookT) {
-					bookT = q.BidTime
-				}
-				if bookT.After(t) {
-					t = bookT
-				}
-			}
-		}
-		if first || t.Before(score) {
-			score, first = t, false
-		}
-	}
-	return score
+// This is deliberately NOT scored on quote freshness. It used to be, and that
+// was backwards: the rotation exists to re-estimate a group's strike as the
+// underlying drifts, a need driven by how long it has been since the group
+// was last serviced, not by whether its legs happen to be quoting. Scoring on
+// quote time made "has fresh data" — evidence the group is healthy — count as
+// evidence it was up to date, so any continuously-quoting group scored ~now
+// and lost to every group serviced even a fraction of a second earlier,
+// permanently. On 2026-08-03 that gave SPY, QQQ and IWM (the three most
+// liquid underlyings, 6-15 delta misses each) zero rotation picks in two
+// hours while NVDA (532 misses, i.e. the group least able to obtain a quote)
+// consumed 794 log lines re-estimating futilely. The correlation was exact
+// and inverted: the better a group's data, the less often it was refreshed.
+//
+// Dropping the Book lookup also closes a latent starvation of the opposite
+// kind. The old loop skipped each right with no active leg, so a group with
+// NO legs at all left first==true and returned the zero time — winning every
+// tick forever. That state is reachable today: handleOptionMktError deletes a
+// leg on error 200 and returns without resubscribing when no ATM retry record
+// exists. Keying on lastAttempt, which is recorded whether or not any leg
+// results, makes a legless group age like any other.
+func (s *Session) groupLastServicedLocked(g optResGroup) time.Time {
+	return s.optChain.lastAttempt[g.groupID]
 }
 
 // groupResolvingLocked reports whether an option resolution for groupID is
@@ -632,6 +652,9 @@ func (s *Session) handleConIDContractDetailsEnd(reqID int64) bool {
 // reqSecDefOptParams call. Only the SMART exchange response is kept — it
 // contains exactly the strikes routable via SMART for market data and orders.
 func (s *Session) SecurityDefinitionOptionParameter(reqID int64, exchange string, underlyingConID int64, tradingClass string, multiplier string, expirations []string, strikes []float64) {
+	if s.handleOptionQuerySecDefOptParams(reqID, exchange, expirations, strikes) {
+		return
+	}
 	if exchange != "SMART" {
 		return
 	}
@@ -672,6 +695,9 @@ func (s *Session) SecurityDefinitionOptionParameter(reqID int64, exchange string
 // nearest expiry and ATM/target-delta strike, stores a sorted retry list in
 // case error 200 forces a fallback, then subscribes market data.
 func (s *Session) SecurityDefinitionOptionParameterEnd(reqID int64) {
+	if s.handleOptionQuerySecDefOptParamsEnd(reqID) {
+		return
+	}
 	s.optChain.mu.Lock()
 	req, ok := s.optChain.chainReqs[reqID]
 	if !ok {
@@ -752,7 +778,7 @@ func (s *Session) SecurityDefinitionOptionParameterEnd(reqID int64) {
 			strike := strikes[0]
 			s.optionLog.Printf("Option chain resolved: %s %s (group=%d) expiry=%s strike=%.2f (underlying≈%.2f, ATM, subs=%v)",
 				symbol, right, groupID, expiry, strike, undPrice, busIdxs)
-			s.subscribeOptionLeg(groupID, busIdxs, symbol, right, strike, expiry, false)
+			s.subscribeOptionLeg(groupID, busIdxs, symbol, right, strike, expiry, false, false)
 			s.optChain.mu.Lock()
 			s.optChain.retries[retryKeyLeg(groupID, right)] = &optStrikeRetry{
 				groupID: groupID, symbol: symbol, expiry: expiry, strikes: strikes, nextIdx: 1, pending: 1, busIdxs: busIdxs,
@@ -762,14 +788,15 @@ func (s *Session) SecurityDefinitionOptionParameterEnd(reqID int64) {
 		}
 
 		s.optChain.mu.Lock()
-		if active, hasActive := s.activeLegLocked(symbol, right); hasActive &&
-			active.deltaSource == "matched" && math.Abs(math.Abs(active.delta)-td) <= deltaDriftTolerance {
-			s.optChain.mu.Unlock()
-			s.optionLog.Printf("Option: skipping strike re-estimate %s %s (group=%d) — live delta %.4f still within %.2f of target %.2f",
-				symbol, right, groupID, active.delta, deltaDriftTolerance, td)
+		skip, skipReason := s.shouldSkipReEstimateLocked(symbol, right, td, time.Now())
+		s.optChain.mu.Unlock()
+		if skip {
+			s.optionLog.Printf("Option: skipping strike re-estimate %s %s (group=%d) — %s", symbol, right, groupID, skipReason)
 			continue
 		}
-		s.optChain.mu.Unlock()
+		if skipReason != "" {
+			s.optionLog.Printf("Option: WARNING forcing re-estimate %s %s (group=%d) — %s", symbol, right, groupID, skipReason)
+		}
 
 		s.optChain.mu.Lock()
 		iv := s.optChain.lastIV[symbol]
@@ -782,7 +809,7 @@ func (s *Session) SecurityDefinitionOptionParameterEnd(reqID int64) {
 			symbol, right, groupID, strike, td, iv)
 		s.logDeltaMiss(symbol, right, td, undPrice, strikes, "estimate_default", strike, iv)
 		if strike > 0 {
-			s.subscribeOptionLeg(groupID, busIdxs, symbol, right, strike, expiry, true)
+			s.subscribeOptionLeg(groupID, busIdxs, symbol, right, strike, expiry, true, false)
 		}
 	}
 }
@@ -836,12 +863,110 @@ func (s *Session) replaceMktReqLocked(symbol, right string, newReqID int64) {
 // activeLegLocked returns the ACTIVE (non-pending) mktReqs leg for (symbol,
 // right), if one exists. Must be called with s.optChain.mu held.
 func (s *Session) activeLegLocked(symbol, right string) (*optMktReq, bool) {
-	for _, req := range s.optChain.mktReqs {
+	_, req, ok := s.activeLegWithIDLocked(symbol, right)
+	return req, ok
+}
+
+// activeLegWithIDLocked is activeLegLocked plus the leg's reqID, which is the
+// mktReqs map key rather than a field on the struct. Callers that need to
+// cancel or release the leg's market-data line need the id. Must be called
+// with s.optChain.mu held.
+func (s *Session) activeLegWithIDLocked(symbol, right string) (int64, *optMktReq, bool) {
+	for reqID, req := range s.optChain.mktReqs {
 		if req.symbol == symbol && req.right == right && !req.pending {
-			return req, true
+			return reqID, req, true
 		}
 	}
-	return nil, false
+	return 0, nil, false
+}
+
+// dropLegLocked removes a background leg entirely: out of mktReqs, its
+// market-data line released, and the broker subscription cancelled. Used when
+// a dead leg must surrender its line so a replacement can be granted one.
+// Must be called with s.optChain.mu held.
+func (s *Session) dropLegLocked(reqID int64) {
+	if _, ok := s.optChain.mktReqs[reqID]; !ok {
+		return
+	}
+	delete(s.optChain.mktReqs, reqID)
+	s.mdLines.Release(reqID)
+	s.client.CancelMktData(reqID)
+}
+
+// shouldSkipReEstimateLocked reports whether the active leg for (symbol,
+// right) is already close enough to the target delta that re-estimating its
+// strike would be wasted work. reason is a human-readable explanation for the
+// caller's log line — non-empty on a forced re-estimate too, so the operator
+// can see WHY a leg that looks fine on paper is being refreshed anyway.
+// Must be called with s.optChain.mu held.
+//
+// The freshness test is the whole point. active.delta is a CACHED field,
+// written only when IB delivers a greeks tick, so it freezes at its last
+// value the instant a leg goes dead — and a frozen delta near the target is
+// indistinguishable from a live one. Before this check the frozen value was
+// what justified skipping the refresh, so a dead leg permanently talked the
+// rotation out of repairing it: the 2026-08-03 incident, where QQQ's put
+// froze at δ -0.5672 against a 0.60 target (drift 0.033, inside the 0.05
+// tolerance) and skipped re-estimation for the rest of the session while its
+// quote aged past two hours. The old log line called it "live delta", which
+// is precisely the false claim that hid the bug.
+func (s *Session) shouldSkipReEstimateLocked(symbol, right string, td float64, now time.Time) (skip bool, reason string) {
+	active, hasActive := s.activeLegLocked(symbol, right)
+	if !hasActive {
+		return false, ""
+	}
+	if active.deltaSource != "matched" {
+		return false, ""
+	}
+	if math.Abs(math.Abs(active.delta)-td) > deltaDriftTolerance {
+		return false, ""
+	}
+
+	health := legHealthAt(active.subscribedAt, active.lastTickAt, s.optChain.lastAnyOptionTick, now)
+	if health == legHealthy || health == legWarming {
+		return true, fmt.Sprintf("live delta %.4f (last tick %s ago) still within %.2f of target %.2f",
+			active.delta, legAgeString(active.lastTickAt, now), deltaDriftTolerance, td)
+	}
+	return false, fmt.Sprintf("cached delta %.4f is STALE (last tick %s ago, health=%s) — refusing to trust it",
+		active.delta, legAgeString(active.lastTickAt, now), health)
+}
+
+// legAgeString renders a leg's last-tick age for logs, distinguishing "never
+// ticked" from "ticked a while ago" — they call for different repairs.
+func legAgeString(lastTickAt, now time.Time) string {
+	if lastTickAt.IsZero() {
+		return "never"
+	}
+	return now.Sub(lastTickAt).Truncate(time.Second).String()
+}
+
+// touchOptionLegLocked records that IB delivered a message for reqID, on
+// whichever of the three option request maps owns it, and advances the
+// session-wide lastAnyOptionTick. Must be called with s.optChain.mu held.
+//
+// It is deliberately called for EVERY tick type — including size and generic
+// ticks whose values we discard — because the question it answers is "is this
+// subscription still being served", not "did the price move". Those are
+// different questions with different answers: a liquid option with a flat
+// quote still receives a steady stream of size ticks, so restricting the
+// stamp to ticks we happen to store would re-create the exact blind spot the
+// quotes.Book's advance-on-change timestamps already have.
+func (s *Session) touchOptionLegLocked(reqID int64, now time.Time) {
+	touched := false
+	if req, ok := s.optChain.mktReqs[reqID]; ok {
+		req.lastTickAt = now
+		touched = true
+	}
+	if sub, ok := s.optChain.posSubs[reqID]; ok {
+		sub.lastTickAt = now
+		touched = true
+	}
+	if _, ok := s.optChain.deltaCands[reqID]; ok {
+		touched = true
+	}
+	if touched {
+		s.optChain.lastAnyOptionTick = now
+	}
 }
 
 // mergeBusIdxsLocked adds any of newIdxs not already present in req.busIdxs,
@@ -894,7 +1019,13 @@ func (s *Session) promoteIfReadyLocked(req *optMktReq, reqID int64) bool {
 // subscribeOptionLeg subscribes to market data for a single option leg,
 // routing the resulting option data to the buses of the owning resolution
 // group. fallback marks a strike chosen without a genuine live delta match.
-func (s *Session) subscribeOptionLeg(groupID int, busIdxs []int, symbol, right string, strike float64, expiry string, fallback bool) {
+//
+// force re-subscribes even when the active leg already sits at this exact
+// strike. Normally that case is a no-op — re-subscribing an identical
+// contract would burn a market-data line for nothing — but that shortcut is
+// also what makes a silently dead leg unrepairable, since the repair IS
+// re-subscribing the same strike. Only reapDeadOptionLegs passes true.
+func (s *Session) subscribeOptionLeg(groupID int, busIdxs []int, symbol, right string, strike float64, expiry string, fallback, force bool) {
 	ibRight := "C"
 	if right == "put" {
 		ibRight = "P"
@@ -902,8 +1033,8 @@ func (s *Session) subscribeOptionLeg(groupID int, busIdxs []int, symbol, right s
 	contract := makeOptionContract(symbol, ibRight, strike, expiry)
 
 	s.optChain.mu.Lock()
-	active, hasActive := s.activeLegLocked(symbol, right)
-	if hasActive && active.strike == strike {
+	activeReqID, active, hasActive := s.activeLegWithIDLocked(symbol, right)
+	if hasActive && active.strike == strike && !force {
 		added := mergeBusIdxsLocked(active, busIdxs)
 		snapshot := *active
 		s.optChain.mu.Unlock()
@@ -936,9 +1067,31 @@ func (s *Session) subscribeOptionLeg(groupID int, busIdxs []int, symbol, right s
 	s.optChain.mu.Unlock()
 
 	var granted bool
-	if hasActive {
+	switch {
+	case force:
+		// A forced re-subscribe is repairing a dead leg, so it is a
+		// first-quote request in every sense that matters even though an
+		// "active" leg exists: there is no working line for this contract.
+		// Grading it as churn would be actively wrong, since churn is refused
+		// first under line pressure (ReserveChurn 25 vs ReserveNew 15) —
+		// exactly when a dead leg squatting on a line costs the most.
+		granted = s.mdLines.GrantDiscretionaryNew(mktReqID)
+		if !granted && hasActive {
+			// Nothing left to grant from. Release the dead leg's own line and
+			// take its place. This opens a brief window where the row has no
+			// contract and a buy would fail loudly — strictly better than
+			// filling an order priced off a quote that stopped updating hours
+			// ago, which is what the dead leg would otherwise supply.
+			s.optionLog.Printf("Option: WARNING forced re-subscribe %s %s (group=%d) could not get a line — releasing the dead leg (reqID=%d) to make room",
+				symbol, right, groupID, activeReqID)
+			s.optChain.mu.Lock()
+			s.dropLegLocked(activeReqID)
+			s.optChain.mu.Unlock()
+			granted = s.mdLines.GrantDiscretionaryNew(mktReqID)
+		}
+	case hasActive:
 		granted = s.mdLines.GrantDiscretionaryChurn(mktReqID)
-	} else {
+	default:
 		granted = s.mdLines.GrantDiscretionaryNew(mktReqID)
 	}
 	if !granted {
@@ -954,6 +1107,7 @@ func (s *Session) subscribeOptionLeg(groupID int, busIdxs []int, symbol, right s
 	req := &optMktReq{
 		groupID: groupID, symbol: symbol, right: right, strike: strike, expiry: expiry,
 		busIdxs: busIdxs, pending: pending, deltaSource: deltaSource,
+		subscribedAt: time.Now(),
 	}
 	if pending {
 		req.pendingSince = time.Now()
@@ -1044,7 +1198,7 @@ func (s *Session) resolveDeltaCandidates(groupID int, symbol, right string) (Opt
 			symbol, right, groupID, estStrike, targetDelta, iv)
 		s.logDeltaMiss(symbol, right, targetDelta, undPrice, allStrikes, "no_deltas_received", estStrike, iv)
 		if estStrike > 0 {
-			s.subscribeOptionLeg(groupID, busIdxs, symbol, right, estStrike, expiry, true)
+			s.subscribeOptionLeg(groupID, busIdxs, symbol, right, estStrike, expiry, true, false)
 		}
 		return OptionQuote{}, false
 	}
@@ -1053,6 +1207,10 @@ func (s *Session) resolveDeltaCandidates(groupID int, symbol, right string) (Opt
 	winner := &optMktReq{
 		groupID: groupID, symbol: best.symbol, right: best.right, strike: best.strike, expiry: best.expiry,
 		delta: best.delta, bid: best.bid, ask: best.ask, busIdxs: res.busIdxs, pending: pending, deltaSource: "matched",
+		// It was already subscribed as a probe and has been ticking (that is
+		// how it won on delta), so carry a real liveness clock forward rather
+		// than leaving it zero and looking never-subscribed to the reaper.
+		subscribedAt: time.Now(), lastTickAt: time.Now(),
 	}
 	s.optChain.mktReqs[best.reqID] = winner
 	s.mdLines.Reclassify(best.reqID, mdlines.CategoryDiscretionaryNew)
@@ -1126,44 +1284,6 @@ func deltaCandidatesSettled(candidates []*deltaCandidate, targetDelta float64) b
 		}
 	}
 	return allReady
-}
-
-// CurrentLeg returns the currently active leg's strike/delta/bid/ask for
-// symbol+right as a single atomic snapshot — no new IB call. ok is true
-// only when that leg already carries a live, IB-confirmed delta within
-// deltaDriftTolerance of the resolution group's target_delta, and has a
-// usable two-sided quote. This is the fast path a caller should check
-// before paying for ResolveEntryStrike's multi-candidate probe.
-func (s *Session) CurrentLeg(symbol, right string) (OptionQuote, bool) {
-	s.optChain.mu.Lock()
-	defer s.optChain.mu.Unlock()
-
-	active, hasActive := s.activeLegLocked(symbol, right)
-	if !hasActive || active.deltaSource != "matched" || active.bid <= 0 || active.ask <= 0 {
-		return OptionQuote{}, false
-	}
-	group, hasGroup := s.groupForSymbolLocked(symbol)
-	if !hasGroup {
-		return OptionQuote{}, false
-	}
-	target := group.targetDeltaCall
-	if right == "put" {
-		target = group.targetDeltaPut
-	}
-	if math.Abs(math.Abs(active.delta)-target) > deltaDriftTolerance {
-		return OptionQuote{}, false
-	}
-	q := OptionQuote{Strike: active.strike, Expiry: active.expiry, Bid: active.bid, Ask: active.ask, Last: active.price, Delta: active.delta}
-	// active (optMktReq) caches raw tick values but not when each side last
-	// ticked; the Book is already written on every tick (handleOptionTick →
-	// bookOption) for this exact contract, so read the timestamps back from
-	// there rather than tracking a second, parallel copy.
-	if s.book != nil {
-		if bq, ok := s.book.Option(quotes.ContractKey{Symbol: symbol, Right: right, Strike: active.strike, Expiry: active.expiry}); ok {
-			q.BidTime, q.AskTime = bq.BidTime, bq.AskTime
-		}
-	}
-	return q, true
 }
 
 // ResolveEntryStrike runs a synchronous, bounded, real IB delta probe for
@@ -1338,7 +1458,7 @@ func (s *Session) waitForEntryResolution(groupID int, symbol, right string, time
 // the CALL and PUT at the given strike and expiry, for one resolution group.
 func (s *Session) subscribeOptionMarketData(groupID int, busIdxs []int, symbol string, strike float64, expiry string, fallback bool) {
 	for _, right := range []string{"call", "put"} {
-		s.subscribeOptionLeg(groupID, busIdxs, symbol, right, strike, expiry, fallback)
+		s.subscribeOptionLeg(groupID, busIdxs, symbol, right, strike, expiry, fallback, false)
 	}
 }
 
@@ -1436,6 +1556,11 @@ func (s *Session) handleOptionMktError(reqID int64, errStr string) bool {
 // if reqID was an option market data request, false otherwise.
 func (s *Session) handleOptionTick(reqID int64, tickType int64, price float64) bool {
 	s.optChain.mu.Lock()
+
+	// Stamp liveness before the type switches below: each has a default
+	// branch that returns early on a tick type we do not store, and those
+	// ticks are still proof the subscription is being served.
+	s.touchOptionLegLocked(reqID, time.Now())
 
 	if req, ok := s.optChain.mktReqs[reqID]; ok {
 		switch tickType {
@@ -1809,7 +1934,7 @@ func makeOptionContract(symbol, right string, strike float64, expiry string) *ib
 // feed even as the ATM leg re-resolves to a different strike. No-op if
 // already subscribed for this symbol+right+strike combination.
 func (s *Session) SubscribePositionStrike(symbol, right string, strike float64, expiry string) {
-	key := fmt.Sprintf("%s|%s|%.0f", symbol, right, strike)
+	key := posSubKey(symbol, right, strike)
 
 	s.optChain.mu.Lock()
 	if _, exists := s.optChain.posSubKeys[key]; exists {
@@ -1818,7 +1943,7 @@ func (s *Session) SubscribePositionStrike(symbol, right string, strike float64, 
 	}
 	reqID := s.optChain.nextPosID
 	s.optChain.nextPosID++
-	sub := &posStrikeSub{symbol: symbol, right: right, strike: strike, expiry: expiry, reqID: reqID}
+	sub := &posStrikeSub{symbol: symbol, right: right, strike: strike, expiry: expiry, reqID: reqID, subscribedAt: time.Now()}
 	for _, req := range s.optChain.mktReqs {
 		if req.symbol == symbol && req.right == right && req.strike == strike {
 			sub.deltaSource = req.deltaSource
@@ -1843,7 +1968,7 @@ func (s *Session) SubscribePositionStrike(symbol, right string, strike float64, 
 
 // UnsubscribePositionStrike cancels a position-pinned option subscription.
 func (s *Session) UnsubscribePositionStrike(symbol, right string, strike float64) {
-	key := fmt.Sprintf("%s|%s|%.0f", symbol, right, strike)
+	key := posSubKey(symbol, right, strike)
 
 	s.optChain.mu.Lock()
 	reqID, ok := s.optChain.posSubKeys[key]
