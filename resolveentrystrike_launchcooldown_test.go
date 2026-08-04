@@ -22,14 +22,15 @@ import (
 // immediately rather than blocking or (with s.client nil in this harness)
 // panicking on a real ReqMktData call — i.e. no new probe was launched.
 func TestResolveEntryStrike_LaunchCooldownBlocksRepeatedOwnerAttempt(t *testing.T) {
-	s := newResolveEntryTestSession()
+	sub := newTestSubscriber()
+	s := newResolveEntryTestSession(sub)
 
 	s.optChain.mu.Lock()
 	s.optChain.lastProbeLaunch[retryKeyLeg(1, "put")] = time.Now()
 	s.optChain.mu.Unlock()
 
 	start := time.Now()
-	q, ok := s.ResolveEntryStrike("SPY", "put", 2*time.Second)
+	q, ok := s.ResolveEntryStrike(sub, "SPY", "put", 2*time.Second)
 	elapsed := time.Since(start)
 
 	if ok {
@@ -47,7 +48,8 @@ func TestResolveEntryStrike_LaunchCooldownBlocksRepeatedOwnerAttempt(t *testing.
 // gate sat in front of this call and blocked it from ever running, so a
 // robot could never see what a sibling had already resolved.
 func TestResolveEntryStrike_LaunchCooldownDoesNotBlockSharedRead(t *testing.T) {
-	s := newResolveEntryTestSession()
+	sub := newTestSubscriber()
+	s := newResolveEntryTestSession(sub)
 
 	key := quotes.ContractKey{Symbol: "SPY", Right: "put", Strike: 735, Expiry: "20260731"}
 	s.book.SetOptionBid(key, 6.50)
@@ -61,7 +63,7 @@ func TestResolveEntryStrike_LaunchCooldownDoesNotBlockSharedRead(t *testing.T) {
 	s.optChain.mu.Unlock()
 
 	start := time.Now()
-	q, ok := s.ResolveEntryStrike("SPY", "put", 2*time.Second)
+	q, ok := s.ResolveEntryStrike(sub, "SPY", "put", 2*time.Second)
 	elapsed := time.Since(start)
 
 	if !ok {
@@ -79,7 +81,8 @@ func TestResolveEntryStrike_LaunchCooldownDoesNotBlockSharedRead(t *testing.T) {
 // proves the join-an-in-flight-sibling path is likewise unaffected by an
 // active launch cooldown for the same key.
 func TestResolveEntryStrike_LaunchCooldownDoesNotBlockJoiningInFlightSibling(t *testing.T) {
-	s := newResolveEntryTestSession()
+	sub := newTestSubscriber()
+	s := newResolveEntryTestSession(sub)
 
 	s.optChain.mu.Lock()
 	s.optChain.deltaRes[retryKeyLeg(1, "put")] = &deltaResolution{groupID: 1, symbol: "SPY", right: "put", targetDelta: 0.65}
@@ -98,7 +101,7 @@ func TestResolveEntryStrike_LaunchCooldownDoesNotBlockJoiningInFlightSibling(t *
 		s.optChain.mu.Unlock()
 	}()
 
-	q, ok := s.ResolveEntryStrike("SPY", "put", 2*time.Second)
+	q, ok := s.ResolveEntryStrike(sub, "SPY", "put", 2*time.Second)
 
 	if !ok {
 		t.Fatal("expected to join and receive the sibling's resolved contract despite an active launch cooldown")

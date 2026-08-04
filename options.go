@@ -1271,11 +1271,16 @@ func (s *Session) resolveDeltaCandidates(groupID int, symbol, right string) (Opt
 	return OptionQuote{Strike: best.strike, Expiry: best.expiry, Bid: best.bid, Ask: best.ask, Delta: best.delta, BidTime: now, AskTime: now}, true
 }
 
-// groupForSymbolLocked returns the resolution group for symbol. Caller must
-// hold s.optChain.mu.
-func (s *Session) groupForSymbolLocked(symbol string) (optResGroup, bool) {
+// groupForSymbolLocked returns the resolution group for symbol that busIdx
+// belongs to. busIdx < 0 (subscriber's bus not found in s.buses) falls back
+// to the first group matching symbol, same as the old symbol-only lookup.
+// Caller must hold s.optChain.mu.
+func (s *Session) groupForSymbolLocked(symbol string, busIdx int) (optResGroup, bool) {
 	for _, g := range s.optChain.rotation {
-		if g.symbol == symbol {
+		if g.symbol != symbol {
+			continue
+		}
+		if busIdx < 0 || slices.Contains(g.busIdxs, busIdx) {
 			return g, true
 		}
 	}
@@ -1307,9 +1312,21 @@ func deltaCandidatesSettled(candidates []*deltaCandidate, targetDelta float64) b
 // trip. Reuses the most recently cached chain strikes/expiry rather than
 // repeating the conId + chain-params lookup. Blocks the calling goroutine
 // for up to timeout waiting on IB's TickOptionComputation.
-func (s *Session) ResolveEntryStrike(symbol, right string, timeout time.Duration) (OptionQuote, bool) {
+//
+// sub identifies the calling subscriber so the right resolution group is
+// used when more than one group tracks the same symbol+right with different
+// target_delta configs (e.g. two robots on the same underlying) — groups are
+// sorted by target_delta ascending when assigned (buildOptionGroups), so a
+// symbol-only lookup would always hand every caller the smallest-target_delta
+// group regardless of its own config. That is what happened on 2026-08-04:
+// VWmacdOptionRobot (target_delta 0.60) entered IWM call priced against
+// VWmacdOptionDataRobot's group (target_delta 0.55) instead of its own,
+// landing near 0.60 only because a single candidate happened to be the only
+// one to report a delta in time — not because anything validated the target.
+func (s *Session) ResolveEntryStrike(sub Subscriber, symbol, right string, timeout time.Duration) (OptionQuote, bool) {
+	busIdx := s.busIndex(sub.Bus())
 	s.optChain.mu.Lock()
-	group, hasGroup := s.groupForSymbolLocked(symbol)
+	group, hasGroup := s.groupForSymbolLocked(symbol, busIdx)
 	info, hasInfo := s.optChain.lastChainInfo[symbol]
 	resKey := retryKeyLeg(group.groupID, right)
 	_, inFlight := s.optChain.deltaRes[resKey]
