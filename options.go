@@ -154,6 +154,21 @@ type posStrikeSub struct {
 	// never trips or trips on a stale extreme.
 	subscribedAt time.Time
 	lastTickAt   time.Time
+
+	// refCount counts independent holders of this exact symbol+right+strike
+	// subscription. Two robots (or two positions) can resolve to the same
+	// contract and share one IB feed by design (posSubKey has no robot
+	// identity) — but that means an unconditional unsubscribe on any single
+	// holder's exit would kill the feed out from under every other holder
+	// still relying on it for stop-loss/trailing-stop pricing. That is
+	// exactly what happened on 2026-08-04: VWmacdOptionRobot's IWM 298 PUT
+	// hit its trailing stop and unsubscribed reqID 10011 at the same moment
+	// OrbOptionRobot's own IWM 298 PUT — opened a minute earlier and sharing
+	// the same key — was still open, freezing its quote at ~$1.83 for the
+	// rest of the session while the real market fell to $0.02. refCount
+	// makes subscribe/unsubscribe additive: the feed is only torn down once
+	// the last holder releases it.
+	refCount int
 }
 
 // deltaCandidate tracks one strike subscription used during delta-based
@@ -1937,13 +1952,16 @@ func (s *Session) SubscribePositionStrike(symbol, right string, strike float64, 
 	key := posSubKey(symbol, right, strike)
 
 	s.optChain.mu.Lock()
-	if _, exists := s.optChain.posSubKeys[key]; exists {
+	if existingID, exists := s.optChain.posSubKeys[key]; exists {
+		if existing, ok := s.optChain.posSubs[existingID]; ok {
+			existing.refCount++
+		}
 		s.optChain.mu.Unlock()
 		return
 	}
 	reqID := s.optChain.nextPosID
 	s.optChain.nextPosID++
-	sub := &posStrikeSub{symbol: symbol, right: right, strike: strike, expiry: expiry, reqID: reqID, subscribedAt: time.Now()}
+	sub := &posStrikeSub{symbol: symbol, right: right, strike: strike, expiry: expiry, reqID: reqID, subscribedAt: time.Now(), refCount: 1}
 	for _, req := range s.optChain.mktReqs {
 		if req.symbol == symbol && req.right == right && req.strike == strike {
 			sub.deltaSource = req.deltaSource
@@ -1966,7 +1984,11 @@ func (s *Session) SubscribePositionStrike(symbol, right string, strike float64, 
 	s.client.ReqMktData(reqID, contract, "", false, false, nil)
 }
 
-// UnsubscribePositionStrike cancels a position-pinned option subscription.
+// UnsubscribePositionStrike releases one holder's interest in a
+// position-pinned option subscription. Only tears down the IB feed once
+// every holder that shares this exact symbol+right+strike (see posStrikeSub's
+// refCount doc) has released it — a still-open sibling position must never
+// lose its feed because another position on the same contract exited.
 func (s *Session) UnsubscribePositionStrike(symbol, right string, strike float64) {
 	key := posSubKey(symbol, right, strike)
 
@@ -1975,6 +1997,13 @@ func (s *Session) UnsubscribePositionStrike(symbol, right string, strike float64
 	if !ok {
 		s.optChain.mu.Unlock()
 		return
+	}
+	if sub, ok := s.optChain.posSubs[reqID]; ok {
+		sub.refCount--
+		if sub.refCount > 0 {
+			s.optChain.mu.Unlock()
+			return
+		}
 	}
 	delete(s.optChain.posSubs, reqID)
 	delete(s.optChain.posSubKeys, key)

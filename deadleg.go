@@ -369,6 +369,7 @@ func (s *Session) recoverPinnedLeg(a deadLegAction, now time.Time) {
 		symbol: old.symbol, right: old.right, strike: old.strike, expiry: old.expiry,
 		reqID: newReqID, price: old.price, bid: old.bid, ask: old.ask,
 		delta: old.delta, deltaSource: old.deltaSource, subscribedAt: now,
+		refCount: old.refCount,
 	}
 	s.optChain.posSubKeys[key] = newReqID
 	delete(s.optChain.posSubs, a.reqID)
