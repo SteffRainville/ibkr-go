@@ -825,6 +825,11 @@ func (s *Session) SecurityDefinitionOptionParameterEnd(reqID int64) {
 		s.logDeltaMiss(symbol, right, td, undPrice, strikes, "estimate_default", strike, iv)
 		if strike > 0 {
 			s.subscribeOptionLeg(groupID, busIdxs, symbol, right, strike, expiry, true, false)
+			s.optChain.mu.Lock()
+			s.optChain.retries[retryKeyLeg(groupID, right)] = &optStrikeRetry{
+				groupID: groupID, symbol: symbol, expiry: expiry, strikes: strikes, nextIdx: 1, pending: 1, busIdxs: busIdxs,
+			}
+			s.optChain.mu.Unlock()
 		}
 	}
 }
@@ -982,6 +987,26 @@ func (s *Session) touchOptionLegLocked(reqID int64, now time.Time) {
 	if touched {
 		s.optChain.lastAnyOptionTick = now
 	}
+}
+
+// optionKeyForReqIDLocked resolves reqID to the ContractKey of the option leg
+// it currently identifies (ATM background, position-pinned, or a background
+// delta-probe candidate) — for touch-only liveness stamps that have no price
+// to associate, such as a size tick or a greeks-only tick. Must be called with
+// s.optChain.mu held. ok is false when reqID is not (or no longer, e.g. mid
+// strike-roll) a resolved option subscription — most commonly because it is a
+// stock's reqID instead.
+func (s *Session) optionKeyForReqIDLocked(reqID int64) (key quotes.ContractKey, ok bool) {
+	if req, found := s.optChain.mktReqs[reqID]; found && req.strike > 0 && req.expiry != "" {
+		return quotes.ContractKey{Symbol: req.symbol, Right: req.right, Strike: req.strike, Expiry: req.expiry}, true
+	}
+	if sub, found := s.optChain.posSubs[reqID]; found && sub.strike > 0 && sub.expiry != "" {
+		return quotes.ContractKey{Symbol: sub.symbol, Right: sub.right, Strike: sub.strike, Expiry: sub.expiry}, true
+	}
+	if cand, found := s.optChain.deltaCands[reqID]; found && cand.strike > 0 && cand.expiry != "" {
+		return quotes.ContractKey{Symbol: cand.symbol, Right: cand.right, Strike: cand.strike, Expiry: cand.expiry}, true
+	}
+	return quotes.ContractKey{}, false
 }
 
 // mergeBusIdxsLocked adds any of newIdxs not already present in req.busIdxs,
@@ -1555,6 +1580,12 @@ func (s *Session) handleOptionMktError(reqID int64, errStr string) bool {
 
 	retryKey := retryKeyATM(groupID)
 	retry, hasRetry := s.optChain.retries[retryKey]
+	legRetry := false
+	if !hasRetry {
+		retryKey = retryKeyLeg(groupID, right)
+		retry, hasRetry = s.optChain.retries[retryKey]
+		legRetry = true
+	}
 	if !hasRetry {
 		s.optChain.mu.Unlock()
 		return true
@@ -1573,12 +1604,20 @@ func (s *Session) handleOptionMktError(reqID int64, errStr string) bool {
 	}
 	nextStrike := retry.strikes[retry.nextIdx]
 	retry.nextIdx++
-	retry.pending = 2
+	if legRetry {
+		retry.pending = 1
+	} else {
+		retry.pending = 2
+	}
 	busIdxs := retry.busIdxs
 	s.optChain.mu.Unlock()
 
 	s.optionLog.Printf("Option: %s (group=%d) — retrying with next nearest strike=%.2f expiry=%s", symbol, groupID, nextStrike, expiry)
-	s.subscribeOptionMarketData(groupID, busIdxs, symbol, nextStrike, expiry, false)
+	if legRetry {
+		s.subscribeOptionLeg(groupID, busIdxs, symbol, right, nextStrike, expiry, true, false)
+	} else {
+		s.subscribeOptionMarketData(groupID, busIdxs, symbol, nextStrike, expiry, false)
+	}
 	return true
 }
 

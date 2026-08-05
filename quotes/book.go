@@ -33,12 +33,19 @@ import (
 // that side's price actually changes, so a consumer can tell a genuinely fresh
 // quote from a value merely re-sent unchanged (used for the SSE age fields that
 // gate stale outside-RTH orders).
+//
+// LastTickTime is different on purpose: it advances on EVERY real bid/ask tick
+// or bar close IB sends for this symbol, whether or not the price moved. A quiet
+// market (price genuinely unchanged for minutes, common outside RTH) and a dead
+// subscription (IB stopped sending anything at all) look identical through
+// BidTime/AskTime alone — LastTickTime is the signal that tells them apart.
 type StockQuote struct {
 	Bid, Ask, Last float64
 	BidTime        time.Time
 	AskTime        time.Time
 	BarTime        time.Time
 	LastBar        string // "2026-04-09 09:45:00" — the bar date that set Last
+	LastTickTime   time.Time
 }
 
 // OptionQuote is the centralized quote for one exact option contract (identified
@@ -46,11 +53,16 @@ type StockQuote struct {
 // that also carries the strike/expiry — this is only the quote itself: the strike
 // and expiry live in the key, so a Book value can never pair a strike with a
 // foreign price. BidTime/AskTime advance on change, mirroring StockQuote.
+//
+// LastTickTime mirrors StockQuote.LastTickTime: it advances on every real bid/
+// ask/last tick for this contract, whether or not the price moved, so a quiet-
+// but-live contract can be told apart from one IB has stopped serving.
 type OptionQuote struct {
 	Bid, Ask, Last float64
 	Delta, IV      float64
 	BidTime        time.Time
 	AskTime        time.Time
+	LastTickTime   time.Time
 	// DeltaSource is "matched" (a genuine live IB delta) or "atm_fallback"/estimate
 	// (picked without a confirmed Greek). Empty until the first tick arrives.
 	DeltaSource string
@@ -94,6 +106,7 @@ func (b *Book) SetStockBar(symbol string, last float64, barDate string) {
 	q := b.stocks[symbol]
 	q.Last = last
 	q.BarTime = time.Now()
+	q.LastTickTime = q.BarTime
 	if barDate != "" {
 		q.LastBar = barDate
 	}
@@ -109,10 +122,12 @@ func (b *Book) SetStockBid(symbol string, bid float64) {
 	}
 	b.mu.Lock()
 	q := b.stocks[symbol]
+	now := time.Now()
 	if bid != q.Bid {
-		q.BidTime = time.Now()
+		q.BidTime = now
 	}
 	q.Bid = bid
+	q.LastTickTime = now
 	b.stocks[symbol] = q
 	b.mu.Unlock()
 }
@@ -124,10 +139,12 @@ func (b *Book) SetStockAsk(symbol string, ask float64) {
 	}
 	b.mu.Lock()
 	q := b.stocks[symbol]
+	now := time.Now()
 	if ask != q.Ask {
-		q.AskTime = time.Now()
+		q.AskTime = now
 	}
 	q.Ask = ask
+	q.LastTickTime = now
 	b.stocks[symbol] = q
 	b.mu.Unlock()
 }
@@ -141,10 +158,12 @@ func (b *Book) SetOptionBid(key ContractKey, bid float64) {
 	}
 	b.mu.Lock()
 	q := b.opts[key]
+	now := time.Now()
 	if bid != q.Bid {
-		q.BidTime = time.Now()
+		q.BidTime = now
 	}
 	q.Bid = bid
+	q.LastTickTime = now
 	b.opts[key] = q
 	b.mu.Unlock()
 }
@@ -156,10 +175,12 @@ func (b *Book) SetOptionAsk(key ContractKey, ask float64) {
 	}
 	b.mu.Lock()
 	q := b.opts[key]
+	now := time.Now()
 	if ask != q.Ask {
-		q.AskTime = time.Now()
+		q.AskTime = now
 	}
 	q.Ask = ask
+	q.LastTickTime = now
 	b.opts[key] = q
 	b.mu.Unlock()
 }
@@ -172,6 +193,7 @@ func (b *Book) SetOptionLast(key ContractKey, last float64) {
 	b.mu.Lock()
 	q := b.opts[key]
 	q.Last = last
+	q.LastTickTime = time.Now()
 	b.opts[key] = q
 	b.mu.Unlock()
 }
@@ -190,6 +212,32 @@ func (b *Book) SetOptionGreeks(key ContractKey, delta, iv float64, deltaSource s
 	if deltaSource != "" {
 		q.DeltaSource = deltaSource
 	}
+	b.opts[key] = q
+	b.mu.Unlock()
+}
+
+// TouchStockTick records that IB sent SOME tick for symbol without necessarily
+// carrying a new price — a size-only tick, most commonly. SetStockBid/SetStockAsk
+// can't express this: they need a positive price to write. Size ticks are the
+// most valuable liveness signal available outside RTH: they keep arriving on a
+// line whose price is flat, which is exactly what BidTime/AskTime/Bid/Ask alone
+// cannot distinguish from a dead subscription. Creates the entry if this is the
+// very first tick seen for symbol, so a size tick arriving before any price tick
+// still proves the line is alive.
+func (b *Book) TouchStockTick(symbol string) {
+	b.mu.Lock()
+	q := b.stocks[symbol]
+	q.LastTickTime = time.Now()
+	b.stocks[symbol] = q
+	b.mu.Unlock()
+}
+
+// TouchOptionTick is the option analogue of TouchStockTick — records a size (or
+// other non-price) tick for one exact contract.
+func (b *Book) TouchOptionTick(key ContractKey) {
+	b.mu.Lock()
+	q := b.opts[key]
+	q.LastTickTime = time.Now()
 	b.opts[key] = q
 	b.mu.Unlock()
 }

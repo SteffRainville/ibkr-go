@@ -157,16 +157,28 @@ func (s *Session) TickSnapshotEnd(reqID int64) {
 // removing the override would restore the embedded Wrapper's own logging.
 func (s *Session) TickString(reqID int64, tickType int64, value string) {}
 
-// TickSize handles size ticks: stamps option-leg liveness and captures daily
+// TickSize handles size ticks: stamps option-leg liveness (both the deadleg
+// tracker and the shared Book, for options AND stocks) and captures daily
 // volume for scanner enrichment snapshots.
 func (s *Session) TickSize(reqID int64, tickType int64, size ibapi.Decimal) {
 	// Size ticks are the most valuable liveness signal available — they keep
-	// arriving on a liquid option whose price is flat, which is precisely the
-	// case the Book's advance-on-change timestamps cannot distinguish from a
-	// dead line.
+	// arriving on a liquid line whose price is flat, which is precisely the
+	// case the Book's advance-on-change timestamps (BidTime/AskTime) cannot
+	// distinguish from a dead line. Stamp the Book's LastTickTime here too —
+	// not just deadleg.go's option-only tracker — so a size-only tick keeps a
+	// stock's dashboard/position liveness coloring fresh as well.
 	s.optChain.mu.Lock()
 	s.touchOptionLegLocked(reqID, time.Now())
+	optKey, isOption := s.optionKeyForReqIDLocked(reqID)
 	s.optChain.mu.Unlock()
+
+	if s.book != nil {
+		if isOption {
+			s.book.TouchOptionTick(optKey)
+		} else if sym, ok := s.mktData.mktDataSymbol[reqID]; ok {
+			s.book.TouchStockTick(sym)
+		}
+	}
 
 	switch tickType {
 	case ibapi.VOLUME, ibapi.DELAYED_VOLUME:

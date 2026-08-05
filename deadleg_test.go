@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"github.com/scmhub/ibapi"
+
+	"github.com/SteffRainville/ibkr-go/quotes"
 )
 
 // rthNoon is inside RTH on a Tuesday, so legSilenceRTH applies.
@@ -273,12 +275,36 @@ func TestTickSizeStampsLegLiveness(t *testing.T) {
 	s.TickSize(1, 0, ibapi.StringToDecimal("100"))
 
 	s.optChain.mu.Lock()
-	defer s.optChain.mu.Unlock()
 	if s.optChain.mktReqs[1].lastTickAt.IsZero() {
 		t.Fatal("lastTickAt still zero after a size tick — a liquid option with a flat quote would be judged dead")
 	}
 	if s.optChain.lastAnyOptionTick.IsZero() {
 		t.Fatal("lastAnyOptionTick still zero — the feed-alive gate depends on this being advanced")
+	}
+	s.optChain.mu.Unlock()
+
+	// The shared Book must agree with the tracker above — the ORBtrader
+	// dashboard/position liveness coloring reads the Book, not deadleg.go's
+	// internal state, so a size tick that only touched the tracker would leave
+	// the UI showing this leg as dead while deadleg.go considers it alive.
+	oq, ok := s.book.Option(quotes.ContractKey{Symbol: "QQQ", Right: "call", Strike: 480, Expiry: "20260805"})
+	if !ok || oq.LastTickTime.IsZero() {
+		t.Fatal("Book's OptionQuote.LastTickTime not stamped by a size tick")
+	}
+}
+
+// TestTickSizeStampsStockLiveness is the stock analogue: a stock's size ticks
+// (bid/ask size changing with the price flat, common outside RTH) must reach
+// the Book too, not just the option-only tracker above.
+func TestTickSizeStampsStockLiveness(t *testing.T) {
+	s := newRotationTestSession(nil)
+	s.mktData.mktDataSymbol[7] = "TQQQ"
+
+	s.TickSize(7, 0, ibapi.StringToDecimal("500"))
+
+	sq, ok := s.book.Stock("TQQQ")
+	if !ok || sq.LastTickTime.IsZero() {
+		t.Fatal("Book's StockQuote.LastTickTime not stamped by a size tick")
 	}
 }
 
