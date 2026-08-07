@@ -50,16 +50,16 @@ var ErrReady = errors.New("connected but TWS did not become ready")
 //	11001 …        — ad-hoc option chain query: ReqContractDetails (conId lookup)
 //	12001 …        — ad-hoc option chain query: reqSecDefOptParams
 const (
-	reqIDHistBase         int64 = 1001
-	reqIDStreamBase       int64 = 2001
-	reqIDScannerBase      int64 = 3001
-	reqIDOnDemandHistBase int64 = 4001
-	reqIDSnapBase         int64 = 5001
-	reqIDOptChainBase     int64 = 6001
-	reqIDOptMktBase       int64 = 7001
-	reqIDOptConIDBase     int64 = 8001
-	reqIDAcctSummary      int64 = 9001
-	reqIDPosMktBase       int64 = 10001
+	reqIDHistBase          int64 = 1001
+	reqIDStreamBase        int64 = 2001
+	reqIDScannerBase       int64 = 3001
+	reqIDOnDemandHistBase  int64 = 4001
+	reqIDSnapBase          int64 = 5001
+	reqIDOptChainBase      int64 = 6001
+	reqIDOptMktBase        int64 = 7001
+	reqIDOptConIDBase      int64 = 8001
+	reqIDAcctSummary       int64 = 9001
+	reqIDPosMktBase        int64 = 10001
 	reqIDOptQueryConIDBase int64 = 11001
 	reqIDOptQueryChainBase int64 = 12001
 )
@@ -207,9 +207,22 @@ type Session struct {
 
 	Candles *candlestore.Store
 
+	// symMu guards every field of the tracked-symbol registry below:
+	// reqSymbol, symbols, subSymbols, histReqID, streamReqID, the two reqID
+	// counters, and mktData.mktDataSymbol. Run used to write all of them once,
+	// before any subscription existed, so unsynchronized reads from the
+	// callback goroutines were safe by construction. ResyncSymbols mutates
+	// them mid-session — from an HTTP handler goroutine, while bars and ticks
+	// are arriving — so the registry now needs a real lock. It is a leaf:
+	// never hold it while calling into the IB client or taking optChain.mu.
+	symMu          sync.RWMutex
 	reqSymbol      map[int64]string
-	symbols        []SymbolSpec   // full list (all subscribers, with tags)
-	subSymbols     [][]SymbolSpec // per-subscriber symbol list, indexed like subs/buses
+	symbols        []SymbolSpec     // full list (all subscribers, with tags)
+	subSymbols     [][]SymbolSpec   // per-subscriber symbol list, indexed like subs/buses
+	histReqID      map[string]int64 // base symbol → keepUpToDate bar-stream reqID
+	streamReqID    map[string]int64 // base symbol → streaming market-data reqID
+	nextHistID     int64            // next free reqID in the reqIDHistBase block
+	nextStreamID   int64            // next free reqID in the reqIDStreamBase block
 	tradingAccount string
 	accountsReady  chan []string
 
@@ -277,6 +290,10 @@ func NewSession(opts Options, book *quotes.Book, cs *candlestore.Store) *Session
 		book:           book,
 		Candles:        cs,
 		reqSymbol:      make(map[int64]string),
+		histReqID:      make(map[string]int64),
+		streamReqID:    make(map[string]int64),
+		nextHistID:     reqIDHistBase,
+		nextStreamID:   reqIDStreamBase,
 		tradingAccount: opts.TradingAccount,
 		accountsReady:  make(chan []string, 1),
 
@@ -315,24 +332,25 @@ func NewSession(opts Options, book *quotes.Book, cs *candlestore.Store) *Session
 			cdReqIDs:   make(map[int64][]int64),
 		},
 		optChain: optionChainTracker{
-			nextConIDID:     reqIDOptConIDBase,
-			nextChainID:     reqIDOptChainBase,
-			nextMktID:       reqIDOptMktBase,
-			nextPosID:       reqIDPosMktBase,
-			conIDReqs:       make(map[int64]*optConIDReq),
-			chainReqs:       make(map[int64]*optChainReq),
-			mktReqs:         make(map[int64]*optMktReq),
-			posSubs:         make(map[int64]*posStrikeSub),
-			posSubKeys:      make(map[string]int64),
-			retries:         make(map[string]*optStrikeRetry),
-			deltaCands:      make(map[int64]*deltaCandidate),
-			deltaRes:        make(map[string]*deltaResolution),
-			lastIV:          make(map[string]float64),
-			lastChainInfo:   make(map[string]chainSnapshot),
-			resolvedEntry:   make(map[string]resolvedEntryLeg),
-			lastProbeLaunch: make(map[string]time.Time),
-			lastAttempt:     make(map[int]time.Time),
-			forcedResub:     make(map[string]resubState),
+			nextConIDID:      reqIDOptConIDBase,
+			nextChainID:      reqIDOptChainBase,
+			nextMktID:        reqIDOptMktBase,
+			nextPosID:        reqIDPosMktBase,
+			conIDReqs:        make(map[int64]*optConIDReq),
+			chainReqs:        make(map[int64]*optChainReq),
+			mktReqs:          make(map[int64]*optMktReq),
+			posSubs:          make(map[int64]*posStrikeSub),
+			posSubKeys:       make(map[string]int64),
+			retries:          make(map[string]*optStrikeRetry),
+			deltaCands:       make(map[int64]*deltaCandidate),
+			deltaRes:         make(map[string]*deltaResolution),
+			lastIV:           make(map[string]float64),
+			lastChainInfo:    make(map[string]chainSnapshot),
+			resolvedEntry:    make(map[string]resolvedEntryLeg),
+			lastEntryFailure: make(map[string]EntryStrikeResult),
+			lastProbeLaunch:  make(map[string]time.Time),
+			lastAttempt:      make(map[int]time.Time),
+			forcedResub:      make(map[string]resubState),
 		},
 		onDemand: onDemandTracker{
 			nextID:    reqIDOnDemandHistBase,
@@ -433,11 +451,6 @@ func (s *Session) Run(subs []Subscriber, stop time.Time) (bool, error) {
 			}
 		}
 	}
-	reqSymbol := make(map[int64]string, len(deduped))
-	for i, sy := range deduped {
-		reqSymbol[reqIDHistBase+int64(i)] = sy.Symbol
-	}
-
 	var buses []*eventbus.Bus
 	for _, sub := range subs {
 		buses = append(buses, sub.Bus())
@@ -447,34 +460,50 @@ func (s *Session) Run(subs []Subscriber, stop time.Time) (bool, error) {
 		subSymbols[i] = sub.Symbols()
 	}
 
+	s.symMu.Lock()
 	s.subs = subs
 	s.buses = buses
-	s.reqSymbol = reqSymbol
+	s.reqSymbol = make(map[int64]string, len(deduped))
 	s.symbols = allSymbols
 	s.subSymbols = subSymbols
+	s.histReqID = make(map[string]int64, len(deduped))
+	s.streamReqID = make(map[string]int64, len(deduped))
+	s.nextHistID = reqIDHistBase
+	s.nextStreamID = reqIDStreamBase
+	s.mktData.mktDataSymbol = make(map[int64]string, len(deduped))
+	// reqIDs are assigned from a counter rather than the loop index because
+	// ResyncSymbols hands out more of them later, after the initial block has
+	// developed holes — see subscribeSymbolLocked.
+	type sub struct {
+		spec          SymbolSpec
+		histID, mktID int64
+	}
+	pending := make([]sub, 0, len(deduped))
+	for _, sy := range deduped {
+		histID, mktID := s.reserveSymbolIDsLocked(sy.Symbol)
+		pending = append(pending, sub{spec: sy, histID: histID, mktID: mktID})
+	}
+	s.symMu.Unlock()
 
 	ctx := client.Ctx()
-	for _, sub := range subs {
-		sub.OnConnected(ctx)
+	for _, sb := range subs {
+		sb.OnConnected(ctx)
 	}
 
 	s.liveStart = time.Now()
 
-	for i, sy := range deduped {
-		reqID := reqIDHistBase + int64(i)
-		if !s.mdLines.GrantHist(reqID) {
+	for _, p := range pending {
+		if !s.mdLines.GrantHist(p.histID) {
 			_, _, _, histMax, _, _ := s.mdLines.StatusAll()
-			s.logger.Printf("Live bars: %s SKIPPED — over the %d concurrent keepUpToDate stream limit; this symbol will get NO live bars. Trim the watchlist or raise MaxHistoricalStreams.", sy.Symbol, histMax)
+			s.logger.Printf("Live bars: %s SKIPPED — over the %d concurrent keepUpToDate stream limit; this symbol will get NO live bars. Trim the watchlist or raise MaxHistoricalStreams.", p.spec.Symbol, histMax)
 			continue
 		}
-		client.ReqHistoricalData(reqID, sy.Contract, "", "1 D", "30 secs", "TRADES", false, 1, true, nil)
+		client.ReqHistoricalData(p.histID, p.spec.Contract, "", "1 D", "30 secs", "TRADES", false, 1, true, nil)
 	}
 
-	for i, sy := range deduped {
-		reqID := reqIDStreamBase + int64(i)
-		s.mktData.mktDataSymbol[reqID] = sy.Symbol
-		s.mdLines.GrantGuaranteed(reqID, mdlines.CategoryStock)
-		client.ReqMktData(reqID, sy.Contract, "", false, false, nil)
+	for _, p := range pending {
+		s.mdLines.GrantGuaranteed(p.mktID, mdlines.CategoryStock)
+		client.ReqMktData(p.mktID, p.spec.Contract, "", false, false, nil)
 	}
 
 	client.ReqAccountSummary(reqIDAcctSummary, "All", "AccountType,TradingType,AccountCode,AccountAlias,NetLiquidation,TotalCashValue,AvailableFunds,BuyingPower,MaintExcessLiquidity,Leverage,AccountStatusLocked,AccountStatusPendingApproval,Cushion,FullInitMarginReq,FullMaintMarginReq,InitMarginReq,LookAheadAvailableFunds,LookAheadInitMarginReq,SMA")
@@ -626,10 +655,10 @@ func (s *Session) resolveReqID(reqID int64) string {
 	if reqID == -1 {
 		return "n/a"
 	}
-	if sym, ok := s.reqSymbol[reqID]; ok {
+	if sym := s.histSymbol(reqID); sym != "" {
 		return sym + " (hist)"
 	}
-	if sym, ok := s.mktData.mktDataSymbol[reqID]; ok {
+	if sym, ok := s.streamSymbol(reqID); ok {
 		return sym + " (stream)"
 	}
 	if sym, ok := s.mktData.snapReqSymbol[reqID]; ok {
@@ -657,6 +686,20 @@ func (s *Session) resolveReqID(reqID int64) string {
 		s.optChain.mu.Unlock()
 		return r
 	}
+	// Entry delta probes and position-pinned legs were missing here, so every
+	// IB error against one — including the not-subscribed family, the errors
+	// most worth reading — logged "symbol=unknown" and could not be tied back
+	// to the contract that provoked it.
+	if cand, ok := s.optChain.deltaCands[reqID]; ok {
+		r := fmt.Sprintf("%s %s strike=%.2f expiry=%s (opt-probe)", cand.symbol, cand.right, cand.strike, cand.expiry)
+		s.optChain.mu.Unlock()
+		return r
+	}
+	if sub, ok := s.optChain.posSubs[reqID]; ok {
+		r := fmt.Sprintf("%s %s strike=%.2f (opt-pinned)", sub.symbol, sub.right, sub.strike)
+		s.optChain.mu.Unlock()
+		return r
+	}
 	s.optChain.mu.Unlock()
 	s.onDemand.mu.Lock()
 	if sym, ok := s.onDemand.reqSymbol[reqID]; ok {
@@ -680,6 +723,15 @@ func (s *Session) Error(reqID int64, errTime int64, errCode int64, errString str
 		label = "IB Error"
 	}
 	s.logger.Printf("%s: reqID=%d symbol=%s code=%d msg=%s", label, reqID, sym, errCode, errString)
+
+	// Attribute the error to an in-flight entry delta probe, if this reqID is
+	// one. Purely observational — see noteCandidateError. Only code 200 gets
+	// the full handleOptionMktError treatment below, which is why every OTHER
+	// code (354/10167/10197 and the rest of the not-subscribed family — the
+	// ones that actually explain a permanently quote-less account) used to
+	// vanish into the log line above and never reach the trading decision that
+	// they caused to fail.
+	s.noteCandidateError(reqID, errCode, errString)
 
 	if errCode == 200 {
 		if s.handleOptionMktError(reqID, errString) {

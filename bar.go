@@ -51,7 +51,7 @@ func (s *Session) HistoricalData(reqId int64, bar *ibapi.Bar) {
 		return
 	}
 
-	baseSym := s.reqSymbol[reqId]
+	baseSym := s.histSymbol(reqId)
 	date := FormatBarDate(bar.Date)
 	s.logger.Printf("Historical Bar %-5s %s O:%.2f H:%.2f L:%.2f C:%.2f", baseSym, date, bar.Open, bar.High, bar.Low, bar.Close)
 	s.Candles.AddHistorical(baseSym, date, bar.Open, bar.High, bar.Low, bar.Close, bar.Volume.Float(), bar.Wap.Float(), bar.BarCount)
@@ -96,7 +96,7 @@ func (s *Session) HistoricalDataUpdate(reqId int64, bar *ibapi.Bar) {
 	// Stamp the bar-feed watchdog liveness signal.
 	s.lastBarNano.Store(time.Now().UnixNano())
 
-	baseSym := s.reqSymbol[reqId]
+	baseSym := s.histSymbol(reqId)
 	date := FormatBarDate(bar.Date)
 	s.logger.Printf(">>> LIVE      %-5s %s O:%.2f H:%.2f L:%.2f C:%.2f", baseSym, date, bar.Open, bar.High, bar.Low, bar.Close)
 

@@ -55,7 +55,7 @@ func (s *Session) TickPrice(reqID int64, tickType int64, price float64, attrib i
 		return
 	}
 
-	if sym, ok := s.mktData.mktDataSymbol[reqID]; ok {
+	if sym, ok := s.streamSymbol(reqID); ok {
 		now := time.Now()
 		switch tickType {
 		case ibapi.BID, ibapi.DELAYED_BID:
@@ -175,7 +175,7 @@ func (s *Session) TickSize(reqID int64, tickType int64, size ibapi.Decimal) {
 	if s.book != nil {
 		if isOption {
 			s.book.TouchOptionTick(optKey)
-		} else if sym, ok := s.mktData.mktDataSymbol[reqID]; ok {
+		} else if sym, ok := s.streamSymbol(reqID); ok {
 			s.book.TouchStockTick(sym)
 		}
 	}

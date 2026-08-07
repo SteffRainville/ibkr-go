@@ -30,11 +30,14 @@ func TestResolveEntryStrike_LaunchCooldownBlocksRepeatedOwnerAttempt(t *testing.
 	s.optChain.mu.Unlock()
 
 	start := time.Now()
-	q, ok := s.ResolveEntryStrike(sub, "SPY", "put", 2*time.Second)
+	q, res := s.ResolveEntryStrike(sub, "SPY", "put", 2*time.Second)
 	elapsed := time.Since(start)
 
-	if ok {
+	if res.OK {
 		t.Fatalf("expected no quote while the launch cooldown is active, got %+v", q)
+	}
+	if res.Reason != entryFailProbeCooldown {
+		t.Errorf("Reason = %q, want %q — with no recorded prior failure the cooldown itself is the cause", res.Reason, entryFailProbeCooldown)
 	}
 	if elapsed > 200*time.Millisecond {
 		t.Fatalf("took %s to return — should fail fast on a cooled-down key, not block", elapsed)
@@ -63,11 +66,11 @@ func TestResolveEntryStrike_LaunchCooldownDoesNotBlockSharedRead(t *testing.T) {
 	s.optChain.mu.Unlock()
 
 	start := time.Now()
-	q, ok := s.ResolveEntryStrike(sub, "SPY", "put", 2*time.Second)
+	q, res := s.ResolveEntryStrike(sub, "SPY", "put", 2*time.Second)
 	elapsed := time.Since(start)
 
-	if !ok {
-		t.Fatal("expected the shared resolved contract despite an active launch cooldown, got ok=false")
+	if !res.OK {
+		t.Fatalf("expected the shared resolved contract despite an active launch cooldown, got %+v", res)
 	}
 	if q.Strike != 735 || q.Expiry != "20260731" {
 		t.Fatalf("got strike=%.0f expiry=%s, want strike=735 expiry=20260731", q.Strike, q.Expiry)
@@ -101,10 +104,10 @@ func TestResolveEntryStrike_LaunchCooldownDoesNotBlockJoiningInFlightSibling(t *
 		s.optChain.mu.Unlock()
 	}()
 
-	q, ok := s.ResolveEntryStrike(sub, "SPY", "put", 2*time.Second)
+	q, res := s.ResolveEntryStrike(sub, "SPY", "put", 2*time.Second)
 
-	if !ok {
-		t.Fatal("expected to join and receive the sibling's resolved contract despite an active launch cooldown")
+	if !res.OK {
+		t.Fatalf("expected to join and receive the sibling's resolved contract despite an active launch cooldown, got %+v", res)
 	}
 	if q.Strike != 735 {
 		t.Fatalf("got strike=%.0f, want 735", q.Strike)

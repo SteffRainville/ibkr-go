@@ -8,6 +8,7 @@ package ibkr
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -16,6 +17,13 @@ import (
 
 	"github.com/scmhub/ibapi"
 )
+
+// ErrNoOptionChain reports that the underlying resolved fine but IB lists no
+// SMART option chain for it — a definitive "this instrument has no options",
+// as opposed to a lookup that simply failed (unresolvable conId, timeout,
+// disconnect). Callers that need to distinguish "no" from "don't know" must
+// test with errors.Is; the message alone is not a contract.
+var ErrNoOptionChain = errors.New("no SMART option chain")
 
 // OptionChainInfo is the expirations (YYYYMMDD, ascending, today or later)
 // and SMART strikes (ascending) available for one underlying's option chain.
@@ -66,6 +74,15 @@ func (s *Session) RequestOptionChain(ctx context.Context, symbol string) (Option
 	done := make(chan optQueryResult, 1)
 
 	s.optQuery.mu.Lock()
+	// Both counters walk forward one ID per call and never wrap on their own;
+	// after 1000 lookups nextConID would cross into the chain range and the
+	// two phases would collide. Rewind while fully idle — no request is in
+	// flight under either ID then — the same idiom RunScanner uses for its
+	// own range.
+	if len(s.optQuery.conIDReqs) == 0 && len(s.optQuery.chainReqs) == 0 {
+		s.optQuery.nextConID = reqIDOptQueryConIDBase
+		s.optQuery.nextChainID = reqIDOptQueryChainBase
+	}
 	reqID := s.optQuery.nextConID
 	s.optQuery.nextConID++
 	s.optQuery.conIDReqs[reqID] = &optQueryReq{symbol: sym, done: done}
@@ -194,7 +211,7 @@ func (s *Session) handleOptionQuerySecDefOptParamsEnd(reqID int64) bool {
 	sort.Float64s(strikes)
 
 	if len(future) == 0 || len(strikes) == 0 {
-		req.done <- optQueryResult{err: fmt.Errorf("no SMART option chain found for %s", symbol)}
+		req.done <- optQueryResult{err: fmt.Errorf("%w found for %s", ErrNoOptionChain, symbol)}
 		return true
 	}
 	req.done <- optQueryResult{info: OptionChainInfo{Expirations: future, Strikes: strikes}}

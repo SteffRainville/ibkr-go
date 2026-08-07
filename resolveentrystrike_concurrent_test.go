@@ -65,11 +65,11 @@ func TestResolveEntryStrike_SiblingInFlightWaitsInsteadOfDuplicateProbe(t *testi
 	}()
 
 	start := time.Now()
-	q, ok := s.ResolveEntryStrike(sub, "SPY", "put", 2*time.Second)
+	q, res := s.ResolveEntryStrike(sub, "SPY", "put", 2*time.Second)
 	elapsed := time.Since(start)
 
-	if !ok {
-		t.Fatal("expected ResolveEntryStrike to return the sibling's resolved contract, got ok=false")
+	if !res.OK {
+		t.Fatalf("expected ResolveEntryStrike to return the sibling's resolved contract, got %+v", res)
 	}
 	if q.Strike != 735 || q.Expiry != "20260731" {
 		t.Fatalf("got strike=%.0f expiry=%s, want the sibling's contract strike=735 expiry=20260731", q.Strike, q.Expiry)
@@ -96,11 +96,14 @@ func TestResolveEntryStrike_SiblingInFlightNeverResolves(t *testing.T) {
 
 	const timeout = 300 * time.Millisecond
 	start := time.Now()
-	q, ok := s.ResolveEntryStrike(sub, "SPY", "put", timeout)
+	q, res := s.ResolveEntryStrike(sub, "SPY", "put", timeout)
 	elapsed := time.Since(start)
 
-	if ok {
+	if res.OK {
 		t.Fatalf("expected no quote when the owning sibling never resolves, got %+v", q)
+	}
+	if res.Reason != entryFailSiblingFailed {
+		t.Errorf("Reason = %q, want %q — a caller that waited on a sibling must say so", res.Reason, entryFailSiblingFailed)
 	}
 	if elapsed < timeout {
 		t.Fatalf("returned after %s, before its own timeout of %s", elapsed, timeout)

@@ -76,14 +76,14 @@ func TestResolveEntryStrike_DifferentTargetDeltaGroupsResolveIndependently(t *te
 	s.book.SetOptionBid(key11, 2.11)
 	s.book.SetOptionAsk(key11, 2.20)
 
-	q, ok := s.ResolveEntryStrike(subData, "IWM", "call", 2*time.Second)
-	if !ok || q.Strike != 296 {
-		t.Fatalf("VWmacdOptionDataRobot (busIdx 4): got strike=%.0f ok=%v, want strike=296 (its own group 10)", q.Strike, ok)
+	q, res := s.ResolveEntryStrike(subData, "IWM", "call", 2*time.Second)
+	if !res.OK || q.Strike != 296 {
+		t.Fatalf("VWmacdOptionDataRobot (busIdx 4): got strike=%.0f res=%+v, want strike=296 (its own group 10)", q.Strike, res)
 	}
 
-	q, ok = s.ResolveEntryStrike(subVWmacd, "IWM", "call", 2*time.Second)
-	if !ok || q.Strike != 297 {
-		t.Fatalf("VWmacdOptionRobot (busIdx 3): got strike=%.0f ok=%v, want strike=297 (its own group 11) — this is the 2026-08-04 bug if it instead got 296", q.Strike, ok)
+	q, res = s.ResolveEntryStrike(subVWmacd, "IWM", "call", 2*time.Second)
+	if !res.OK || q.Strike != 297 {
+		t.Fatalf("VWmacdOptionRobot (busIdx 3): got strike=%.0f res=%+v, want strike=297 (its own group 11) — this is the 2026-08-04 bug if it instead got 296", q.Strike, res)
 	}
 }
 
@@ -119,9 +119,9 @@ func TestResolveEntryStrike_SameTargetDeltaGroupSharedAcrossBusIdxs(t *testing.T
 	// subVWmacd (busIdx 3) calls in while busIdx 1 owns the resolution for
 	// the SAME group (11) — it must join, not launch its own probe (s.client
 	// is nil here; launching a real probe would panic).
-	q, ok := s.ResolveEntryStrike(subVWmacd, "IWM", "call", 2*time.Second)
-	if !ok || q.Strike != 297 {
-		t.Fatalf("expected busIdx 3 to join busIdx 1's in-flight resolution for the shared group 11, got strike=%.0f ok=%v", q.Strike, ok)
+	q, res := s.ResolveEntryStrike(subVWmacd, "IWM", "call", 2*time.Second)
+	if !res.OK || q.Strike != 297 {
+		t.Fatalf("expected busIdx 3 to join busIdx 1's in-flight resolution for the shared group 11, got strike=%.0f res=%+v", q.Strike, res)
 	}
 }
 

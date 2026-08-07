@@ -52,7 +52,7 @@ func (s *Session) ConnectionsSnapshot() ConnectionsStatus {
 // symbols among them — the dedup unit for underlying market-data lines.
 func (s *Session) configuredRowCounts() (stockRows, optionRows, uniqueUnderlyings int) {
 	seen := make(map[string]bool)
-	for _, syms := range s.subSymbols {
+	for _, syms := range s.subSymbolLists() {
 		for _, sy := range syms {
 			if isOptionTag(sy.Tag) {
 				optionRows++

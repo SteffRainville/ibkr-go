@@ -12,7 +12,7 @@ import (
 
 // contractForSymbol returns the IB contract for a tracked symbol, or nil.
 func (s *Session) contractForSymbol(symbol string) *ibapi.Contract {
-	for _, sy := range s.symbols {
+	for _, sy := range s.symbolSpecs() {
 		if sy.Symbol == symbol {
 			return sy.Contract
 		}

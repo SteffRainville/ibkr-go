@@ -186,6 +186,165 @@ type deltaCandidate struct {
 	ask     float64
 	ready   bool
 	busIdxs []int
+
+	// errCode/errMsg record an IB error delivered against this candidate's
+	// reqID (noteCandidateError). Purely diagnostic: they are what lets
+	// classifyCandidateErrors tell "IB refused for lack of subscription
+	// rights" apart from "IB accepted the request and never answered", the
+	// two cases that used to arrive at the bot as one indistinguishable
+	// "option quote unavailable". Deliberately NOT consulted by
+	// deltaCandidatesSettled — recording a cause must not change probe timing.
+	//
+	// No timestamp is kept: candidates are allocated fresh per probe and
+	// dropped from deltaCands once it resolves, so an error can only ever
+	// belong to the probe currently in flight. There is no staleness to check.
+	errCode int64
+	errMsg  string
+}
+
+// EntryStrikeResult reports the outcome of ResolveEntryStrike. It replaces a
+// bare bool because a failed entry probe has EIGHT structurally different
+// causes (no cached chain, probe cooldown, no market-data lines, an ATM target
+// delta, no ITM candidates, a failed sibling probe, a delta match with no
+// price, and IB simply never answering) and collapsing them into one token
+// left the dashboard reporting a symptom with no route to a diagnosis.
+//
+// Reason is a stable token (see the entryFail* constants); Detail is the
+// human-readable elaboration — for an IB-attributed failure, the code and
+// message IB actually sent.
+type EntryStrikeResult struct {
+	OK     bool
+	Reason string
+	Detail string
+	IBCode int64
+}
+
+// Entry-probe failure reasons. Each maps to exactly one branch, so a token in
+// a log or on a dashboard row identifies a single line of code.
+const (
+	// entryFailNoSubscription — IB explicitly refused the market data for
+	// lack of entitlement. THE answer to "why does this account never get an
+	// option quote": nothing about the app will fix it.
+	entryFailNoSubscription = "option_no_subscription"
+	// entryFailQuoteTimeout — probes launched, IB raised no error at all, and
+	// nothing ticked before the deadline. The genuine "no response" case.
+	entryFailQuoteTimeout = "option_quote_timeout"
+	// entryFailContractInvalid — IB 200, no security definition for the
+	// contract we asked about (bad expiry, delisted, wrong exchange).
+	entryFailContractInvalid = "option_contract_invalid"
+	// entryFailMDError — some other IB error against a candidate (pacing,
+	// request validation, duplicate ticker id, …). Kept distinct from the
+	// above so an unrecognised code is visibly unclassified rather than
+	// silently filed as a timeout.
+	entryFailMDError = "option_md_error"
+	// entryFailDeltaNoPrice — a candidate won on delta but carried no
+	// two-sided price, so the quote is not Valid() and must not be traded.
+	entryFailDeltaNoPrice = "option_delta_no_price"
+	// entryFailNoChain — no resolution group for this subscriber, or no
+	// cached chain/strikes yet. Normal in the first seconds after connect.
+	entryFailNoChain = "option_no_chain"
+	// entryFailProbeCooldown — inside entryProbeLaunchCooldown from the last
+	// launch for this group+right.
+	entryFailProbeCooldown = "option_probe_cooldown"
+	// entryFailDeltaTargetATM — target_delta sits in the refused ATM band.
+	entryFailDeltaTargetATM = "option_delta_target_atm"
+	// entryFailNoCandidates — selectITMCandidates found no strike to probe.
+	entryFailNoCandidates = "option_no_candidates"
+	// entryFailNoMDLines — every GrantProbe was refused; the market-data line
+	// budget is exhausted and nothing was preemptible.
+	entryFailNoMDLines = "option_no_md_lines"
+	// entryFailSiblingFailed — joined an in-flight sibling probe that failed
+	// without leaving a recorded cause behind.
+	entryFailSiblingFailed = "option_sibling_failed"
+)
+
+// subscriptionErrorCodes are the IB error codes that mean "your account is not
+// entitled to this market data" in one form or another. Grouped because the
+// distinction between them (delayed data substituted vs. not enabled vs. a
+// competing live session holding the subscription) does not change what the
+// operator must do, and the exact message is carried through in Detail anyway.
+//
+//	354   Requested market data is not subscribed
+//	10089 Requested market data requires additional subscription for API
+//	10090 Part of requested market data is not subscribed
+//	10167 Not subscribed — displaying delayed market data
+//	10168 Not subscribed — delayed market data is not enabled
+//	10197 No market data during competing live session
+var subscriptionErrorCodes = map[int64]bool{
+	354: true, 10089: true, 10090: true, 10167: true, 10168: true, 10197: true,
+}
+
+// classifyEntryIBCode maps one IB error code to its entry-failure reason.
+func classifyEntryIBCode(code int64) string {
+	switch {
+	case subscriptionErrorCodes[code]:
+		return entryFailNoSubscription
+	case code == 200:
+		return entryFailContractInvalid
+	default:
+		return entryFailMDError
+	}
+}
+
+// entryFailRank orders reasons by how conclusively they explain the failure,
+// so that when candidates failed differently the most actionable one is
+// reported. A single entitlement error is the whole story; four siblings that
+// merely timed out are not, and must not mask it.
+func entryFailRank(reason string) int {
+	switch reason {
+	case entryFailNoSubscription:
+		return 3
+	case entryFailContractInvalid:
+		return 2
+	case entryFailMDError:
+		return 1
+	default:
+		return 0
+	}
+}
+
+// classifyCandidateErrors reduces a finished probe's candidates to the single
+// reason worth reporting. With no IB error recorded anywhere, the probe simply
+// went unanswered — entryFailQuoteTimeout, which is the honest description and
+// the one the old code could never distinguish from the rest.
+func classifyCandidateErrors(candidates []*deltaCandidate) EntryStrikeResult {
+	best := EntryStrikeResult{Reason: entryFailQuoteTimeout}
+	best.Detail = fmt.Sprintf("IB returned no quote and no error within the probe window (%d candidate strikes)", len(candidates))
+	bestRank := 0
+
+	for _, c := range candidates {
+		if c.errCode == 0 {
+			continue
+		}
+		reason := classifyEntryIBCode(c.errCode)
+		rank := entryFailRank(reason)
+		if rank <= bestRank {
+			continue
+		}
+		bestRank = rank
+		best = EntryStrikeResult{
+			Reason: reason,
+			Detail: fmt.Sprintf("IB %d on %s %s strike %.2f: %s", c.errCode, c.symbol, c.right, c.strike, c.errMsg),
+			IBCode: c.errCode,
+		}
+	}
+	return best
+}
+
+// noteCandidateError stamps an IB error onto the in-flight delta candidate it
+// was reported against, so the cause survives to classifyCandidateErrors.
+//
+// Observational ONLY: it does not delete the candidate, release its
+// market-data line, or influence deltaCandidatesSettled. Recording why a probe
+// failed must not change when the probe gives up — the timing here is load-
+// bearing for entries and is deliberately left exactly as it was.
+func (s *Session) noteCandidateError(reqID, code int64, msg string) {
+	s.optChain.mu.Lock()
+	defer s.optChain.mu.Unlock()
+	if cand, ok := s.optChain.deltaCands[reqID]; ok {
+		cand.errCode = code
+		cand.errMsg = msg
+	}
 }
 
 // deltaResolution groups the pending candidates for one symbol+right so
@@ -234,6 +393,13 @@ type optionChainTracker struct {
 	rotation     []optResGroup
 	rotateCursor int
 
+	// groupIDs maps a group's configuration tuple to the groupID assigned the
+	// first time it was seen, so rebuilding the rotation (which ResyncSymbols
+	// does after every watchlist edit) preserves the identity of every group
+	// that did not change. See buildOptionGroups for why renumbering would be
+	// destructive.
+	groupIDs map[groupKey]int
+
 	// lastIV remembers the most recent implied-volatility sample seen for
 	// each underlying symbol. Used by approximateStrikeForDelta as the best
 	// available IV estimate when a delta probe fails.
@@ -250,6 +416,15 @@ type optionChainTracker struct {
 	// resolving the SAME group within resolvedEntryTTL reuses the identical
 	// strike instead of running its own probe.
 	resolvedEntry map[string]resolvedEntryLeg
+
+	// lastEntryFailure caches the classified cause of the most recent failed
+	// entry probe per "groupID|right", the failure-side counterpart to
+	// resolvedEntry. It exists so a subscriber that joined an in-flight
+	// sibling's probe (waitForEntryResolution) reports the sibling's REAL
+	// cause — "not subscribed", say — instead of the useless "the other robot
+	// failed too", which would defeat the whole point of classifying at all
+	// for whichever robot happened to arrive second.
+	lastEntryFailure map[string]EntryStrikeResult
 
 	// lastProbeLaunch records when ResolveEntryStrike last became the OWNER
 	// of a fresh set of delta-candidate probes for "groupID|right" — i.e.
@@ -349,17 +524,31 @@ func (s *Session) requestOptionChains() {
 	}
 }
 
+// groupKey identifies one option resolution group by its configuration —
+// the tuple that decides which contract the group resolves to. Two
+// subscribers configuring the same tuple share one group and one IB feed.
+type groupKey struct {
+	symbol      string
+	optionDelay int
+	callDelta   float64
+	putDelta    float64
+}
+
 // buildOptionGroups rebuilds the option resolution-group list from the
 // current subscriber symbol lists, deduplicating (symbol, delay, callδ,
 // putδ) tuples across subscribers and assigning each group a stable
-// session-lifetime groupID.
-func (s *Session) buildOptionGroups() {
-	type groupKey struct {
-		symbol      string
-		optionDelay int
-		callDelta   float64
-		putDelta    float64
-	}
+// groupID. It returns the groups that did not exist before this call.
+//
+// Group IDs are keyed by configuration, not by position in the rotation, and
+// are remembered for the life of the session. That matters because a rebuild
+// is no longer a once-per-session event: ResyncSymbols rebuilds after every
+// watchlist edit. Renumbering would invalidate everything keyed by groupID —
+// the resolvedEntry share cache, the rotation's lastAttempt scores, the
+// in-flight-resolution guard — so an unrelated edit would silently re-probe
+// every group at once. With stable IDs an untouched group is bit-identical
+// across a rebuild, and only genuinely new configurations are returned for
+// resolution.
+func (s *Session) buildOptionGroups() []optResGroup {
 	type symInfo struct {
 		currency        string
 		optionDelay     int
@@ -369,7 +558,7 @@ func (s *Session) buildOptionGroups() {
 
 	groups := make(map[groupKey]*optResGroup)
 	var order []groupKey
-	for busIdx, syms := range s.subSymbols {
+	for busIdx, syms := range s.subSymbolLists() {
 		perSym := make(map[string]*symInfo)
 		for _, sy := range syms {
 			if !isOptionTag(sy.Tag) {
@@ -423,16 +612,34 @@ func (s *Session) buildOptionGroups() {
 		return order[i].putDelta < order[j].putDelta
 	})
 
+	var fresh []optResGroup
 	s.optChain.mu.Lock()
+	if s.optChain.groupIDs == nil {
+		s.optChain.groupIDs = make(map[groupKey]int)
+	}
 	s.optChain.rotation = s.optChain.rotation[:0]
 	for _, key := range order {
 		g := groups[key]
-		g.groupID = s.optChain.nextGroupID
-		s.optChain.nextGroupID++
+		id, known := s.optChain.groupIDs[key]
+		if !known {
+			id = s.optChain.nextGroupID
+			s.optChain.nextGroupID++
+			s.optChain.groupIDs[key] = id
+		}
+		g.groupID = id
 		s.optChain.rotation = append(s.optChain.rotation, *g)
+		if !known {
+			fresh = append(fresh, *g)
+		}
 	}
-	s.optChain.rotateCursor = 0
+	// Reset the cursor only on the first build. Later rebuilds keep it so a
+	// watchlist edit does not restart the rotation from the top and re-service
+	// groups that were just serviced.
+	if s.optChain.rotateCursor >= len(s.optChain.rotation) {
+		s.optChain.rotateCursor = 0
+	}
 	s.optChain.mu.Unlock()
+	return fresh
 }
 
 // resolveOptionGroup begins ATM strike resolution for one group by firing
@@ -1192,14 +1399,15 @@ func (s *Session) releaseOrphanedProbeCandidate(reqID int64) {
 // resolveDeltaCandidates picks the candidate with delta closest to the
 // target, promotes it to a live mktReqs subscription, and cancels the
 // rest. Only called from ResolveEntryStrike.
-func (s *Session) resolveDeltaCandidates(groupID int, symbol, right string) (OptionQuote, bool) {
+func (s *Session) resolveDeltaCandidates(groupID int, symbol, right string) (OptionQuote, EntryStrikeResult) {
 	resKey := retryKeyLeg(groupID, right)
 
 	s.optChain.mu.Lock()
 	res, ok := s.optChain.deltaRes[resKey]
 	if !ok {
 		s.optChain.mu.Unlock()
-		return OptionQuote{}, false
+		return OptionQuote{}, EntryStrikeResult{Reason: entryFailQuoteTimeout,
+			Detail: fmt.Sprintf("delta resolution for %s %s vanished before it could be read", symbol, right)}
 	}
 	delete(s.optChain.deltaRes, resKey)
 
@@ -1217,6 +1425,11 @@ func (s *Session) resolveDeltaCandidates(groupID int, symbol, right string) (Opt
 	}
 
 	if best == nil {
+		// Classify BEFORE the candidates are released — an IB error stamped on
+		// a candidate by noteCandidateError is the only thing that separates
+		// "this account is not entitled to option data" from "IB never
+		// answered", and both look identical from here otherwise.
+		failure := classifyCandidateErrors(res.candidates)
 		for _, c := range res.candidates {
 			delete(s.optChain.deltaCands, c.reqID)
 			s.mdLines.Release(c.reqID)
@@ -1234,13 +1447,13 @@ func (s *Session) resolveDeltaCandidates(groupID int, symbol, right string) (Opt
 		}
 		undPrice := s.getUnderlyingPrice(symbol)
 		estStrike := approximateStrikeForDelta(allStrikes, undPrice, iv, targetDelta, expiry, right)
-		s.optionLog.Printf("Option delta resolve: %s %s (group=%d) — no deltas received, estimating strike=%.2f via target delta %.2f (iv=%.4f)",
-			symbol, right, groupID, estStrike, targetDelta, iv)
-		s.logDeltaMiss(symbol, right, targetDelta, undPrice, allStrikes, "no_deltas_received", estStrike, iv)
+		s.optionLog.Printf("Option delta resolve: %s %s (group=%d) — %s (%s), estimating strike=%.2f via target delta %.2f (iv=%.4f)",
+			symbol, right, groupID, failure.Reason, failure.Detail, estStrike, targetDelta, iv)
+		s.logDeltaMiss(symbol, right, targetDelta, undPrice, allStrikes, failure.Reason, estStrike, iv)
 		if estStrike > 0 {
 			s.subscribeOptionLeg(groupID, busIdxs, symbol, right, estStrike, expiry, true, false)
 		}
-		return OptionQuote{}, false
+		return OptionQuote{}, failure
 	}
 
 	_, pending := s.activeLegLocked(best.symbol, best.right)
@@ -1293,7 +1506,18 @@ func (s *Session) resolveDeltaCandidates(groupID int, symbol, right string) (Opt
 	// entryDeltaProbeTimeout), so "now" is an accurate freshness stamp for them —
 	// there is no separate per-tick timestamp cached on deltaCandidate to read back.
 	now := time.Now()
-	return OptionQuote{Strike: best.strike, Expiry: best.expiry, Bid: best.bid, Ask: best.ask, Delta: best.delta, BidTime: now, AskTime: now}, true
+	q := OptionQuote{Strike: best.strike, Expiry: best.expiry, Bid: best.bid, Ask: best.ask, Delta: best.delta, BidTime: now, AskTime: now}
+	if !q.Valid() {
+		// A winner on delta with no two-sided price. Callers already refused to
+		// trade this (Valid() is the entry precondition); reporting it as its
+		// own reason stops it hiding inside the generic "no quote" bucket, and
+		// it is a genuinely different situation — the contract IS quoting
+		// Greeks, so entitlement is fine and the price is merely late.
+		return q, EntryStrikeResult{Reason: entryFailDeltaNoPrice,
+			Detail: fmt.Sprintf("%s %s strike %.2f matched on delta %.4f but IB sent no two-sided price (bid=%.2f ask=%.2f)",
+				symbol, right, best.strike, best.delta, best.bid, best.ask)}
+	}
+	return q, EntryStrikeResult{OK: true}
 }
 
 // groupForSymbolLocked returns the resolution group for symbol that busIdx
@@ -1348,7 +1572,7 @@ func deltaCandidatesSettled(candidates []*deltaCandidate, targetDelta float64) b
 // VWmacdOptionDataRobot's group (target_delta 0.55) instead of its own,
 // landing near 0.60 only because a single candidate happened to be the only
 // one to report a delta in time — not because anything validated the target.
-func (s *Session) ResolveEntryStrike(sub Subscriber, symbol, right string, timeout time.Duration) (OptionQuote, bool) {
+func (s *Session) ResolveEntryStrike(sub Subscriber, symbol, right string, timeout time.Duration) (OptionQuote, EntryStrikeResult) {
 	busIdx := s.busIndex(sub.Bus())
 	s.optChain.mu.Lock()
 	group, hasGroup := s.groupForSymbolLocked(symbol, busIdx)
@@ -1356,12 +1580,17 @@ func (s *Session) ResolveEntryStrike(sub Subscriber, symbol, right string, timeo
 	resKey := retryKeyLeg(group.groupID, right)
 	_, inFlight := s.optChain.deltaRes[resKey]
 	s.optChain.mu.Unlock()
-	if !hasGroup || !hasInfo || len(info.strikes) == 0 {
-		return OptionQuote{}, false
+	if !hasGroup {
+		return OptionQuote{}, EntryStrikeResult{Reason: entryFailNoChain,
+			Detail: fmt.Sprintf("no option resolution group tracks %s for this robot", symbol)}
+	}
+	if !hasInfo || len(info.strikes) == 0 {
+		return OptionQuote{}, EntryStrikeResult{Reason: entryFailNoChain,
+			Detail: fmt.Sprintf("no cached option chain for %s yet (conId/chain-params lookup has not returned)", symbol)}
 	}
 
 	if q, ok := s.sharedResolvedEntry(group.groupID, symbol, right); ok {
-		return q, true
+		return q, EntryStrikeResult{OK: true}
 	}
 
 	// A sibling subscriber configured identically (same symbol, option_delay,
@@ -1385,9 +1614,18 @@ func (s *Session) ResolveEntryStrike(sub Subscriber, symbol, right string, timeo
 	// independently re-launch within the other's cooldown window.
 	s.optChain.mu.Lock()
 	sinceLaunch := time.Since(s.optChain.lastProbeLaunch[resKey])
+	lastFail, hadFail := s.optChain.lastEntryFailure[resKey]
 	s.optChain.mu.Unlock()
 	if sinceLaunch < entryProbeLaunchCooldown {
-		return OptionQuote{}, false
+		// The previous launch's cause is the real explanation for this call
+		// too — the cooldown is only why we are not re-asking IB right now.
+		// Reporting the cooldown itself would bury an entitlement failure
+		// behind an implementation detail for 15 of every 16 seconds.
+		if hadFail {
+			return OptionQuote{}, lastFail
+		}
+		return OptionQuote{}, EntryStrikeResult{Reason: entryFailProbeCooldown,
+			Detail: fmt.Sprintf("last delta probe for %s %s was %.0fs ago; cooldown is %s", symbol, right, sinceLaunch.Seconds(), entryProbeLaunchCooldown)}
 	}
 
 	targetDelta := group.targetDeltaCall
@@ -1395,13 +1633,15 @@ func (s *Session) ResolveEntryStrike(sub Subscriber, symbol, right string, timeo
 		targetDelta = group.targetDeltaPut
 	}
 	if targetDelta >= 0.48 && targetDelta <= 0.52 {
-		return OptionQuote{}, false
+		return OptionQuote{}, EntryStrikeResult{Reason: entryFailDeltaTargetATM,
+			Detail: fmt.Sprintf("target_delta %.2f for %s %s is inside the refused ATM band [0.48, 0.52]", targetDelta, symbol, right)}
 	}
 
 	undPrice := s.getUnderlyingPrice(symbol)
 	candidates := selectITMCandidates(info.strikes, undPrice, right, 5)
 	if len(candidates) == 0 {
-		return OptionQuote{}, false
+		return OptionQuote{}, EntryStrikeResult{Reason: entryFailNoCandidates,
+			Detail: fmt.Sprintf("no ITM %s strike for %s near underlying %.2f in a %d-strike chain", right, symbol, undPrice, len(info.strikes))}
 	}
 
 	groupID := group.groupID
@@ -1436,7 +1676,8 @@ func (s *Session) ResolveEntryStrike(sub Subscriber, symbol, right string, timeo
 	}
 	if len(res.candidates) == 0 {
 		s.optChain.mu.Unlock()
-		return OptionQuote{}, false
+		return OptionQuote{}, EntryStrikeResult{Reason: entryFailNoMDLines,
+			Detail: fmt.Sprintf("market-data line budget refused all %d probe candidates for %s %s", len(candidates), symbol, right)}
 	}
 	s.optChain.deltaRes[resKey] = res
 	s.optChain.lastProbeLaunch[resKey] = time.Now()
@@ -1453,16 +1694,28 @@ func (s *Session) ResolveEntryStrike(sub Subscriber, symbol, right string, timeo
 		}
 		time.Sleep(pollInterval)
 	}
-	q, matched := s.resolveDeltaCandidates(groupID, symbol, right)
-	if matched && q.Valid() {
-		s.optChain.mu.Lock()
+	q, res2 := s.resolveDeltaCandidates(groupID, symbol, right)
+	s.optChain.mu.Lock()
+	if res2.OK {
 		if s.optChain.resolvedEntry == nil {
 			s.optChain.resolvedEntry = make(map[string]resolvedEntryLeg)
 		}
 		s.optChain.resolvedEntry[retryKeyLeg(groupID, right)] = resolvedEntryLeg{strike: q.Strike, expiry: q.Expiry, delta: q.Delta, at: time.Now()}
-		s.optChain.mu.Unlock()
+		delete(s.optChain.lastEntryFailure, resKey)
+	} else {
+		// Publish the cause for siblings still polling waitForEntryResolution,
+		// and for our own next call inside the launch cooldown.
+		if s.optChain.lastEntryFailure == nil {
+			s.optChain.lastEntryFailure = make(map[string]EntryStrikeResult)
+		}
+		s.optChain.lastEntryFailure[resKey] = res2
 	}
-	return q, matched
+	s.optChain.mu.Unlock()
+	if !res2.OK {
+		s.optionLog.Printf("Option entry probe FAILED: %s %s (group=%d) — %s: %s",
+			symbol, right, groupID, res2.Reason, res2.Detail)
+	}
+	return q, res2
 }
 
 // sharedResolvedEntry returns a fresh, Book-priced quote for the contract
@@ -1495,7 +1748,7 @@ func (s *Session) sharedResolvedEntry(groupID int, symbol, right string) (Option
 // populates on success. If the owner's probe failed, resolvedEntry stays
 // empty and this returns the same (OptionQuote{}, false) the owner got,
 // rather than spending a second probe chasing the same answer.
-func (s *Session) waitForEntryResolution(groupID int, symbol, right string, timeout time.Duration) (OptionQuote, bool) {
+func (s *Session) waitForEntryResolution(groupID int, symbol, right string, timeout time.Duration) (OptionQuote, EntryStrikeResult) {
 	resKey := retryKeyLeg(groupID, right)
 	const pollInterval = 100 * time.Millisecond
 	deadline := time.Now().Add(timeout)
@@ -1508,7 +1761,20 @@ func (s *Session) waitForEntryResolution(groupID int, symbol, right string, time
 		}
 		time.Sleep(pollInterval)
 	}
-	return s.sharedResolvedEntry(groupID, symbol, right)
+	if q, ok := s.sharedResolvedEntry(groupID, symbol, right); ok {
+		return q, EntryStrikeResult{OK: true}
+	}
+	// Report the owner's actual cause rather than "the other one failed too" —
+	// whichever robot arrives second must not get a worse diagnosis than the
+	// one that happened to own the probe.
+	s.optChain.mu.Lock()
+	fail, ok := s.optChain.lastEntryFailure[resKey]
+	s.optChain.mu.Unlock()
+	if ok {
+		return OptionQuote{}, fail
+	}
+	return OptionQuote{}, EntryStrikeResult{Reason: entryFailSiblingFailed,
+		Detail: fmt.Sprintf("another robot's delta probe for %s %s finished without a usable quote", symbol, right)}
 }
 
 // subscribeOptionMarketData subscribes to streaming market data for both
@@ -1544,6 +1810,12 @@ func (s *Session) handleOptionMktError(reqID int64, errStr string) bool {
 	}
 
 	if cand, ok := s.optChain.deltaCands[reqID]; ok {
+		// Stamp the cause on the candidate BEFORE dropping it from the map:
+		// res.candidates still holds this pointer, so classifyCandidateErrors
+		// can read it even though the candidate is no longer discoverable by
+		// reqID.
+		cand.errCode = 200
+		cand.errMsg = errStr
 		delete(s.optChain.deltaCands, cand.reqID)
 		s.mdLines.Release(cand.reqID)
 		s.optChain.mu.Unlock()
