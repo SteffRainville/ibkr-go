@@ -92,7 +92,14 @@ func (s *Session) AccountSummaryEnd(reqID int64) {
 // Position is called by IB for each position in the account.
 //
 // Before the first PositionEnd() (initial snapshot): accumulate in posMap.
-// After PositionEnd() (real-time subscription updates): apply immediately.
+// After PositionEnd() (real-time subscription updates): apply immediately —
+// including to posMap itself, since posMap is the naked-short safety gate's
+// (ensureOptionSellable/heldOptionQtyShares in orders.go) sole source of
+// truth. A fill that only fired OnPositionUpdate without updating posMap
+// left a freshly opened position invisible to that gate until the next
+// periodic resync — up to position_refresh_interval_minutes later — so a
+// same-session close saw "0 held" and refused to sell a position IB had
+// already confirmed (the 2026-08-10 IWM incident).
 func (s *Session) Position(account string, contract *ibapi.Contract, position ibapi.Decimal, avgCost float64) {
 	posQty := float64(position.Int())
 	s.logger.Printf("Position: account=%s symbol=%s pos=%.0f avgCost=%.2f", account, contract.Symbol, posQty, avgCost)
@@ -111,6 +118,11 @@ func (s *Session) Position(account string, contract *ibapi.Contract, position ib
 		info.Strike = contract.Strike
 		info.Expiry = contract.LastTradeDateOrContractMonth
 	}
+	// Keyed by full leg identity (not just account+Symbol+SecType) so two
+	// different option legs of the same underlying — e.g. two robots
+	// holding different IWM strikes/rights at once — occupy distinct
+	// posMap slots instead of clobbering each other.
+	key := account + "|" + legIdentity(info)
 
 	s.pos.posMapMu.Lock()
 	done := s.pos.initialDone
@@ -121,7 +133,7 @@ func (s *Session) Position(account string, contract *ibapi.Contract, position ib
 			return
 		}
 		s.pos.posMapMu.Lock()
-		s.pos.posMap[account+"|"+contract.Symbol+"|"+contract.SecType] = info
+		s.pos.posMap[key] = info
 		s.pos.posMapMu.Unlock()
 		return
 	}
@@ -131,17 +143,22 @@ func (s *Session) Position(account string, contract *ibapi.Contract, position ib
 		// transient or erroneous zero for a position that is still
 		// genuinely held. Record the leg and confirm it against a fresh
 		// COMPLETE snapshot in PositionEnd.
-		key := legIdentity(info)
+		legKey := legIdentity(info)
 		s.pos.posMapMu.Lock()
-		s.pos.pendingClose[key] = info
+		s.pos.pendingClose[legKey] = info
 		accumulating := !s.pos.initialDone
 		s.pos.posMapMu.Unlock()
-		s.logger.Printf("Position: qty=0 for %s — deferring close pending snapshot confirmation", key)
+		s.logger.Printf("Position: qty=0 for %s — deferring close pending snapshot confirmation", legKey)
 		if !accumulating {
 			s.refreshPositions()
 		}
 		return
 	}
+
+	s.pos.posMapMu.Lock()
+	s.pos.posMap[key] = info
+	s.pos.posMapMu.Unlock()
+
 	if s.opts.OnPositionUpdate != nil {
 		s.opts.OnPositionUpdate(info)
 	}
