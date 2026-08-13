@@ -209,10 +209,8 @@ func (s *Session) TickOptionComputation(reqID int64, tickType int64, tickAttrib 
 			s.optChain.lastIV = make(map[string]float64)
 		}
 		symbolKey := ""
-		if req, ok := s.optChain.mktReqs[reqID]; ok {
-			symbolKey = req.symbol
-		} else if sub, ok := s.optChain.posSubs[reqID]; ok {
-			symbolKey = sub.symbol
+		if leg, ok := s.legByReqIDLocked(reqID); ok {
+			symbolKey = leg.symbol
 		} else if cand, ok := s.optChain.deltaCands[reqID]; ok {
 			symbolKey = cand.symbol
 		}
@@ -221,30 +219,23 @@ func (s *Session) TickOptionComputation(reqID int64, tickType int64, tickAttrib 
 		}
 	}
 
-	if req, ok := s.optChain.mktReqs[reqID]; ok {
-		req.delta = delta
-		req.deltaSource = "matched"
+	if leg, ok := s.legByReqIDLocked(reqID); ok {
+		leg.delta = delta
+		leg.deltaSource = "matched"
 		od := eventbus.OptionData{
-			Symbol: req.symbol, Right: req.right, Strike: req.strike, Expiry: req.expiry,
-			Price: req.price, Bid: req.bid, Ask: req.ask, Delta: req.delta, IV: impliedVol, DeltaSource: req.deltaSource,
+			Symbol: leg.symbol, Right: leg.right, Strike: leg.strike, Expiry: leg.expiry,
+			Price: leg.price, Bid: leg.bid, Ask: leg.ask, Delta: leg.delta, IV: impliedVol, DeltaSource: leg.deltaSource,
 		}
-		busIdxs := req.busIdxs
+		buses := s.legDisplayBusesLocked(leg.key())
+		pinned := leg.pins > 0
 		s.optChain.mu.Unlock()
 		s.bookOption(od)
-		s.publishTo(busIdxs, eventbus.Event{Kind: eventbus.KindOptionData, Payload: od})
-		return
-	}
-
-	if sub, ok := s.optChain.posSubs[reqID]; ok {
-		sub.delta = delta
-		sub.deltaSource = "matched"
-		od := eventbus.OptionData{
-			Symbol: sub.symbol, Right: sub.right, Strike: sub.strike, Expiry: sub.expiry,
-			Price: sub.price, Bid: sub.bid, Ask: sub.ask, Delta: sub.delta, IV: impliedVol, DeltaSource: sub.deltaSource,
+		if len(buses) > 0 {
+			s.publishTo(buses, eventbus.Event{Kind: eventbus.KindOptionData, Payload: od})
 		}
-		s.optChain.mu.Unlock()
-		s.bookOption(od)
-		s.publish(eventbus.Event{Kind: eventbus.KindPositionOptionData, Payload: od})
+		if pinned {
+			s.publish(eventbus.Event{Kind: eventbus.KindPositionOptionData, Payload: od})
+		}
 		return
 	}
 

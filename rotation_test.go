@@ -10,19 +10,19 @@ import (
 // newRotationTestSession builds a Session (via NewSession, so every logger
 // field is a real io.Discard-backed *log.Logger rather than a nil one that
 // would panic on the first Printf) with the given per-subscriber symbol
-// lists — enough to exercise buildOptionGroups / groupResolvingLocked
-// without an IB client.
+// lists — enough to exercise buildSelectors / selectorResolvingLocked without
+// an IB client.
 func newRotationTestSession(subSymbols [][]SymbolSpec) *Session {
 	s := NewSession(Options{}, nil, nil)
 	s.subSymbols = subSymbols
 	return s
 }
 
-// TestBuildOptionGroups_DedupAndStableIDs verifies option groups are deduped by
-// (symbol, delay, deltas), non-option rows are ignored, both subscribers that
-// share a symbol are merged into one group with both bus indices, and each
-// group gets a distinct stable groupID.
-func TestBuildOptionGroups_DedupAndStableIDs(t *testing.T) {
+// TestBuildSelectors_DedupAndStableIDs verifies selectors are deduped by
+// (symbol, right, delay, δ), non-option rows are ignored, both subscribers
+// that share a configuration are merged into one selector with both bus
+// indices, and each selector gets a distinct stable id.
+func TestBuildSelectors_DedupAndStableIDs(t *testing.T) {
 	subSymbols := [][]SymbolSpec{
 		{ // bus 0
 			{Symbol: "TQQQ", Tag: "long"}, // ignored (not call/put)
@@ -30,50 +30,109 @@ func TestBuildOptionGroups_DedupAndStableIDs(t *testing.T) {
 			{Symbol: "QQQ", Tag: "put", OptionDelay: 0, TargetDelta: 0.50},
 			{Symbol: "SPY", Tag: "call", OptionDelay: 1, TargetDelta: 0.65},
 		},
-		{ // bus 1 — QQQ with identical params → same group as bus 0's QQQ
+		{ // bus 1 — QQQ with identical params → same selectors as bus 0's
 			{Symbol: "QQQ", Tag: "call", OptionDelay: 0, TargetDelta: 0.50},
 			{Symbol: "QQQ", Tag: "put", OptionDelay: 0, TargetDelta: 0.50},
 		},
 	}
 	s := newRotationTestSession(subSymbols)
-	s.buildOptionGroups()
+	s.buildSelectors()
 
-	if got := len(s.optChain.rotation); got != 2 {
-		t.Fatalf("rotation groups = %d, want 2 (QQQ, SPY)", got)
+	if got := len(s.optChain.rotation); got != 3 {
+		t.Fatalf("rotation = %d, want 3 (QQQ call, QQQ put, SPY call)", got)
 	}
 
-	bySym := map[string]optResGroup{}
+	byKey := map[string]selector{}
 	seenID := map[int]bool{}
-	for _, g := range s.optChain.rotation {
-		bySym[g.symbol] = g
-		if seenID[g.groupID] {
-			t.Fatalf("duplicate groupID %d", g.groupID)
+	for _, sel := range s.optChain.rotation {
+		byKey[sel.symbol+"|"+sel.right] = sel
+		if seenID[sel.id] {
+			t.Fatalf("duplicate selector id %d", sel.id)
 		}
-		seenID[g.groupID] = true
+		seenID[sel.id] = true
 	}
 
-	qqq, ok := bySym["QQQ"]
+	qqqCall, ok := byKey["QQQ|call"]
 	if !ok {
-		t.Fatal("QQQ group missing")
+		t.Fatal("QQQ call selector missing")
 	}
-	if len(qqq.busIdxs) != 2 {
-		t.Fatalf("QQQ busIdxs = %v, want both subscribers", qqq.busIdxs)
+	if len(qqqCall.busIdxs) != 2 {
+		t.Fatalf("QQQ call busIdxs = %v, want both subscribers", qqqCall.busIdxs)
 	}
-	spy, ok := bySym["SPY"]
+	spy, ok := byKey["SPY|call"]
 	if !ok {
-		t.Fatal("SPY group missing")
+		t.Fatal("SPY call selector missing")
 	}
-	if spy.optionDelay != 1 || spy.targetDeltaCall != 0.65 {
-		t.Fatalf("SPY params wrong: delay=%d callδ=%.2f", spy.optionDelay, spy.targetDeltaCall)
+	if spy.optionDelay != 1 || spy.targetDelta != 0.65 {
+		t.Fatalf("SPY params wrong: delay=%d δ=%.2f", spy.optionDelay, spy.targetDelta)
 	}
 	if len(spy.busIdxs) != 1 {
 		t.Fatalf("SPY busIdxs = %v, want only bus 0", spy.busIdxs)
 	}
+	if _, exists := byKey["SPY|put"]; exists {
+		t.Fatal("a SPY put selector was invented from a watchlist that has no SPY put row")
+	}
 }
 
-// TestBuildOptionGroups_Deterministic verifies the rotation order is stable across
+// TestBuildSelectors_AbsentRightMakesNoSelector is the trigger for the
+// 2026-08-13 QQQ blackout. Commenting out VWmacdFilteredRobot's QQQ put row
+// made the old builder default that side to δ0.50 — which both subscribed an
+// ATM put leg nobody was watching AND, because the default was part of the
+// group key, moved the still-watched CALL into a group of its own, away from
+// the sibling it had been sharing with.
+//
+// A call-only watchlist must produce exactly one selector, for the call.
+func TestBuildSelectors_AbsentRightMakesNoSelector(t *testing.T) {
+	s := newRotationTestSession([][]SymbolSpec{{
+		{Symbol: "QQQ", Tag: "call", OptionDelay: 2, TargetDelta: 0.55},
+	}})
+	s.buildSelectors()
+
+	if got := len(s.optChain.rotation); got != 1 {
+		t.Fatalf("rotation = %d, want exactly 1 (the call); a put selector must not be invented", got)
+	}
+	sel := s.optChain.rotation[0]
+	if sel.right != "call" || sel.targetDelta != 0.55 {
+		t.Fatalf("selector = %s δ%.2f, want call δ0.55", sel.right, sel.targetDelta)
+	}
+}
+
+// TestBuildSelectors_CommentingOutAPutLeavesTheCallAlone is the same trigger
+// stated as the operation that caused it: editing one right's row must not
+// change the other right's identity, since a stable id is what keeps a
+// selector's leg, rotation score and share caches across a resync.
+func TestBuildSelectors_CommentingOutAPutLeavesTheCallAlone(t *testing.T) {
+	both := [][]SymbolSpec{{
+		{Symbol: "QQQ", Tag: "call", OptionDelay: 2, TargetDelta: 0.55},
+		{Symbol: "QQQ", Tag: "put", OptionDelay: 2, TargetDelta: 0.55},
+	}}
+	s := newRotationTestSession(both)
+	s.buildSelectors()
+
+	var callID int
+	for _, sel := range s.optChain.rotation {
+		if sel.right == "call" {
+			callID = sel.id
+		}
+	}
+
+	// The put row is commented out and the symbols re-read.
+	s.subSymbols = [][]SymbolSpec{{
+		{Symbol: "QQQ", Tag: "call", OptionDelay: 2, TargetDelta: 0.55},
+	}}
+	s.buildSelectors()
+
+	if len(s.optChain.rotation) != 1 {
+		t.Fatalf("rotation = %d, want 1", len(s.optChain.rotation))
+	}
+	if got := s.optChain.rotation[0].id; got != callID {
+		t.Fatalf("call selector id changed %d → %d when the PUT row was removed — the call must be untouched by an edit to a different instrument", callID, got)
+	}
+}
+
+// TestBuildSelectors_Deterministic verifies the rotation order is stable across
 // rebuilds (map iteration randomness must not leak into the rotation).
-func TestBuildOptionGroups_Deterministic(t *testing.T) {
+func TestBuildSelectors_Deterministic(t *testing.T) {
 	subSymbols := [][]SymbolSpec{{
 		{Symbol: "AAA", Tag: "call"},
 		{Symbol: "BBB", Tag: "put"},
@@ -81,177 +140,163 @@ func TestBuildOptionGroups_Deterministic(t *testing.T) {
 		{Symbol: "DDD", Tag: "put"},
 	}}
 	s := newRotationTestSession(subSymbols)
-	s.buildOptionGroups()
+	s.buildSelectors()
 	first := make([]string, len(s.optChain.rotation))
-	for i, g := range s.optChain.rotation {
-		first[i] = g.symbol
+	for i, sel := range s.optChain.rotation {
+		first[i] = sel.symbol + "|" + sel.right
 	}
-	// Rebuild several times; order must not change.
 	for iter := 0; iter < 20; iter++ {
-		s.buildOptionGroups()
-		for i, g := range s.optChain.rotation {
-			if g.symbol != first[i] {
-				t.Fatalf("rotation order changed on rebuild %d: %v vs %v", iter, g.symbol, first[i])
+		s.buildSelectors()
+		for i, sel := range s.optChain.rotation {
+			if got := sel.symbol + "|" + sel.right; got != first[i] {
+				t.Fatalf("rotation order changed on rebuild %d: %v vs %v", iter, got, first[i])
 			}
 		}
 	}
 }
 
-// TestGroupResolvingLocked verifies the in-flight guard sees a pending conId,
-// chain-params, or delta resolution for a group and is false once cleared.
-func TestGroupResolvingLocked(t *testing.T) {
+// TestSelectorResolvingLocked verifies the in-flight guard sees a pending
+// conId, chain-params, or delta resolution for a selector and is false once
+// cleared.
+func TestSelectorResolvingLocked(t *testing.T) {
 	s := newRotationTestSession(nil)
 
-	if s.groupResolvingLocked(7) {
+	if s.selectorResolvingLocked(7) {
 		t.Fatal("empty tracker should report not resolving")
 	}
 
-	s.optChain.conIDReqs[100] = &optConIDReq{groupID: 7}
-	if !s.groupResolvingLocked(7) {
+	s.optChain.conIDReqs[100] = &optConIDReq{chain: chainKey{"QQQ", 0}, waiters: []int{7}}
+	if !s.selectorResolvingLocked(7) {
 		t.Fatal("pending conId lookup not detected")
 	}
 	delete(s.optChain.conIDReqs, 100)
 
-	s.optChain.chainReqs[200] = &optChainReq{groupID: 7}
-	if !s.groupResolvingLocked(7) {
+	s.optChain.chainReqs[200] = &optChainReq{chain: chainKey{"QQQ", 0}, waiters: []int{7}}
+	if !s.selectorResolvingLocked(7) {
 		t.Fatal("pending chain-params request not detected")
 	}
 	delete(s.optChain.chainReqs, 200)
 
-	s.optChain.deltaRes[retryKeyLeg(7, "put")] = &deltaResolution{groupID: 7}
-	if !s.groupResolvingLocked(7) {
+	s.optChain.deltaRes[7] = &deltaResolution{selectorID: 7}
+	if !s.selectorResolvingLocked(7) {
 		t.Fatal("pending delta resolution not detected")
 	}
-	// A different group must not be considered resolving.
-	if s.groupResolvingLocked(8) {
-		t.Fatal("group 8 falsely reported resolving")
+	if s.selectorResolvingLocked(8) {
+		t.Fatal("selector 8 falsely reported resolving")
 	}
 }
 
-// TestPickRotationGroupLocked_TiedGroupsRotateFairly pins down the
-// 2026-07-28 stuck-first-quote bug: groupStalenessLocked returns the zero
-// time.Time for any group with no active leg yet, so a large batch of
-// never-quoted groups (the normal state right after startup, or any time no
-// ticks are flowing, e.g. outside RTH) all tie at the same score. The old
-// picker always started scanning at index 0 and never replaced a tie
-// (score.Before is strict), so group 0 won every single tick forever and no
-// other group ever got its first resolution attempt. The fix must cycle
-// through tied groups instead of freezing on the first one.
-func TestPickRotationGroupLocked_TiedGroupsRotateFairly(t *testing.T) {
+// TestPickRotationSelectorLocked_TiedRotateFairly pins down the 2026-07-28
+// stuck-first-quote bug: the score is the zero time.Time for anything never
+// resolved, so a large batch of them — the normal state right after startup —
+// all tie. The old picker always started scanning at index 0 and never replaced
+// a tie (score.Before is strict), so entry 0 won every single tick forever and
+// nothing else ever got its first resolution attempt. The fix must cycle
+// through tied entries instead of freezing on the first one.
+func TestPickRotationSelectorLocked_TiedRotateFairly(t *testing.T) {
 	s := newRotationTestSession(nil)
-	s.optChain.rotation = []optResGroup{
-		{groupID: 0, symbol: "AAA"},
-		{groupID: 1, symbol: "BBB"},
-		{groupID: 2, symbol: "CCC"},
+	s.optChain.rotation = []selector{
+		{id: 0, symbol: "AAA", right: "call"},
+		{id: 1, symbol: "BBB", right: "call"},
+		{id: 2, symbol: "CCC", right: "call"},
 	}
-	// No active legs and no book entries for any of them — every group's
-	// groupStalenessLocked score is the tied zero value.
 
 	seen := map[string]int{}
 	for i := 0; i < 6; i++ {
 		s.optChain.mu.Lock()
-		g, ok := s.pickRotationGroupLocked()
+		sel, ok := s.pickRotationSelectorLocked()
 		s.optChain.mu.Unlock()
 		if !ok {
-			t.Fatalf("pick %d: expected a group, got none", i)
+			t.Fatalf("pick %d: expected a selector, got none", i)
 		}
-		seen[g.symbol]++
+		seen[sel.symbol]++
 	}
 
 	for _, sym := range []string{"AAA", "BBB", "CCC"} {
 		if seen[sym] != 2 {
-			t.Errorf("symbol %s picked %d times over 6 ticks, want 2 (fair rotation through 3 tied groups)", sym, seen[sym])
+			t.Errorf("symbol %s picked %d times over 6 ticks, want 2 (fair rotation through 3 tied entries)", sym, seen[sym])
 		}
 	}
 }
 
-// TestPickRotationGroupLocked_SkipsResolvingGroups verifies a group with an
-// in-flight conId/chain/delta resolution is never returned, even when it
-// would otherwise tie for staleness.
-func TestPickRotationGroupLocked_SkipsResolvingGroups(t *testing.T) {
+// TestPickRotationSelectorLocked_SkipsResolving verifies a selector with an
+// in-flight conId/chain/delta resolution is never returned, even when it would
+// otherwise tie for staleness.
+func TestPickRotationSelectorLocked_SkipsResolving(t *testing.T) {
 	s := newRotationTestSession(nil)
-	s.optChain.rotation = []optResGroup{
-		{groupID: 0, symbol: "AAA"},
-		{groupID: 1, symbol: "BBB"},
+	s.optChain.rotation = []selector{
+		{id: 0, symbol: "AAA", right: "call"},
+		{id: 1, symbol: "BBB", right: "call"},
 	}
-	s.optChain.conIDReqs[500] = &optConIDReq{groupID: 0}
+	s.optChain.conIDReqs[500] = &optConIDReq{chain: chainKey{"AAA", 0}, waiters: []int{0}}
 
 	for i := 0; i < 4; i++ {
 		s.optChain.mu.Lock()
-		g, ok := s.pickRotationGroupLocked()
+		sel, ok := s.pickRotationSelectorLocked()
 		s.optChain.mu.Unlock()
 		if !ok {
 			t.Fatalf("pick %d: expected BBB, got none", i)
 		}
-		if g.symbol != "BBB" {
-			t.Fatalf("pick %d: got %s, want BBB — AAA is still resolving", i, g.symbol)
+		if sel.symbol != "BBB" {
+			t.Fatalf("pick %d: got %s, want BBB — AAA is still resolving", i, sel.symbol)
 		}
 	}
 }
 
-// TestPickRotationGroupLocked_EmptyWhenAllResolving verifies the picker
-// returns ok=false (rather than forcing a still-resolving group through,
-// as the old !found fallback did) when nothing is eligible.
-func TestPickRotationGroupLocked_EmptyWhenAllResolving(t *testing.T) {
+// TestPickRotationSelectorLocked_EmptyWhenAllResolving verifies the picker
+// returns ok=false (rather than forcing a still-resolving entry through, as the
+// old !found fallback did) when nothing is eligible.
+func TestPickRotationSelectorLocked_EmptyWhenAllResolving(t *testing.T) {
 	s := newRotationTestSession(nil)
-	s.optChain.rotation = []optResGroup{{groupID: 0, symbol: "AAA"}}
-	s.optChain.conIDReqs[500] = &optConIDReq{groupID: 0}
+	s.optChain.rotation = []selector{{id: 0, symbol: "AAA", right: "call"}}
+	s.optChain.conIDReqs[500] = &optConIDReq{chain: chainKey{"AAA", 0}, waiters: []int{0}}
 
 	s.optChain.mu.Lock()
-	_, ok := s.pickRotationGroupLocked()
+	_, ok := s.pickRotationSelectorLocked()
 	s.optChain.mu.Unlock()
 	if ok {
-		t.Fatal("expected no group when the only group is still resolving")
+		t.Fatal("expected no selector when the only one is still resolving")
 	}
 }
 
-// TestPickRotationGroupLocked_UnquotedLegDoesNotStarveForever pins down the
+// TestPickRotationSelectorLocked_UnquotedLegDoesNotStarveForever pins down the
 // 2026-07-31 stuck-at-31 "Background ATM — first quote" bug, a sequel to the
-// 2026-07-28 tied-groups bug above. This one isn't a tie: a group with an
-// active leg that never receives a book quote (e.g. IB never sends ticks for
-// a thin/illiquid strike) scored the zero time.Time forever, which beats
-// every group with a real, recent quote timestamp unconditionally — not just
-// on ties. That let a single chronically-unquoted leg monopolize every
-// rotation tick permanently, starving every other group's churn (in
-// production: GLD/HOOD/INTC alone took 96/50/39 of the rotation picks in a
-// 14-minute window while 12 of 21 configured groups got none). The fix
-// records when a group was last actually attempted (lastAttempt) and uses
-// that as the fallback score instead of the zero value, so a group ages
-// forward after its shot even if it never gets a quote — a genuinely never-
-// touched group still wins first (matching the tied-groups test above), but
-// a group that already had its turn and failed can't freeze at "more stale
-// than the dawn of time" and lock out everyone else.
-func TestPickRotationGroupLocked_UnquotedLegDoesNotStarveForever(t *testing.T) {
+// 2026-07-28 tied bug above. This one isn't a tie: an entry with a leg that
+// never receives a book quote (e.g. IB never sends ticks for a thin/illiquid
+// strike) scored the zero time.Time forever, which beats every real, recent
+// quote timestamp unconditionally — not just on ties. That let a single
+// chronically-unquoted leg monopolize every rotation tick permanently (in
+// production: GLD/HOOD/INTC alone took 96/50/39 of the picks in a 14-minute
+// window while 12 of 21 configured groups got none). The fix records when an
+// entry was last actually attempted (lastAttempt) and uses that as the score,
+// so it ages forward after its shot even if it never gets a quote.
+func TestPickRotationSelectorLocked_UnquotedLegDoesNotStarveForever(t *testing.T) {
 	s := newRotationTestSession(nil)
 	s.book = quotes.NewBook()
-	s.optChain.rotation = []optResGroup{
-		{groupID: 0, symbol: "STUCK"},
-		{groupID: 1, symbol: "GOOD"},
+	s.optChain.rotation = []selector{
+		{id: 0, symbol: "STUCK", right: "call"},
+		{id: 1, symbol: "GOOD", right: "call"},
 	}
 
-	// GOOD has a real, recent book quote.
-	s.optChain.mktReqs[10] = &optMktReq{groupID: 1, symbol: "GOOD", right: "call", strike: 100}
+	seedLeg(s, lk("GOOD", "call", 100, ""), legOpts{reqID: 10, selectors: []int{1}})
 	s.book.SetOptionBid(quotes.ContractKey{Symbol: "GOOD", Right: "call", Strike: 100}, 1.0)
 	goodQuotedAt := time.Now()
 
-	// STUCK has an active leg (already attempted once, hence it exists) but
-	// has never received a book tick — the illiquid-strike case.
-	s.optChain.mktReqs[20] = &optMktReq{groupID: 0, symbol: "STUCK", right: "call", strike: 50}
+	// STUCK has a leg (already attempted once, hence it exists) but has never
+	// received a book tick — the illiquid-strike case.
+	seedLeg(s, lk("STUCK", "call", 50, ""), legOpts{reqID: 20, selectors: []int{0}})
 
 	time.Sleep(2 * time.Millisecond) // ensure strictly-ordered timestamps below
 
 	// First pick: STUCK has never been recorded in lastAttempt, so it still
-	// correctly scores as maximally stale and goes first — a never-quoted
-	// leg should get its shot before an already-flowing one is re-churned.
+	// correctly scores as maximally stale and goes first.
 	s.optChain.mu.Lock()
-	g, ok := s.pickRotationGroupLocked()
+	sel, ok := s.pickRotationSelectorLocked()
 	s.optChain.mu.Unlock()
-	if !ok || g.symbol != "STUCK" {
-		t.Fatalf("first pick = %v (ok=%v), want STUCK", g.symbol, ok)
+	if !ok || sel.symbol != "STUCK" {
+		t.Fatalf("first pick = %v (ok=%v), want STUCK", sel.symbol, ok)
 	}
 
-	// Simulate resolveOptionGroup committing to that attempt (it still gets
-	// no quote — the strike stays illiquid).
 	s.optChain.mu.Lock()
 	s.optChain.lastAttempt[0] = time.Now()
 	s.optChain.mu.Unlock()
@@ -260,48 +305,46 @@ func TestPickRotationGroupLocked_UnquotedLegDoesNotStarveForever(t *testing.T) {
 		t.Fatal("test setup: STUCK's attempt must be after GOOD's quote for this to prove anything")
 	}
 
-	// Second pick: STUCK already had its attempt and is now "fresher" than
-	// GOOD's now-older quote, so GOOD — the one actually due for a refresh —
-	// must win. Before the fix, STUCK would still score zero and win again,
+	// Second pick: STUCK already had its attempt, so GOOD — the one actually
+	// due — must win. Before the fix STUCK would still score zero and win again,
 	// forever.
 	s.optChain.mu.Lock()
-	g, ok = s.pickRotationGroupLocked()
+	sel, ok = s.pickRotationSelectorLocked()
 	s.optChain.mu.Unlock()
-	if !ok || g.symbol != "GOOD" {
-		t.Fatalf("second pick = %v (ok=%v), want GOOD — STUCK must not win indefinitely after its own attempt", g.symbol, ok)
+	if !ok || sel.symbol != "GOOD" {
+		t.Fatalf("second pick = %v (ok=%v), want GOOD — STUCK must not win indefinitely after its own attempt", sel.symbol, ok)
 	}
 }
 
-// TestPickRotationGroupLocked_OverdueLiquidGroupWins pins down the 2026-08-03
+// TestPickRotationSelectorLocked_OverdueLiquidWins pins down the 2026-08-03
 // scoring inversion.
 //
-// The picker used to score a group by how fresh its option QUOTES were, which
-// made "this group has good data" count as "this group is up to date". Those
-// are different claims, and conflating them starved exactly the wrong groups:
-// a continuously-quoting underlying scored ~now on every tick and therefore
-// lost to any group serviced even fractionally earlier, forever. In production
-// that gave SPY, QQQ and IWM — the three most liquid underlyings, whose ATM
-// strike moves fastest and matters most — zero rotation picks in two hours,
-// while NVDA (the group least able to obtain a quote at all, 532 delta misses)
-// consumed 794 log lines re-estimating futilely.
+// The picker used to score by how fresh the option QUOTES were, which made
+// "this has good data" count as "this is up to date". Those are different
+// claims, and conflating them starved exactly the wrong entries: a
+// continuously-quoting underlying scored ~now on every tick and therefore lost
+// to anything serviced even fractionally earlier, forever. In production that
+// gave SPY, QQQ and IWM — the three most liquid underlyings, whose ATM strike
+// moves fastest and matters most — zero rotation picks in two hours, while NVDA
+// (the one least able to obtain a quote at all, 532 delta misses) consumed 794
+// log lines re-estimating futilely.
 //
-// Timestamps here are explicit rather than wall-clock. An earlier version of
-// this test drove real picks in a loop and passed against the buggy scorer,
-// because the whole loop completed inside one clock granule and every
-// comparison collapsed into a tie that the round-robin cursor then resolved
-// fairly. The bug is a ranking between two specific instants, so the test has
-// to state those instants.
-func TestPickRotationGroupLocked_OverdueLiquidGroupWins(t *testing.T) {
+// Timestamps here are explicit rather than wall-clock. An earlier version drove
+// real picks in a loop and passed against the buggy scorer, because the whole
+// loop completed inside one clock granule and every comparison collapsed into a
+// tie the round-robin cursor then resolved fairly. The bug is a ranking between
+// two specific instants, so the test has to state those instants.
+func TestPickRotationSelectorLocked_OverdueLiquidWins(t *testing.T) {
 	s := newRotationTestSession(nil)
 	s.book = quotes.NewBook()
 	now := time.Now()
 
-	s.optChain.rotation = []optResGroup{
-		{groupID: 0, symbol: "LIQUID"},
-		{groupID: 1, symbol: "THIN"},
+	s.optChain.rotation = []selector{
+		{id: 0, symbol: "LIQUID", right: "call"},
+		{id: 1, symbol: "THIN", right: "call"},
 	}
-	s.optChain.mktReqs[10] = &optMktReq{groupID: 0, symbol: "LIQUID", right: "call", strike: 100}
-	s.optChain.mktReqs[20] = &optMktReq{groupID: 1, symbol: "THIN", right: "call", strike: 50}
+	seedLeg(s, lk("LIQUID", "call", 100, ""), legOpts{reqID: 10, selectors: []int{0}})
+	seedLeg(s, lk("THIN", "call", 50, ""), legOpts{reqID: 20, selectors: []int{1}})
 
 	// LIQUID is badly overdue for a strike re-estimate; THIN was serviced a
 	// moment ago. On need alone LIQUID must win.
@@ -310,52 +353,49 @@ func TestPickRotationGroupLocked_OverdueLiquidGroupWins(t *testing.T) {
 
 	// ...but LIQUID is quoting continuously, which is what used to disqualify
 	// it: max(lastAttempt, bookTime) made its score ~now, later than THIN's
-	// one-second-old service time, so THIN won despite being ten times more
-	// recently serviced.
+	// one-second-old service time.
 	s.book.SetOptionBid(quotes.ContractKey{Symbol: "LIQUID", Right: "call", Strike: 100}, 1.25)
 
 	s.optChain.mu.Lock()
-	g, ok := s.pickRotationGroupLocked()
+	sel, ok := s.pickRotationSelectorLocked()
 	s.optChain.mu.Unlock()
 
 	if !ok {
-		t.Fatal("expected a group, got none")
+		t.Fatal("expected a selector, got none")
 	}
-	if g.symbol != "LIQUID" {
-		t.Fatalf("picked %s, want LIQUID — a group 10s overdue must not lose to one serviced 1s ago just because its quotes are fresh", g.symbol)
+	if sel.symbol != "LIQUID" {
+		t.Fatalf("picked %s, want LIQUID — something 10s overdue must not lose to one serviced 1s ago just because its quotes are fresh", sel.symbol)
 	}
 }
 
-// TestPickRotationGroupLocked_LeglessGroupDoesNotMonopolize covers the
-// opposite starvation the old quote-based scorer had: it skipped every right
-// with no active leg, so a group with NO legs never entered the comparison at
-// all and returned the zero time.Time — beating every real timestamp, every
-// tick, forever. That state is reachable in production, since
-// handleOptionMktError drops a leg on error 200 and returns without
-// resubscribing when no ATM retry record exists.
-func TestPickRotationGroupLocked_LeglessGroupDoesNotMonopolize(t *testing.T) {
+// TestPickRotationSelectorLocked_LeglessDoesNotMonopolize covers the opposite
+// starvation the old quote-based scorer had: it skipped every right with no
+// active leg, so an entry with NO legs never entered the comparison at all and
+// returned the zero time.Time — beating every real timestamp, every tick,
+// forever. That state is reachable in production, since handleOptionMktError
+// drops a leg on error 200 and can leave nothing behind.
+func TestPickRotationSelectorLocked_LeglessDoesNotMonopolize(t *testing.T) {
 	s := newRotationTestSession(nil)
 	now := time.Now()
 
-	s.optChain.rotation = []optResGroup{
-		{groupID: 0, symbol: "LEGLESS"},
-		{groupID: 1, symbol: "NORMAL"},
+	s.optChain.rotation = []selector{
+		{id: 0, symbol: "LEGLESS", right: "call"},
+		{id: 1, symbol: "NORMAL", right: "call"},
 	}
-	// LEGLESS has no mktReqs entry at all; NORMAL has one.
-	s.optChain.mktReqs[20] = &optMktReq{groupID: 1, symbol: "NORMAL", right: "call", strike: 50}
+	seedLeg(s, lk("NORMAL", "call", 50, ""), legOpts{reqID: 20, selectors: []int{1}})
 
 	// LEGLESS was serviced most recently, so NORMAL is the one due.
 	s.optChain.lastAttempt[0] = now.Add(-1 * time.Second)
 	s.optChain.lastAttempt[1] = now.Add(-10 * time.Second)
 
 	s.optChain.mu.Lock()
-	g, ok := s.pickRotationGroupLocked()
+	sel, ok := s.pickRotationSelectorLocked()
 	s.optChain.mu.Unlock()
 
 	if !ok {
-		t.Fatal("expected a group, got none")
+		t.Fatal("expected a selector, got none")
 	}
-	if g.symbol != "NORMAL" {
-		t.Fatalf("picked %s, want NORMAL — a group with zero legs must age like any other, not score as infinitely stale", g.symbol)
+	if sel.symbol != "NORMAL" {
+		t.Fatalf("picked %s, want NORMAL — an entry with zero legs must age like any other, not score as infinitely stale", sel.symbol)
 	}
 }

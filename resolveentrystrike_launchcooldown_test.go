@@ -3,8 +3,8 @@
 // behind a per-robot, per-symbol|direction cooldown, so a robot whose own
 // cooldown hadn't cleared never reached this function at all — not even the
 // free sharedResolvedEntry read or joining an in-flight sibling probe. These
-// tests pin down the fix: the cooldown now lives here, scoped to
-// groupID|right (shared across every caller), and only gates becoming the
+// tests pin down the fix: the cooldown now lives here, scoped to the
+// selector (shared across every caller), and only gates becoming the
 // OWNER of a fresh batch of ReqMktData candidate probes — never the free
 // reads/joins. See resolveentrystrike_concurrent_test.go for the sibling-
 // wait tests this complements.
@@ -18,7 +18,7 @@ import (
 )
 
 // TestResolveEntryStrike_LaunchCooldownBlocksRepeatedOwnerAttempt proves a
-// recent owner-probe launch for groupID|right blocks a new one, returning
+// recent owner-probe launch for a selector blocks a new one, returning
 // immediately rather than blocking or (with s.client nil in this harness)
 // panicking on a real ReqMktData call — i.e. no new probe was launched.
 func TestResolveEntryStrike_LaunchCooldownBlocksRepeatedOwnerAttempt(t *testing.T) {
@@ -26,7 +26,7 @@ func TestResolveEntryStrike_LaunchCooldownBlocksRepeatedOwnerAttempt(t *testing.
 	s := newResolveEntryTestSession(sub)
 
 	s.optChain.mu.Lock()
-	s.optChain.lastProbeLaunch[retryKeyLeg(1, "put")] = time.Now()
+	s.optChain.lastProbeLaunch[1] = time.Now()
 	s.optChain.mu.Unlock()
 
 	start := time.Now()
@@ -59,10 +59,10 @@ func TestResolveEntryStrike_LaunchCooldownDoesNotBlockSharedRead(t *testing.T) {
 	s.book.SetOptionAsk(key, 6.60)
 
 	s.optChain.mu.Lock()
-	s.optChain.resolvedEntry[retryKeyLeg(1, "put")] = resolvedEntryLeg{strike: 735, expiry: "20260731", delta: -0.65, at: time.Now()}
+	s.optChain.resolvedEntry[1] = resolvedEntryLeg{strike: 735, expiry: "20260731", delta: -0.65, at: time.Now()}
 	// A launch cooldown is simultaneously active for this exact key — proves
 	// it doesn't gate the shared-cache read, only becoming a fresh owner.
-	s.optChain.lastProbeLaunch[retryKeyLeg(1, "put")] = time.Now()
+	s.optChain.lastProbeLaunch[1] = time.Now()
 	s.optChain.mu.Unlock()
 
 	start := time.Now()
@@ -88,8 +88,8 @@ func TestResolveEntryStrike_LaunchCooldownDoesNotBlockJoiningInFlightSibling(t *
 	s := newResolveEntryTestSession(sub)
 
 	s.optChain.mu.Lock()
-	s.optChain.deltaRes[retryKeyLeg(1, "put")] = &deltaResolution{groupID: 1, symbol: "SPY", right: "put", targetDelta: 0.65}
-	s.optChain.lastProbeLaunch[retryKeyLeg(1, "put")] = time.Now()
+	s.optChain.deltaRes[1] = &deltaResolution{selectorID: 1, symbol: "SPY", right: "put", targetDelta: 0.65}
+	s.optChain.lastProbeLaunch[1] = time.Now()
 	s.optChain.mu.Unlock()
 
 	const simulatedProbeDelay = 100 * time.Millisecond
@@ -99,8 +99,8 @@ func TestResolveEntryStrike_LaunchCooldownDoesNotBlockJoiningInFlightSibling(t *
 		s.book.SetOptionBid(key, 6.50)
 		s.book.SetOptionAsk(key, 6.60)
 		s.optChain.mu.Lock()
-		delete(s.optChain.deltaRes, retryKeyLeg(1, "put"))
-		s.optChain.resolvedEntry[retryKeyLeg(1, "put")] = resolvedEntryLeg{strike: 735, expiry: "20260731", delta: -0.65, at: time.Now()}
+		delete(s.optChain.deltaRes, 1)
+		s.optChain.resolvedEntry[1] = resolvedEntryLeg{strike: 735, expiry: "20260731", delta: -0.65, at: time.Now()}
 		s.optChain.mu.Unlock()
 	}()
 

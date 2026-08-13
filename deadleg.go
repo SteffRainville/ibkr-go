@@ -2,9 +2,8 @@ package ibkr
 
 import (
 	"fmt"
+	"sort"
 	"time"
-
-	"github.com/SteffRainville/ibkr-go/mdlines"
 )
 
 // Detection of option market-data legs that IB has silently stopped serving.
@@ -167,17 +166,16 @@ func resubCooldown(attempts int) time.Duration {
 
 // deadLegAction is one repair the reaper decided to perform.
 type deadLegAction struct {
-	reqID   int64
-	groupID int
-	busIdxs []int
-	symbol  string
-	right   string
-	strike  float64
-	expiry  string
-	health  legHealth
-	age     string
-	pinned  bool
+	reqID  int64
+	key    legKey
+	health legHealth
+	age    string
+	pinned bool
 }
+
+func (a deadLegAction) symbol() string  { return a.key.symbol }
+func (a deadLegAction) right() string   { return a.key.right }
+func (a deadLegAction) strike() float64 { return a.key.strike }
 
 // reapDeadOptionLegs finds option legs IB has silently stopped serving and
 // repairs them. It runs on the rotation ticker but is deliberately NOT part
@@ -200,21 +198,44 @@ func (s *Session) reapDeadOptionLegs() {
 	s.optChain.mu.Unlock()
 
 	for _, a := range silent {
-		s.optionLog.Printf("Option: WARNING %s %s strike=%.2f (group=%d, reqID=%d) has NEVER ticked (health=%s) — leaving it for the rotation to re-estimate onto another strike",
-			a.symbol, a.right, a.strike, a.groupID, a.reqID, a.health)
+		s.optionLog.Printf("Option: WARNING %s %s strike=%.2f (reqID=%d) has NEVER ticked (health=%s) — leaving it for the rotation to re-estimate onto another strike",
+			a.symbol(), a.right(), a.strike(), a.reqID, a.health)
 	}
 
 	for _, a := range actions {
 		if a.pinned {
-			s.recoverPinnedLeg(a, now)
-			continue
+			// Alert first and independently of the repair: a pinned leg is what
+			// stop-loss and trailing-stop price against, so a frozen one does
+			// not merely look wrong — it silently disarms the exit logic.
+			s.alertFrozenPositionQuote(a)
 		}
-		s.optionLog.Printf("Option: WARNING %s %s strike=%.2f (group=%d, reqID=%d) went SILENT (last tick %s ago) while the option feed is live — forcing re-subscribe of the same strike",
-			a.symbol, a.right, a.strike, a.groupID, a.reqID, a.age)
-		s.subscribeOptionLeg(a.groupID, a.busIdxs, a.symbol, a.right, a.strike, a.expiry, false, true)
+		s.optionLog.Printf("Option: WARNING %s %s strike=%.2f (reqID=%d, pinned=%v) went SILENT (last tick %s ago) while the option feed is live — forcing re-subscribe of the same contract",
+			a.symbol(), a.right(), a.strike(), a.reqID, a.pinned, a.age)
+		s.forceResubscribeLeg(a.key, "")
 	}
 
 	s.sweepStuckPendingLegs(now)
+}
+
+// alertFrozenPositionQuote raises the operator-facing alarm for a
+// position-pinned leg that has stopped ticking.
+//
+// This is the highest-stakes case on the page. A pinned leg is what stop-loss
+// and trailing-stop evaluation price against, so a frozen one either never
+// trips or trips against a stale extreme. The alert fires whether or not the
+// repair succeeds, because a human being told "the stop-loss quote for this
+// position is frozen" is worth more than any automatic action: it reaches the
+// console banner, the dashboard banner and ntfy through the existing outage
+// plumbing.
+func (s *Session) alertFrozenPositionQuote(a deadLegAction) {
+	if s.opts.OnError == nil {
+		return
+	}
+	s.opts.OnError(ErrorEvent{
+		Type: "subscription",
+		Message: fmt.Sprintf("Stop-loss quote frozen: %s %s %.0f has not ticked in %s — re-subscribing.",
+			a.symbol(), a.right(), a.strike(), a.age),
+	})
 }
 
 // planDeadLegRepairsLocked decides which legs need repair without performing
@@ -227,46 +248,70 @@ func (s *Session) reapDeadOptionLegs() {
 func (s *Session) planDeadLegRepairsLocked(now time.Time) (repair, silent []deadLegAction) {
 	lastAny := s.optChain.lastAnyOptionTick
 
-	consider := func(a deadLegAction, subscribedAt, lastTickAt time.Time, key string) {
-		health := legHealthAt(subscribedAt, lastTickAt, lastAny, now)
-		if health != legStale && health != legSilent {
-			return
+	for key, leg := range s.optChain.legs {
+		if s.legIsOnlyWarmingLocked(key) {
+			continue // handled by the promote-or-abandon sweep instead
 		}
-		a.health = health
-		a.age = legAgeString(lastTickAt, now)
+		health := legHealthAt(leg.subscribedAt, leg.lastTickAt, lastAny, now)
+		if health != legStale && health != legSilent {
+			continue
+		}
+		a := deadLegAction{reqID: leg.reqID, key: key, health: health,
+			age: legAgeString(leg.lastTickAt, now), pinned: leg.pins > 0}
 		if health == legSilent {
 			silent = append(silent, a)
-			return
+			continue
 		}
 		st := s.optChain.forcedResub[key]
 		if !st.last.IsZero() && now.Sub(st.last) < resubCooldown(st.attempts) {
-			return
+			continue
 		}
 		if len(repair) >= maxForcedResubsPerTick {
-			return
+			continue
 		}
 		st.last, st.attempts = now, st.attempts+1
 		s.optChain.forcedResub[key] = st
 		repair = append(repair, a)
 	}
-
-	for reqID, req := range s.optChain.mktReqs {
-		if req.pending {
-			continue // handled by the promote-or-abandon sweep instead
-		}
-		consider(deadLegAction{
-			reqID: reqID, groupID: req.groupID, busIdxs: req.busIdxs,
-			symbol: req.symbol, right: req.right, strike: req.strike, expiry: req.expiry,
-		}, req.subscribedAt, req.lastTickAt, retryKeyLeg(req.groupID, req.right))
-	}
-	for reqID, sub := range s.optChain.posSubs {
-		consider(deadLegAction{
-			reqID: reqID, groupID: -1,
-			symbol: sub.symbol, right: sub.right, strike: sub.strike, expiry: sub.expiry,
-			pinned: true,
-		}, sub.subscribedAt, sub.lastTickAt, posSubKey(sub.symbol, sub.right, sub.strike))
-	}
+	// Map iteration is random and maxForcedResubsPerTick truncates, so without
+	// this a repeated scan of the same standing set of dead legs would repair a
+	// different arbitrary two each tick. Sorting makes the cap deterministic
+	// and the tests reproducible.
+	sortDeadLegActions(repair)
+	sortDeadLegActions(silent)
 	return repair, silent
+}
+
+// sortDeadLegActions orders by contract so a truncated repair list is stable.
+func sortDeadLegActions(as []deadLegAction) {
+	sort.Slice(as, func(i, j int) bool {
+		if as[i].key.symbol != as[j].key.symbol {
+			return as[i].key.symbol < as[j].key.symbol
+		}
+		if as[i].key.right != as[j].key.right {
+			return as[i].key.right < as[j].key.right
+		}
+		if as[i].key.strike != as[j].key.strike {
+			return as[i].key.strike < as[j].key.strike
+		}
+		return as[i].key.expiry < as[j].key.expiry
+	})
+}
+
+// legIsOnlyWarmingLocked reports whether every selector holding this contract
+// is still warming into it and no position pins it — the state the
+// promote-or-abandon sweep owns. Caller holds s.optChain.mu.
+func (s *Session) legIsOnlyWarmingLocked(key legKey) bool {
+	leg, ok := s.optChain.legs[key]
+	if !ok || leg.pins > 0 || len(leg.selectors) == 0 {
+		return false
+	}
+	for selID := range leg.selectors {
+		if s.optChain.selCurrent[selID] == key {
+			return false
+		}
+	}
+	return true
 }
 
 // sweepStuckPendingLegs promotes or abandons replacement legs stuck pending.
@@ -281,110 +326,46 @@ func (s *Session) sweepStuckPendingLegs(now time.Time) {
 	s.optChain.mu.Lock()
 	lastAny := s.optChain.lastAnyOptionTick
 	type stuck struct {
-		reqID  int64
-		symbol string
-		right  string
-		strike float64
-		age    string
+		reqID int64
+		key   legKey
+		age   string
 	}
 	var abandoned []stuck
-	for reqID, req := range s.optChain.mktReqs {
-		if !req.pending || req.pendingSince.IsZero() {
-			continue
-		}
-		if now.Sub(req.pendingSince) <= pendingPromoteGrace {
+	var cancel []int64
+	for selID, sw := range s.optChain.selPending {
+		if sw.since.IsZero() || now.Sub(sw.since) <= pendingPromoteGrace {
 			continue
 		}
 		// Try the normal promotion first — it succeeds if any usable price
 		// arrived while nothing called it.
-		if s.promoteIfReadyLocked(req, reqID) {
+		if id, promoted := s.promotePendingLocked(selID, now); promoted {
+			if id != 0 {
+				cancel = append(cancel, id)
+			}
 			continue
 		}
-		switch legHealthAt(req.subscribedAt, req.lastTickAt, lastAny, now) {
+		leg, ok := s.optChain.legs[sw.to]
+		if !ok {
+			delete(s.optChain.selPending, selID)
+			continue
+		}
+		switch legHealthAt(leg.subscribedAt, leg.lastTickAt, lastAny, now) {
 		case legStale, legSilent:
 			// fall through to abandon
 		default:
 			continue
 		}
-		abandoned = append(abandoned, stuck{reqID, req.symbol, req.right, req.strike, legAgeString(req.lastTickAt, now)})
-		s.dropLegLocked(reqID)
+		delete(s.optChain.selPending, selID)
+		if id := s.detachSelectorLocked(sw.to, selID); id != 0 {
+			abandoned = append(abandoned, stuck{id, sw.to, legAgeString(leg.lastTickAt, now)})
+			cancel = append(cancel, id)
+		}
 	}
 	s.optChain.mu.Unlock()
 
+	s.cancelLines(cancel)
 	for _, a := range abandoned {
 		s.optionLog.Printf("Option: WARNING abandoning stuck pending leg %s %s strike=%.2f (reqID=%d) — never produced a usable quote (last tick %s ago)",
-			a.symbol, a.right, a.strike, a.reqID, a.age)
+			a.key.symbol, a.key.right, a.key.strike, a.reqID, a.age)
 	}
-}
-
-// posSubKey is the posSubs lookup key. Note it carries no expiry, which is
-// what lets a pinned leg be re-subscribed under a new reqID without the key
-// changing.
-func posSubKey(symbol, right string, strike float64) string {
-	return fmt.Sprintf("%s|%s|%.0f", symbol, right, strike)
-}
-
-// recoverPinnedLeg alerts on, then re-subscribes, a position-pinned option
-// leg that has gone silent.
-//
-// This is the highest-stakes case on the page. A pinned leg is what stop-loss
-// and trailing-stop evaluation price against, so a frozen one does not merely
-// look wrong — it silently disarms the exit logic, which then either never
-// trips or trips against a stale extreme. The alert fires first and
-// independently of the repair succeeding, because a human being told "the
-// stop-loss quote for this position is frozen" is worth more than any
-// automatic action: it reaches the console banner, the dashboard banner and
-// ntfy through the existing outage plumbing.
-//
-// The re-subscribe allocates a NEW reqID rather than reusing the dead one
-// (IB may still consider the old id live) and grants CategoryPosition, which
-// is guaranteed and never refused — a held position must never lose its feed
-// to line pressure. posSubKeys is re-pointed at the new id; its key format
-// carries no expiry, so it survives the swap unchanged.
-func (s *Session) recoverPinnedLeg(a deadLegAction, now time.Time) {
-	if s.opts.OnError != nil {
-		s.opts.OnError(ErrorEvent{
-			Type: "subscription",
-			Message: fmt.Sprintf("Stop-loss quote frozen: %s %s %.0f has not ticked in %s — re-subscribing.",
-				a.symbol, a.right, a.strike, a.age),
-		})
-	}
-	s.optionLog.Printf("Option: WARNING POSITION-PINNED %s %s strike=%.2f (reqID=%d) went SILENT (last tick %s ago) — stop-loss was pricing against a frozen quote; re-subscribing",
-		a.symbol, a.right, a.strike, a.reqID, a.age)
-
-	key := posSubKey(a.symbol, a.right, a.strike)
-
-	s.optChain.mu.Lock()
-	old, ok := s.optChain.posSubs[a.reqID]
-	if !ok || s.optChain.posSubKeys[key] != a.reqID {
-		s.optChain.mu.Unlock()
-		return // unsubscribed or already recovered since the scan
-	}
-	newReqID := s.optChain.nextPosID
-	s.optChain.nextPosID++
-	// Carry the last known values forward so the row does not blank while the
-	// replacement warms up, but reset the liveness clocks so the new leg is
-	// judged on its own behaviour.
-	s.optChain.posSubs[newReqID] = &posStrikeSub{
-		symbol: old.symbol, right: old.right, strike: old.strike, expiry: old.expiry,
-		reqID: newReqID, price: old.price, bid: old.bid, ask: old.ask,
-		delta: old.delta, deltaSource: old.deltaSource, subscribedAt: now,
-		refCount: old.refCount,
-	}
-	s.optChain.posSubKeys[key] = newReqID
-	delete(s.optChain.posSubs, a.reqID)
-	s.optChain.mu.Unlock()
-
-	s.mdLines.GrantGuaranteed(newReqID, mdlines.CategoryPosition)
-
-	ibRight := "C"
-	if a.right == "put" {
-		ibRight = "P"
-	}
-	s.client.ReqMktData(newReqID, makeOptionContract(a.symbol, ibRight, a.strike, a.expiry), "", false, false, nil)
-
-	s.mdLines.Release(a.reqID)
-	s.client.CancelMktData(a.reqID)
-	s.optionLog.Printf("Option: POSITION-PINNED %s %s strike=%.2f re-subscribed (reqID %d → %d)",
-		a.symbol, a.right, a.strike, a.reqID, newReqID)
 }

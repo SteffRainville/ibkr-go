@@ -104,9 +104,7 @@ func TestEnsureOptionHeldForClose_BlocksDriftedATMFallback(t *testing.T) {
 // structurally impossible once the identity is carried on the order.
 func TestResolveCloseContract_UsesCarriedIdentityNotATM(t *testing.T) {
 	s := newTestSession()
-	s.optChain.mktReqs = map[int64]*optMktReq{
-		1: {symbol: "QQQ", right: "call", strike: 709, expiry: "20260710"},
-	}
+	seedDisplayedLeg(s, "QQQ", "call", 709, "20260710", 0, 0)
 
 	o := OrderRequest{Symbol: "QQQ", Tag: "call", SecType: "OPT", Qty: 600, Strike: 708, OptionExpiry: "20260710", Bid: 6.10, Ask: 6.20}
 
@@ -130,9 +128,7 @@ func TestResolveCloseContract_UsesCarriedIdentityNotATM(t *testing.T) {
 // resolves the current ATM leg.
 func TestResolveCloseContract_FallsBackToATMWhenIdentityAbsent(t *testing.T) {
 	s := newTestSession()
-	s.optChain.mktReqs = map[int64]*optMktReq{
-		1: {symbol: "QQQ", right: "call", strike: 709, expiry: "20260710", bid: 5.9, ask: 6.0},
-	}
+	seedDisplayedLeg(s, "QQQ", "call", 709, "20260710", 5.9, 6.0)
 
 	o := OrderRequest{Symbol: "QQQ", Tag: "call", Qty: 600} // no strike/expiry
 
@@ -191,9 +187,7 @@ func TestClosePosition_RefusesNakedShort_IdentityNotAtIB(t *testing.T) {
 func TestClosePosition_RefusesNakedShort_DriftedATMFallback(t *testing.T) {
 	s := newTestSession()
 	seedHeldOption(s, "QQQ", "C", 708, "20260710", 6)
-	s.optChain.mktReqs = map[int64]*optMktReq{
-		1: {symbol: "QQQ", right: "call", strike: 709, expiry: "20260710"},
-	}
+	seedDisplayedLeg(s, "QQQ", "call", 709, "20260710", 0, 0)
 	sub := newTestSubscriber()
 
 	o := OrderRequest{Symbol: "QQQ", Tag: "call", Qty: 600} // untracked -> ATM fallback

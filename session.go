@@ -338,19 +338,20 @@ func NewSession(opts Options, book *quotes.Book, cs *candlestore.Store) *Session
 			nextPosID:        reqIDPosMktBase,
 			conIDReqs:        make(map[int64]*optConIDReq),
 			chainReqs:        make(map[int64]*optChainReq),
-			mktReqs:          make(map[int64]*optMktReq),
-			posSubs:          make(map[int64]*posStrikeSub),
-			posSubKeys:       make(map[string]int64),
-			retries:          make(map[string]*optStrikeRetry),
+			legs:             make(map[legKey]*optLeg),
+			legByReqID:       make(map[int64]legKey),
+			selCurrent:       make(map[int]legKey),
+			selPending:       make(map[int]pendingSwap),
+			retries:          make(map[int]*optStrikeRetry),
 			deltaCands:       make(map[int64]*deltaCandidate),
-			deltaRes:         make(map[string]*deltaResolution),
+			deltaRes:         make(map[int]*deltaResolution),
 			lastIV:           make(map[string]float64),
-			lastChainInfo:    make(map[string]chainSnapshot),
-			resolvedEntry:    make(map[string]resolvedEntryLeg),
-			lastEntryFailure: make(map[string]EntryStrikeResult),
-			lastProbeLaunch:  make(map[string]time.Time),
+			lastChainInfo:    make(map[chainKey]chainSnapshot),
+			resolvedEntry:    make(map[int]resolvedEntryLeg),
+			lastEntryFailure: make(map[int]EntryStrikeResult),
+			lastProbeLaunch:  make(map[int]time.Time),
 			lastAttempt:      make(map[int]time.Time),
-			forcedResub:      make(map[string]resubState),
+			forcedResub:      make(map[legKey]resubState),
 		},
 		onDemand: onDemandTracker{
 			nextID:    reqIDOnDemandHistBase,
@@ -671,32 +672,31 @@ func (s *Session) resolveReqID(reqID int64) string {
 		return sym + " (order)"
 	}
 	s.optChain.mu.Lock()
-	if req, ok := s.optChain.mktReqs[reqID]; ok {
-		r := fmt.Sprintf("%s %s strike=%.2f expiry=%s (opt-mkt)", req.symbol, req.right, req.strike, req.expiry)
+	if leg, ok := s.legByReqIDLocked(reqID); ok {
+		kind := "opt-mkt"
+		if leg.pins > 0 {
+			kind = "opt-pinned"
+		}
+		r := fmt.Sprintf("%s %s strike=%.2f expiry=%s (%s)", leg.symbol, leg.right, leg.strike, leg.expiry, kind)
 		s.optChain.mu.Unlock()
 		return r
 	}
 	if req, ok := s.optChain.chainReqs[reqID]; ok {
-		r := req.symbol + " (opt-chain)"
+		r := req.chain.symbol + " (opt-chain)"
 		s.optChain.mu.Unlock()
 		return r
 	}
 	if req, ok := s.optChain.conIDReqs[reqID]; ok {
-		r := req.symbol + " (opt-conid)"
+		r := req.chain.symbol + " (opt-conid)"
 		s.optChain.mu.Unlock()
 		return r
 	}
-	// Entry delta probes and position-pinned legs were missing here, so every
-	// IB error against one — including the not-subscribed family, the errors
-	// most worth reading — logged "symbol=unknown" and could not be tied back
-	// to the contract that provoked it.
+	// Entry delta probes were missing here, so every IB error against one —
+	// including the not-subscribed family, the errors most worth reading —
+	// logged "symbol=unknown" and could not be tied back to the contract that
+	// provoked it.
 	if cand, ok := s.optChain.deltaCands[reqID]; ok {
 		r := fmt.Sprintf("%s %s strike=%.2f expiry=%s (opt-probe)", cand.symbol, cand.right, cand.strike, cand.expiry)
-		s.optChain.mu.Unlock()
-		return r
-	}
-	if sub, ok := s.optChain.posSubs[reqID]; ok {
-		r := fmt.Sprintf("%s %s strike=%.2f (opt-pinned)", sub.symbol, sub.right, sub.strike)
 		s.optChain.mu.Unlock()
 		return r
 	}

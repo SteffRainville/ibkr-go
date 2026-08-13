@@ -54,9 +54,11 @@ type PositionLegHealth struct {
 	Expiry string // "YYYYMMDD"
 	ReqID  int64
 
-	// RefCount is how many independent holders share this subscription. Two
-	// robots holding the same contract share one IB feed; the feed is torn
-	// down only when the last of them releases it (see posStrikeSub.refCount).
+	// RefCount is how many open POSITIONS share this subscription. Two robots
+	// holding the same contract share one IB feed; the feed is torn down only
+	// when the last holder releases it (see optLeg.pins/selectors). A
+	// watchlist row's selector can hold the same leg without appearing here —
+	// it keeps the feed alive but is not a position.
 	RefCount int
 
 	SubscribedAt time.Time
@@ -112,17 +114,20 @@ func (s *Session) PositionLegs() PositionLegSnapshot {
 func (s *Session) positionLegsAt(now time.Time) PositionLegSnapshot {
 	s.optChain.mu.Lock()
 	lastAny := s.optChain.lastAnyOptionTick
-	legs := make([]PositionLegHealth, 0, len(s.optChain.posSubs))
-	for reqID, sub := range s.optChain.posSubs {
+	legs := make([]PositionLegHealth, 0, len(s.optChain.legs))
+	for key, leg := range s.optChain.legs {
+		if leg.pins == 0 {
+			continue // a watchlist row's leg, not a held position's
+		}
 		silentFor := time.Duration(-1)
-		if !sub.lastTickAt.IsZero() {
-			silentFor = now.Sub(sub.lastTickAt)
+		if !leg.lastTickAt.IsZero() {
+			silentFor = now.Sub(leg.lastTickAt)
 		}
 		legs = append(legs, PositionLegHealth{
-			Symbol: sub.symbol, Right: sub.right, Strike: sub.strike, Expiry: sub.expiry,
-			ReqID: reqID, RefCount: sub.refCount,
-			SubscribedAt: sub.subscribedAt, LastTickAt: sub.lastTickAt,
-			Health:    LegHealthState(legHealthAt(sub.subscribedAt, sub.lastTickAt, lastAny, now).String()),
+			Symbol: key.symbol, Right: key.right, Strike: key.strike, Expiry: key.expiry,
+			ReqID: leg.reqID, RefCount: leg.pins,
+			SubscribedAt: leg.subscribedAt, LastTickAt: leg.lastTickAt,
+			Health:    LegHealthState(legHealthAt(leg.subscribedAt, leg.lastTickAt, lastAny, now).String()),
 			SilentFor: silentFor,
 		})
 	}

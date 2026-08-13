@@ -108,20 +108,20 @@ func TestShouldSkipReEstimate_StaleLegIsNotTrusted(t *testing.T) {
 	now := rthNoon()
 	const targetDelta = 0.60
 
-	newSessionWithLeg := func(lastTickAt time.Time) *Session {
+	newSessionWithLeg := func(lastTickAt time.Time, td float64) (*Session, selector) {
 		s := newRotationTestSession(nil)
-		s.optChain.mktReqs[1] = &optMktReq{
-			groupID: 19, symbol: "QQQ", right: "put", strike: 693, expiry: "20260805",
-			delta: -0.5672, deltaSource: "matched",
+		sel := seedSelector(s, selector{id: 19, symbol: "QQQ", right: "put", targetDelta: td, busIdxs: []int{0}})
+		seedLeg(s, lk("QQQ", "put", 693, "20260805"), legOpts{
+			reqID: 1, selectors: []int{sel.id}, delta: -0.5672, deltaSource: "matched",
 			subscribedAt: now.Add(-3 * time.Hour), lastTickAt: lastTickAt,
-		}
+		})
 		s.optChain.lastAnyOptionTick = now.Add(-time.Second) // feed demonstrably alive
-		return s
+		return s, sel
 	}
 
 	t.Run("stale leg must not be trusted", func(t *testing.T) {
-		s := newSessionWithLeg(now.Add(-2 * time.Hour))
-		skip, reason := s.shouldSkipReEstimateLocked("QQQ", "put", targetDelta, now)
+		s, sel := newSessionWithLeg(now.Add(-2*time.Hour), targetDelta)
+		skip, reason := s.shouldSkipReEstimateLocked(sel, now)
 		if skip {
 			t.Fatalf("skip = true for a leg that has not ticked in 2h — the frozen delta must not justify skipping (reason: %s)", reason)
 		}
@@ -131,28 +131,28 @@ func TestShouldSkipReEstimate_StaleLegIsNotTrusted(t *testing.T) {
 	})
 
 	t.Run("healthy leg still skips", func(t *testing.T) {
-		s := newSessionWithLeg(now.Add(-2 * time.Second))
-		skip, _ := s.shouldSkipReEstimateLocked("QQQ", "put", targetDelta, now)
+		s, sel := newSessionWithLeg(now.Add(-2*time.Second), targetDelta)
+		skip, _ := s.shouldSkipReEstimateLocked(sel, now)
 		if !skip {
 			t.Fatal("skip = false for a live leg inside tolerance — this would churn a perfectly good strike every tick")
 		}
 	})
 
 	t.Run("drifted delta re-estimates regardless of freshness", func(t *testing.T) {
-		s := newSessionWithLeg(now.Add(-2 * time.Second))
-		skip, _ := s.shouldSkipReEstimateLocked("QQQ", "put", 0.30, now)
+		s, sel := newSessionWithLeg(now.Add(-2*time.Second), 0.30)
+		skip, _ := s.shouldSkipReEstimateLocked(sel, now)
 		if skip {
 			t.Fatal("skip = true for a delta far outside tolerance")
 		}
 	})
 }
 
-// staleLeg builds an mktReqs entry that has been silent for 2h.
-func staleLeg(now time.Time, groupID int, symbol, right string, strike float64) *optMktReq {
-	return &optMktReq{
-		groupID: groupID, symbol: symbol, right: right, strike: strike, expiry: "20260805",
+// seedStaleLeg installs a leg that has been silent for 2h.
+func seedStaleLeg(s *Session, now time.Time, reqID int64, selectorID int, symbol, right string, strike float64) {
+	seedLeg(s, lk(symbol, right, strike, "20260805"), legOpts{
+		reqID: reqID, selectors: []int{selectorID},
 		subscribedAt: now.Add(-3 * time.Hour), lastTickAt: now.Add(-2 * time.Hour),
-	}
+	})
 }
 
 // TestPlanDeadLegRepairs_QuietFeedActsOnNothing is the anti-storm guard. If
@@ -163,7 +163,7 @@ func TestPlanDeadLegRepairs_QuietFeedActsOnNothing(t *testing.T) {
 	now := rthNoon()
 	s := newRotationTestSession(nil)
 	for i := range 10 {
-		s.optChain.mktReqs[int64(i)] = staleLeg(now, i, "SYM", "call", 100)
+		seedStaleLeg(s, now, int64(i), i, "SYM", "call", float64(100+i))
 	}
 	s.optChain.lastAnyOptionTick = now.Add(-2 * time.Hour) // whole feed quiet
 
@@ -179,7 +179,7 @@ func TestPlanDeadLegRepairs_CapsPerTick(t *testing.T) {
 	now := rthNoon()
 	s := newRotationTestSession(nil)
 	for i := range 10 {
-		s.optChain.mktReqs[int64(i)] = staleLeg(now, i, "SYM", "call", 100)
+		seedStaleLeg(s, now, int64(i), i, "SYM", "call", float64(100+i))
 	}
 	s.optChain.lastAnyOptionTick = now.Add(-time.Second)
 
@@ -194,7 +194,7 @@ func TestPlanDeadLegRepairs_CapsPerTick(t *testing.T) {
 func TestPlanDeadLegRepairs_CooldownPreventsStorm(t *testing.T) {
 	now := rthNoon()
 	s := newRotationTestSession(nil)
-	s.optChain.mktReqs[1] = staleLeg(now, 19, "QQQ", "put", 693)
+	seedStaleLeg(s, now, 1, 19, "QQQ", "put", 693)
 	s.optChain.lastAnyOptionTick = now.Add(-time.Second)
 
 	if repair, _ := s.planDeadLegRepairsLocked(now); len(repair) != 1 {
@@ -222,10 +222,10 @@ func TestPlanDeadLegRepairs_CooldownPreventsStorm(t *testing.T) {
 func TestPlanDeadLegRepairs_NeverTickedIsNotForceResubscribed(t *testing.T) {
 	now := rthNoon()
 	s := newRotationTestSession(nil)
-	s.optChain.mktReqs[1] = &optMktReq{
-		groupID: 7, symbol: "THIN", right: "call", strike: 50, expiry: "20260805",
+	seedLeg(s, lk("THIN", "call", 50, "20260805"), legOpts{
+		reqID: 1, selectors: []int{7},
 		subscribedAt: now.Add(-5 * time.Minute), // past warmup, never ticked
-	}
+	})
 	s.optChain.lastAnyOptionTick = now.Add(-time.Second)
 
 	repair, silent := s.planDeadLegRepairsLocked(now)
@@ -243,11 +243,10 @@ func TestPlanDeadLegRepairs_NeverTickedIsNotForceResubscribed(t *testing.T) {
 func TestPlanDeadLegRepairs_PinnedLegIsFlagged(t *testing.T) {
 	now := rthNoon()
 	s := newRotationTestSession(nil)
-	s.optChain.posSubs[900] = &posStrikeSub{
-		symbol: "QQQ", right: "put", strike: 693, expiry: "20260805", reqID: 900,
+	seedLeg(s, lk("QQQ", "put", 693, "20260805"), legOpts{
+		reqID: 900, pins: 1,
 		subscribedAt: now.Add(-3 * time.Hour), lastTickAt: now.Add(-2 * time.Hour),
-	}
-	s.optChain.posSubKeys[posSubKey("QQQ", "put", 693)] = 900
+	})
 	s.optChain.lastAnyOptionTick = now.Add(-time.Second)
 
 	repair, _ := s.planDeadLegRepairsLocked(now)
@@ -267,15 +266,13 @@ func TestPlanDeadLegRepairs_PinnedLegIsFlagged(t *testing.T) {
 // symptom to look for.
 func TestTickSizeStampsLegLiveness(t *testing.T) {
 	s := newRotationTestSession(nil)
-	s.optChain.mktReqs[1] = &optMktReq{
-		groupID: 5, symbol: "QQQ", right: "call", strike: 480, expiry: "20260805",
-		subscribedAt: time.Now().Add(-time.Hour),
-	}
+	key := lk("QQQ", "call", 480, "20260805")
+	seedLeg(s, key, legOpts{reqID: 1, selectors: []int{5}, subscribedAt: time.Now().Add(-time.Hour)})
 
 	s.TickSize(1, 0, ibapi.StringToDecimal("100"))
 
 	s.optChain.mu.Lock()
-	if s.optChain.mktReqs[1].lastTickAt.IsZero() {
+	if s.optChain.legs[key].lastTickAt.IsZero() {
 		t.Fatal("lastTickAt still zero after a size tick — a liquid option with a flat quote would be judged dead")
 	}
 	if s.optChain.lastAnyOptionTick.IsZero() {

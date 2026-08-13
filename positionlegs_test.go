@@ -72,10 +72,10 @@ func TestPositionLegsAt_ClassifiesEveryState(t *testing.T) {
 				lastTick = tc.base.Add(tc.lastTickAt)
 			}
 			s.optChain.lastAnyOptionTick = tc.base.Add(tc.lastAnyTick)
-			s.optChain.posSubs[10011] = &posStrikeSub{
-				symbol: "IWM", right: "put", strike: 298, expiry: "20260806", reqID: 10011, refCount: 1,
+			seedLeg(s, lk("IWM", "put", 298, "20260806"), legOpts{
+				reqID: 10011, pins: 1,
 				subscribedAt: tc.base.Add(tc.subscribedAt), lastTickAt: lastTick,
-			}
+			})
 
 			snap := s.positionLegsAt(tc.base)
 			if len(snap.Legs) != 1 {
@@ -97,10 +97,10 @@ func TestPositionLegsAt_CarriesContractIdentityAndRefCount(t *testing.T) {
 	base := rthBase()
 	s := newRotationTestSession(nil)
 	s.optChain.lastAnyOptionTick = base.Add(-time.Second)
-	s.optChain.posSubs[10011] = &posStrikeSub{
-		symbol: "IWM", right: "put", strike: 298, expiry: "20260806", reqID: 10011, refCount: 2,
+	seedLeg(s, lk("IWM", "put", 298, "20260806"), legOpts{
+		reqID: 10011, pins: 2,
 		subscribedAt: base.Add(-30 * time.Minute), lastTickAt: base.Add(-10 * time.Second),
-	}
+	})
 
 	snap := s.positionLegsAt(base)
 	leg, ok := snap.Leg("IWM", "put", 298)
@@ -134,10 +134,10 @@ func TestPositionLegsAt_NeverTickedReportsSilentForNegative(t *testing.T) {
 	base := rthBase()
 	s := newRotationTestSession(nil)
 	s.optChain.lastAnyOptionTick = base.Add(-time.Second)
-	s.optChain.posSubs[10011] = &posStrikeSub{
-		symbol: "QQQ", right: "call", strike: 711, expiry: "20260806", reqID: 10011, refCount: 1,
+	seedLeg(s, lk("QQQ", "call", 711, "20260806"), legOpts{
+		reqID: 10011, pins: 1,
 		subscribedAt: base.Add(-10 * time.Minute),
-	}
+	})
 
 	snap := s.positionLegsAt(base)
 	if got := snap.Legs[0].SilentFor; got != -1 {
@@ -152,10 +152,10 @@ func TestPositionLegsAt_FeedAliveFalseWhenWholeFeedQuiet(t *testing.T) {
 	base := rthBase()
 	s := newRotationTestSession(nil)
 	s.optChain.lastAnyOptionTick = base.Add(-30 * time.Minute)
-	s.optChain.posSubs[10011] = &posStrikeSub{
-		symbol: "SPY", right: "put", strike: 770, expiry: "20260806", reqID: 10011, refCount: 1,
+	seedLeg(s, lk("SPY", "put", 770, "20260806"), legOpts{
+		reqID: 10011, pins: 1,
 		subscribedAt: base.Add(-40 * time.Minute), lastTickAt: base.Add(-30 * time.Minute),
-	}
+	})
 
 	snap := s.positionLegsAt(base)
 	if snap.FeedAlive {
@@ -179,11 +179,10 @@ func TestPositionLegsAt_SortedForStableReading(t *testing.T) {
 		{"SPY", "put", 770}, {"IWM", "call", 302}, {"IWM", "put", 298}, {"IWM", "put", 297},
 	} {
 		reqID := int64(10000 + i)
-		s.optChain.posSubs[reqID] = &posStrikeSub{
-			symbol: spec.sym, right: spec.right, strike: spec.strike, expiry: "20260806",
-			reqID: reqID, refCount: 1,
+		seedLeg(s, lk(spec.sym, spec.right, spec.strike, "20260806"), legOpts{
+			reqID: reqID, pins: 1,
 			subscribedAt: base.Add(-30 * time.Minute), lastTickAt: base.Add(-time.Second),
-		}
+		})
 	}
 
 	snap := s.positionLegsAt(base)

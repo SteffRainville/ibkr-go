@@ -1,10 +1,10 @@
 // Tests for ResolveEntryStrike's handling of a concurrent sibling call
-// resolving the exact same (groupID, right) — the 2026-07-27 SPY put
+// resolving the exact same selector — the 2026-07-27 SPY put
 // incident where two robots watching the same underlying both received the
 // identical crossover, but each independently probed IB for a strike; the
 // loser of that race came back with no quote and silently skipped the
 // entry it should have taken alongside its sibling. See CLAUDE.md for the
-// deltaRes[groupID|right] "in flight" convention these tests exercise.
+// deltaRes "in flight" convention these tests exercise.
 package ibkr
 
 import (
@@ -15,27 +15,27 @@ import (
 	"github.com/SteffRainville/ibkr-go/quotes"
 )
 
-// newResolveEntryTestSession builds a session with a resolution group and
-// chain info already in place (bypassing buildOptionGroups/the conId+chain
-// round trip, neither of which is under test here) so ResolveEntryStrike's
-// early guards pass without a real IB connection. sub is wired into s.buses
-// at busIdx 0, and the seeded group carries busIdxs:[0], mirroring what a
-// real Run() would set up — so groupForSymbolLocked matches sub for real
-// rather than falling back on the busIdx<0 bypass.
+// newResolveEntryTestSession builds a session with a selector and chain info
+// already in place (bypassing buildSelectors/the conId+chain round trip,
+// neither of which is under test here) so ResolveEntryStrike's early guards
+// pass without a real IB connection. sub is wired into s.buses at busIdx 0, and
+// the seeded selector carries busIdxs:[0], mirroring what a real Run() would
+// set up — so selectorForLocked matches sub for real rather than falling back
+// on the busIdx<0 bypass.
 func newResolveEntryTestSession(sub Subscriber) *Session {
 	s := NewSession(Options{}, nil, nil)
 	s.buses = []*eventbus.Bus{sub.Bus()}
-	s.optChain.rotation = []optResGroup{
-		{groupID: 1, symbol: "SPY", targetDeltaCall: 0.65, targetDeltaPut: 0.65, busIdxs: []int{0}},
+	s.optChain.rotation = []selector{
+		{id: 1, symbol: "SPY", right: "put", targetDelta: 0.65, busIdxs: []int{0}},
 	}
-	s.optChain.lastChainInfo = map[string]chainSnapshot{
-		"SPY": {expiry: "20260731", strikes: []float64{725, 730, 735, 740, 745}},
+	s.optChain.lastChainInfo = map[chainKey]chainSnapshot{
+		{symbol: "SPY"}: {expiry: "20260731", strikes: []float64{725, 730, 735, 740, 745}, at: time.Now()},
 	}
 	return s
 }
 
 // TestResolveEntryStrike_SiblingInFlightWaitsInsteadOfDuplicateProbe pins
-// down the fix: when deltaRes["g1|put"] already belongs to a concurrent
+// down the fix: when this selector's deltaRes already belongs to a concurrent
 // sibling call, ResolveEntryStrike must not build its own candidate set and
 // issue its own ReqMktData probes (s.client is nil here — doing so would
 // panic) — it must wait for the sibling's result and return the identical
@@ -46,7 +46,7 @@ func TestResolveEntryStrike_SiblingInFlightWaitsInsteadOfDuplicateProbe(t *testi
 
 	// Simulate a sibling call already owning the resolution for SPY|put.
 	s.optChain.mu.Lock()
-	s.optChain.deltaRes[retryKeyLeg(1, "put")] = &deltaResolution{groupID: 1, symbol: "SPY", right: "put", targetDelta: 0.65}
+	s.optChain.deltaRes[1] = &deltaResolution{selectorID: 1, symbol: "SPY", right: "put", targetDelta: 0.65}
 	s.optChain.mu.Unlock()
 
 	const simulatedProbeDelay = 150 * time.Millisecond
@@ -56,11 +56,11 @@ func TestResolveEntryStrike_SiblingInFlightWaitsInsteadOfDuplicateProbe(t *testi
 		s.book.SetOptionBid(key, 6.50)
 		s.book.SetOptionAsk(key, 6.60)
 		s.optChain.mu.Lock()
-		delete(s.optChain.deltaRes, retryKeyLeg(1, "put"))
+		delete(s.optChain.deltaRes, 1)
 		if s.optChain.resolvedEntry == nil {
-			s.optChain.resolvedEntry = make(map[string]resolvedEntryLeg)
+			s.optChain.resolvedEntry = make(map[int]resolvedEntryLeg)
 		}
-		s.optChain.resolvedEntry[retryKeyLeg(1, "put")] = resolvedEntryLeg{strike: 735, expiry: "20260731", delta: -0.65, at: time.Now()}
+		s.optChain.resolvedEntry[1] = resolvedEntryLeg{strike: 735, expiry: "20260731", delta: -0.65, at: time.Now()}
 		s.optChain.mu.Unlock()
 	}()
 
@@ -91,7 +91,7 @@ func TestResolveEntryStrike_SiblingInFlightNeverResolves(t *testing.T) {
 	s := newResolveEntryTestSession(sub)
 
 	s.optChain.mu.Lock()
-	s.optChain.deltaRes[retryKeyLeg(1, "put")] = &deltaResolution{groupID: 1, symbol: "SPY", right: "put", targetDelta: 0.65}
+	s.optChain.deltaRes[1] = &deltaResolution{selectorID: 1, symbol: "SPY", right: "put", targetDelta: 0.65}
 	s.optChain.mu.Unlock()
 
 	const timeout = 300 * time.Millisecond

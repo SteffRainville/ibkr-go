@@ -223,35 +223,95 @@ func (s *Session) ResyncSymbols() SymbolDelta {
 		s.logger.Printf("Resync: subscribed %s (bars reqID=%d, quotes reqID=%d)", a.spec.Symbol, a.histID, a.mktID)
 	}
 
-	// Rebuild the option resolution groups from the new symbol lists and
-	// resolve only the ones that did not exist before. Existing groups keep
-	// their stable groupID and their place in the rotation, so an unrelated
-	// edit cannot trigger a chain-resolution burst across the whole watchlist.
-	fresh := s.buildOptionGroups()
-	for _, g := range fresh {
-		s.resolveOptionGroup(g)
+	// Rebuild the option selectors from the new symbol lists and resolve only
+	// the ones that did not exist before. Existing selectors keep their stable
+	// id and their place in the rotation, so an unrelated edit cannot trigger a
+	// chain-resolution burst across the whole watchlist.
+	//
+	// Selectors that DEPARTED (their row was removed or its target_delta
+	// edited) must also let go of the contracts they were holding, or a leg
+	// nothing points at any more would keep its market-data line for the rest
+	// of the session.
+	fresh := s.buildSelectors()
+	s.releaseDepartedSelectors()
+	for _, sel := range fresh {
+		s.resolveSelector(sel)
 	}
 
 	return delta
+}
+
+// releaseDepartedSelectors drops the holds of every selector that is no longer
+// in the rebuilt rotation. Must run AFTER buildSelectors has installed the new
+// rotation — it compares live holds against it.
+func (s *Session) releaseDepartedSelectors() {
+	s.optChain.mu.Lock()
+	live := make(map[int]bool, len(s.optChain.rotation))
+	for _, sel := range s.optChain.rotation {
+		live[sel.id] = true
+	}
+	var cancel []int64
+	release := func(m map[int]legKey) {
+		for selID, key := range m {
+			if live[selID] {
+				continue
+			}
+			delete(m, selID)
+			if id := s.detachSelectorLocked(key, selID); id != 0 {
+				cancel = append(cancel, id)
+			}
+		}
+	}
+	release(s.optChain.selCurrent)
+	for selID, sw := range s.optChain.selPending {
+		if live[selID] {
+			continue
+		}
+		delete(s.optChain.selPending, selID)
+		if id := s.detachSelectorLocked(sw.to, selID); id != 0 {
+			cancel = append(cancel, id)
+		}
+	}
+	for selID := range s.optChain.retries {
+		if !live[selID] {
+			delete(s.optChain.retries, selID)
+		}
+	}
+	s.optChain.mu.Unlock()
+
+	s.cancelLines(cancel)
+	if len(cancel) > 0 {
+		s.optionLog.Printf("Resync: released %d option market-data line(s) whose selector no longer exists", len(cancel))
+	}
 }
 
 // dropSymbolOptionState tears down the background option legs, retry state,
 // and cached chain data belonging to a symbol that has left the watchlist,
 // returning its market-data lines to the ledger.
 //
-// Position-pinned subscriptions (posSubs) are deliberately untouched — they
-// are owned by open positions and released by the exit path, not by a
-// watchlist edit.
+// Legs a position still pins are deliberately kept — they are owned by open
+// positions and released by the exit path, not by a watchlist edit. The
+// refcount makes that automatic: dropping the selectors' holds only cancels
+// the line when nothing else wants it.
 func (s *Session) dropSymbolOptionState(symbol string) {
 	s.optChain.mu.Lock()
-	var drop []int64
-	for reqID, req := range s.optChain.mktReqs {
-		if req.symbol == symbol {
-			drop = append(drop, reqID)
+	var cancel []int64
+	for key, leg := range s.optChain.legs {
+		if key.symbol != symbol {
+			continue
 		}
-	}
-	for _, reqID := range drop {
-		delete(s.optChain.mktReqs, reqID)
+		for selID := range leg.selectors {
+			if s.optChain.selCurrent[selID] == key {
+				delete(s.optChain.selCurrent, selID)
+			}
+			if sw, ok := s.optChain.selPending[selID]; ok && sw.to == key {
+				delete(s.optChain.selPending, selID)
+			}
+		}
+		leg.selectors = make(map[int]struct{})
+		if id := s.releaseLegIfUnheldLocked(leg); id != 0 {
+			cancel = append(cancel, id)
+		}
 	}
 	var cands []int64
 	for reqID, c := range s.optChain.deltaCands {
@@ -261,16 +321,18 @@ func (s *Session) dropSymbolOptionState(symbol string) {
 	}
 	for _, reqID := range cands {
 		delete(s.optChain.deltaCands, reqID)
+		s.mdLines.Release(reqID)
 	}
-	delete(s.optChain.lastChainInfo, symbol)
+	for key := range s.optChain.lastChainInfo {
+		if key.symbol == symbol {
+			delete(s.optChain.lastChainInfo, key)
+		}
+	}
 	delete(s.optChain.lastIV, symbol)
 	s.optChain.mu.Unlock()
 
-	for _, reqID := range append(drop, cands...) {
-		s.mdLines.Release(reqID)
-		s.client.CancelMktData(reqID)
-	}
-	if n := len(drop) + len(cands); n > 0 {
+	s.cancelLines(append(cancel, cands...))
+	if n := len(cancel) + len(cands); n > 0 {
 		s.optionLog.Printf("Resync: released %d option market-data line(s) for departed symbol %s", n, symbol)
 	}
 }

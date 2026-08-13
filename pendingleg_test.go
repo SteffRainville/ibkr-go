@@ -5,98 +5,145 @@ import (
 	"time"
 )
 
-// TestActiveLegLocked verifies an active leg is detected (and its strike
-// returned) and a pending-only state is not treated as active.
-func TestActiveLegLocked(t *testing.T) {
+// TestSelectorLegLocked verifies a selector's displayed contract is found, and
+// that a contract it is only WARMING into does not count as displayed.
+func TestSelectorLegLocked(t *testing.T) {
 	s := newRotationTestSession(nil)
-	s.optChain.mktReqs[1] = &optMktReq{symbol: "QQQ", right: "call", strike: 99, pending: false}
-	s.optChain.mktReqs[2] = &optMktReq{symbol: "QQQ", right: "call", strike: 100, pending: true}
+	shown := lk("QQQ", "call", 99, "20260727")
+	warming := lk("QQQ", "call", 100, "20260727")
+	seedLeg(s, shown, legOpts{reqID: 1, selectors: []int{5}})
+	seedLeg(s, warming, legOpts{reqID: 2, warming: []int{5}})
 
-	active, ok := s.activeLegLocked("QQQ", "call")
+	leg, ok := s.selectorLegLocked(5)
 	if !ok {
-		t.Fatal("active leg should be detected")
+		t.Fatal("the selector's displayed leg should be found")
 	}
-	if active.strike != 99 {
-		t.Fatalf("active leg strike = %.0f, want 99 (the non-pending leg, not the pending 100)", active.strike)
+	if leg.strike != 99 {
+		t.Fatalf("displayed strike = %.0f, want 99 (not the warming 100)", leg.strike)
 	}
-	if _, ok := s.activeLegLocked("QQQ", "put"); ok {
-		t.Fatal("no put leg exists")
-	}
-	// Drop the active leg — only the pending remains.
-	delete(s.optChain.mktReqs, 1)
-	if _, ok := s.activeLegLocked("QQQ", "call"); ok {
-		t.Fatal("a pending-only state must not count as active")
+	if _, ok := s.selectorLegLocked(6); ok {
+		t.Fatal("selector 6 holds nothing")
 	}
 }
 
-// TestCurrentOptionContract_PrefersActive verifies a buy resolves against the live
-// active leg during a swap, never the not-yet-ready pending replacement — and falls
-// back to pending only when no active leg exists.
-func TestCurrentOptionContract_PrefersActive(t *testing.T) {
+// TestCurrentOptionContract_PrefersDisplayed verifies a buy resolves against
+// the contract the selector is actually showing during a strike swap, never
+// the not-yet-ready replacement — and falls back to the replacement only when
+// nothing is displayed.
+func TestCurrentOptionContract_PrefersDisplayed(t *testing.T) {
 	s := newRotationTestSession(nil)
-	// Active leg (old strike 99) has a live quote; pending replacement (strike 100)
-	// has none yet.
-	s.optChain.mktReqs[1] = &optMktReq{symbol: "QQQ", right: "call", strike: 99, bid: 5.0, ask: 5.2, pending: false, busIdxs: []int{0}}
-	s.optChain.mktReqs[2] = &optMktReq{symbol: "QQQ", right: "call", strike: 100, pending: true, busIdxs: []int{0}}
+	sel := seedSelector(s, selector{id: 5, symbol: "QQQ", right: "call", targetDelta: 0.60, busIdxs: []int{0}})
+
+	shown := lk("QQQ", "call", 99, "20260727")
+	warming := lk("QQQ", "call", 100, "20260727")
+	seedLeg(s, shown, legOpts{reqID: 1, selectors: []int{sel.id}, bid: 5.0, ask: 5.2})
+	seedLeg(s, warming, legOpts{reqID: 2, warming: []int{sel.id}})
 
 	opt, ok := s.currentOptionContract("QQQ", "call", 0)
 	if !ok {
 		t.Fatal("expected a resolved contract")
 	}
 	if opt.strike != 99 {
-		t.Fatalf("resolved strike = %.0f, want 99 (the active leg, not the pending 100)", opt.strike)
+		t.Fatalf("resolved strike = %.0f, want 99 (the displayed leg, not the warming 100)", opt.strike)
 	}
 	if opt.mid != 5.1 {
-		t.Fatalf("mid = %.2f, want 5.10 (active leg's live quote)", opt.mid)
+		t.Fatalf("mid = %.2f, want 5.10 (displayed leg's live quote)", opt.mid)
 	}
 
-	// Once the active leg is gone, the pending leg is the only fallback.
-	delete(s.optChain.mktReqs, 1)
+	// Once the displayed leg is gone, the warming one is the only thing this
+	// selector means.
+	s.optChain.mu.Lock()
+	delete(s.optChain.selCurrent, sel.id)
+	delete(s.optChain.legs, shown)
+	s.optChain.mu.Unlock()
+
 	opt, ok = s.currentOptionContract("QQQ", "call", 0)
 	if !ok || opt.strike != 100 {
-		t.Fatalf("fallback to pending failed: ok=%v strike=%.0f", ok, opt.strike)
+		t.Fatalf("fallback to the warming contract failed: ok=%v strike=%.0f", ok, opt.strike)
 	}
 }
 
-// TestPromoteIfReadyLocked verifies a pending leg stays pending until it has a
-// complete quote (or the grace elapses), then flips to active.
-func TestPromoteIfReadyLocked(t *testing.T) {
-	s := newRotationTestSession(nil)
+// TestPromotePendingLocked verifies a warming selector stays on its old
+// contract until the new one has a complete quote (or the grace elapses), then
+// switches — and that switching releases the contract it left.
+func TestPromotePendingLocked(t *testing.T) {
+	t.Run("no pending swap is not a promotion", func(t *testing.T) {
+		s := newRotationTestSession(nil)
+		seedLeg(s, lk("QQQ", "call", 99, "20260727"), legOpts{reqID: 1, selectors: []int{5}})
+		if _, promoted := s.promotePendingLocked(5, time.Now()); promoted {
+			t.Fatal("a selector with no in-flight swap must not report a promotion")
+		}
+	})
 
-	// Not pending → always "ready" (already active).
-	active := &optMktReq{symbol: "QQQ", right: "call", strike: 99, pending: false}
-	s.optChain.mktReqs[1] = active
-	if !s.promoteIfReadyLocked(active, 1) {
-		t.Fatal("a non-pending leg must report ready")
-	}
+	t.Run("warming with no quote does not promote", func(t *testing.T) {
+		s := newRotationTestSession(nil)
+		seedLeg(s, lk("QQQ", "put", 60, "20260727"), legOpts{reqID: 1, selectors: []int{5}})
+		to := lk("QQQ", "put", 50, "20260727")
+		seedLeg(s, to, legOpts{reqID: 2, warming: []int{5}})
 
-	// Pending with no quote → not ready.
-	pend := &optMktReq{symbol: "QQQ", right: "put", strike: 50, pending: true, pendingSince: time.Now()}
-	s.optChain.mktReqs[2] = pend
-	if s.promoteIfReadyLocked(pend, 2) {
-		t.Fatal("pending leg with no quote must not promote")
-	}
-	if !pend.pending {
-		t.Fatal("leg should still be pending")
-	}
+		if _, promoted := s.promotePendingLocked(5, time.Now()); promoted {
+			t.Fatal("promoted onto a contract with no quote — the row would blank")
+		}
+		if k, _ := displayedKey(s, 5); k.strike != 60 {
+			t.Fatalf("displayed strike = %.0f, want the old 60", k.strike)
+		}
+	})
 
-	// Complete two-sided quote → promotes.
-	pend.bid, pend.ask = 3.0, 3.2
-	if !s.promoteIfReadyLocked(pend, 2) {
-		t.Fatal("pending leg with a complete quote must promote")
-	}
-	if pend.pending {
-		t.Fatal("leg should now be active")
-	}
+	t.Run("complete quote promotes and releases the old contract", func(t *testing.T) {
+		s := withOfflineClient(newRotationTestSession(nil))
+		old := lk("QQQ", "put", 60, "20260727")
+		to := lk("QQQ", "put", 50, "20260727")
+		seedLeg(s, old, legOpts{reqID: 1, selectors: []int{5}})
+		leg := seedLeg(s, to, legOpts{reqID: 2, warming: []int{5}})
 
-	// Grace fallback: one-sided quote, but pendingSince older than the grace window.
-	slow := &optMktReq{symbol: "SPY", right: "call", strike: 500, pending: true, price: 2.5,
-		pendingSince: time.Now().Add(-pendingPromoteGrace - time.Second)}
-	s.optChain.mktReqs[3] = slow
-	if !s.promoteIfReadyLocked(slow, 3) {
-		t.Fatal("a one-sided quote past the grace window must promote")
-	}
-	if slow.pending {
-		t.Fatal("slow leg should have been promoted by the grace fallback")
-	}
+		s.optChain.mu.Lock()
+		leg.bid, leg.ask = 3.0, 3.2
+		s.optChain.mu.Unlock()
+
+		cancel, promoted := s.promotePendingLocked(5, time.Now())
+		if !promoted {
+			t.Fatal("a complete two-sided quote must promote")
+		}
+		if cancel != 1 {
+			t.Fatalf("cancel = %d, want reqID 1 — the abandoned contract had no other holder", cancel)
+		}
+		if k, _ := displayedKey(s, 5); k.strike != 50 {
+			t.Fatalf("displayed strike = %.0f, want 50", k.strike)
+		}
+	})
+
+	t.Run("one-sided quote promotes past the grace window", func(t *testing.T) {
+		s := newRotationTestSession(nil)
+		seedLeg(s, lk("SPY", "call", 510, "20260727"), legOpts{reqID: 1, selectors: []int{5}})
+		to := lk("SPY", "call", 500, "20260727")
+		seedLeg(s, to, legOpts{reqID: 2, warming: []int{5}, price: 2.5,
+			pendingSince: time.Now().Add(-pendingPromoteGrace - time.Second)})
+
+		if _, promoted := s.promotePendingLocked(5, time.Now()); !promoted {
+			t.Fatal("a one-sided quote past the grace window must promote")
+		}
+	})
+
+	t.Run("abandoning a contract another selector holds keeps its line", func(t *testing.T) {
+		s := newRotationTestSession(nil)
+		shared := lk("QQQ", "call", 480, "20260727")
+		seedLeg(s, shared, legOpts{reqID: 1, selectors: []int{5, 6}})
+		to := lk("QQQ", "call", 485, "20260727")
+		leg := seedLeg(s, to, legOpts{reqID: 2, warming: []int{5}})
+
+		s.optChain.mu.Lock()
+		leg.bid, leg.ask = 1.0, 1.1
+		s.optChain.mu.Unlock()
+
+		cancel, promoted := s.promotePendingLocked(5, time.Now())
+		if !promoted {
+			t.Fatal("expected promotion")
+		}
+		if cancel != 0 {
+			t.Fatalf("cancel = %d, want 0 — selector 6 still holds the 480 contract", cancel)
+		}
+		if _, _, ok := legHolders(s, shared); !ok {
+			t.Fatal("the shared contract was torn down while another selector still displayed it")
+		}
+	})
 }

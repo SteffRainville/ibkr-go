@@ -16,15 +16,15 @@ import (
 
 // TestReapStuckChainRequests_FreesOnlyStaleEntries verifies the reaper
 // leaves fresh conId/chain requests alone but frees ones older than
-// chainResolutionMaxAge, unblocking groupResolvingLocked for that group.
+// chainResolutionMaxAge, unblocking selectorResolvingLocked for its waiters.
 func TestReapStuckChainRequests_FreesOnlyStaleEntries(t *testing.T) {
 	s := NewSession(Options{}, nil, nil)
 
 	s.optChain.mu.Lock()
-	s.optChain.conIDReqs[100] = &optConIDReq{groupID: 1, symbol: "FRESH_CONID", requestedAt: time.Now()}
-	s.optChain.conIDReqs[101] = &optConIDReq{groupID: 2, symbol: "STUCK_CONID", requestedAt: time.Now().Add(-time.Minute)}
-	s.optChain.chainReqs[200] = &optChainReq{groupID: 3, symbol: "FRESH_CHAIN", requestedAt: time.Now()}
-	s.optChain.chainReqs[201] = &optChainReq{groupID: 4, symbol: "STUCK_CHAIN", requestedAt: time.Now().Add(-time.Minute)}
+	s.optChain.conIDReqs[100] = &optConIDReq{chain: chainKey{"FRESH_CONID", 0}, waiters: []int{1}, requestedAt: time.Now()}
+	s.optChain.conIDReqs[101] = &optConIDReq{chain: chainKey{"STUCK_CONID", 0}, waiters: []int{2}, requestedAt: time.Now().Add(-time.Minute)}
+	s.optChain.chainReqs[200] = &optChainReq{chain: chainKey{"FRESH_CHAIN", 0}, waiters: []int{3}, requestedAt: time.Now()}
+	s.optChain.chainReqs[201] = &optChainReq{chain: chainKey{"STUCK_CHAIN", 0}, waiters: []int{4}, requestedAt: time.Now().Add(-time.Minute)}
 	s.optChain.mu.Unlock()
 
 	s.reapStuckChainRequests()
@@ -45,14 +45,14 @@ func TestReapStuckChainRequests_FreesOnlyStaleEntries(t *testing.T) {
 		t.Error("stale chain request was not reaped")
 	}
 
-	if s.groupResolvingLocked(2) {
-		t.Error("group 2 still reports resolving after its stuck conId request was reaped")
+	if s.selectorResolvingLocked(2) {
+		t.Error("selector 2 still reports resolving after its stuck conId request was reaped")
 	}
-	if s.groupResolvingLocked(4) {
-		t.Error("group 4 still reports resolving after its stuck chain request was reaped")
+	if s.selectorResolvingLocked(4) {
+		t.Error("selector 4 still reports resolving after its stuck chain request was reaped")
 	}
-	if !s.groupResolvingLocked(1) {
-		t.Error("group 1 should still report resolving — its conId request is fresh, not reaped")
+	if !s.selectorResolvingLocked(1) {
+		t.Error("selector 1 should still report resolving — its conId request is fresh, not reaped")
 	}
 }
 
@@ -65,8 +65,8 @@ func TestHandleOptionMktError_ClearsConIDAndChainRequests(t *testing.T) {
 	s := NewSession(Options{}, nil, nil)
 
 	s.optChain.mu.Lock()
-	s.optChain.conIDReqs[100] = &optConIDReq{groupID: 1, symbol: "BADSYM", requestedAt: time.Now()}
-	s.optChain.chainReqs[200] = &optChainReq{groupID: 2, symbol: "BADSYM2", requestedAt: time.Now()}
+	s.optChain.conIDReqs[100] = &optConIDReq{chain: chainKey{"BADSYM", 0}, waiters: []int{1}, requestedAt: time.Now()}
+	s.optChain.chainReqs[200] = &optChainReq{chain: chainKey{"BADSYM2", 0}, waiters: []int{2}, requestedAt: time.Now()}
 	s.optChain.mu.Unlock()
 
 	if handled := s.handleOptionMktError(100, "No security definition has been found for the request"); !handled {
@@ -84,10 +84,10 @@ func TestHandleOptionMktError_ClearsConIDAndChainRequests(t *testing.T) {
 	if _, ok := s.optChain.chainReqs[200]; ok {
 		t.Error("chain request still present after handleOptionMktError")
 	}
-	if s.groupResolvingLocked(1) {
-		t.Error("group 1 still reports resolving after its rejected conId request was cleared")
+	if s.selectorResolvingLocked(1) {
+		t.Error("selector 1 still reports resolving after its rejected conId request was cleared")
 	}
-	if s.groupResolvingLocked(2) {
-		t.Error("group 2 still reports resolving after its rejected chain request was cleared")
+	if s.selectorResolvingLocked(2) {
+		t.Error("selector 2 still reports resolving after its rejected chain request was cleared")
 	}
 }

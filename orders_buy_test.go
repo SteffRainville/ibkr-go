@@ -18,9 +18,7 @@ func TestResolveBuyContract_UsesCarriedIdentityNotATM(t *testing.T) {
 	s := newTestSession()
 	// The ATM chain's active leg has drifted to 565 — if resolveBuyContract
 	// consulted it, the test would catch the regression by returning 565.
-	s.optChain.mktReqs = map[int64]*optMktReq{
-		1: {symbol: "AMD", right: "put", strike: 565, expiry: "20260727", bid: 6.60, ask: 6.85},
-	}
+	seedDisplayedLeg(s, "AMD", "put", 565, "20260727", 6.60, 6.85)
 
 	o := OrderRequest{Symbol: "AMD", Tag: "put", SecType: "OPT", Qty: 200, Strike: 580, OptionExpiry: "20260727", Bid: 40.10, Ask: 41.00}
 
@@ -48,9 +46,7 @@ func TestResolveBuyContract_UsesCarriedIdentityNotATM(t *testing.T) {
 // resolveCloseContract already uses for an untracked manual close.
 func TestResolveBuyContract_FallsBackToATMWhenIdentityAbsent(t *testing.T) {
 	s := newTestSession()
-	s.optChain.mktReqs = map[int64]*optMktReq{
-		1: {symbol: "AMD", right: "put", strike: 565, expiry: "20260727", bid: 6.60, ask: 6.85},
-	}
+	seedDisplayedLeg(s, "AMD", "put", 565, "20260727", 6.60, 6.85)
 
 	o := OrderRequest{Symbol: "AMD", Tag: "put", Qty: 600} // no strike/expiry (manual buy)
 
@@ -84,9 +80,7 @@ func TestResolveBuyContract_ErrorsWhenNoActiveLegAndIdentityAbsent(t *testing.T)
 // set, expiry absent) is refused rather than silently ATM-resolved.
 func TestResolveBuyContract_RefusesPartialIdentity(t *testing.T) {
 	s := newTestSession()
-	s.optChain.mktReqs = map[int64]*optMktReq{
-		1: {symbol: "AMD", right: "put", strike: 565, expiry: "20260727", bid: 6.60, ask: 6.85},
-	}
+	seedDisplayedLeg(s, "AMD", "put", 565, "20260727", 6.60, 6.85)
 	o := OrderRequest{Symbol: "AMD", Tag: "put", Qty: 600, Strike: 580} // strike set, no expiry
 
 	_, _, _, _, _, err := s.resolveBuyContract(o, -1)
