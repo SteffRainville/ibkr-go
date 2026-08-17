@@ -64,15 +64,55 @@ const (
 // lines before ever touching it.
 const Buffer = 10
 
-// ReserveNew is the default number of lines below the cap at which
-// CategoryDiscretionaryNew (first-quote) grants stop.
-const ReserveNew = 15
+// ReserveNewPct and ReserveChurnPct are the default discretionary reserves, as
+// a PERCENTAGE of the line cap: the point below the cap at which
+// CategoryDiscretionaryNew (first-quote) and CategoryDiscretionaryChurn
+// (background refresh) grants respectively stop. Churn is the tighter of the
+// two, so an account under pressure spends its remaining discretionary headroom
+// on things that have never gotten a quote at all.
+//
+// These were fixed line counts (15 and 25). At the default cap of 100 the
+// percentages reproduce those numbers exactly — the change is that the policy
+// now scales with the entitlement instead of quietly inverting on one. A fixed
+// 25 is a quarter of a 100-line account and a twentieth of a 500-line one; the
+// reserve is a statement about what fraction of the pool background refreshes
+// may not touch, and it should read the same at any size.
+//
+// Neither value is a tuning knob for "my watchlist doesn't fit": a watchlist
+// whose steady state sits inside the churn reserve has more rows than the
+// account has lines, and lowering the reserve trades position-safety headroom
+// for background refreshes. Override deliberately via Options, not by reflex.
+const (
+	ReserveNewPct   = 15
+	ReserveChurnPct = 25
+)
 
-// ReserveChurn is the default number of lines below the cap at which
-// CategoryDiscretionaryChurn (background refresh) grants stop — tighter
-// than ReserveNew, so an account under pressure spends its remaining
-// discretionary headroom on things that have never gotten a quote at all.
-const ReserveChurn = 25
+// Floors under the percentage reserves, so a small cap still keeps a usable
+// cushion for guaranteed position lines and entry probes.
+const (
+	minReserveNew   = 4
+	minReserveChurn = 6
+)
+
+// ReserveNewFor and ReserveChurnFor resolve the default reserves for a cap.
+func ReserveNewFor(max int) int   { return reserveFor(max, ReserveNewPct, minReserveNew) }
+func ReserveChurnFor(max int) int { return reserveFor(max, ReserveChurnPct, minReserveChurn) }
+
+func reserveFor(max, pct, floor int) int {
+	r := max * pct / 100
+	if r < floor {
+		r = floor
+	}
+	// A reserve at or above the cap would refuse every discretionary grant, so
+	// a pathologically small cap still leaves one line to work with.
+	if r >= max {
+		r = max - 1
+	}
+	if r < 0 {
+		r = 0
+	}
+	return r
+}
 
 // SnapshotMaxAge is how old a transient snapshot line may get before the
 // reaper frees it.
@@ -116,25 +156,49 @@ type Ledger struct {
 	histLines map[int64]struct{}
 	histMax   int
 
+	// reserveNew/reserveChurn are the resolved (absolute) discretionary
+	// thresholds for this cap — see ReserveNewPct/ReserveChurnPct. Set at
+	// construction and never mutated, so they are read without the lock.
+	reserveNew   int
+	reserveChurn int
+
 	onChange func(used, max int)
 }
 
 // NewLedger returns a Ledger with the given line cap and historical-stream
-// ceiling. max defaults to 100 and histMax to 50 when <= 0.
+// ceiling, and the default percentage reserves. max defaults to 100 and
+// histMax to 50 when <= 0.
 func NewLedger(max, histMax int) *Ledger {
+	return NewLedgerWithReserves(max, histMax, 0, 0)
+}
+
+// NewLedgerWithReserves is NewLedger with explicit discretionary reserve
+// percentages; either <= 0 takes its default (ReserveNewPct/ReserveChurnPct).
+// Overriding these is a deliberate risk decision — a lower churn reserve buys
+// background strike refreshes with headroom otherwise held for position and
+// entry-probe lines.
+func NewLedgerWithReserves(max, histMax, reserveNewPct, reserveChurnPct int) *Ledger {
 	if max <= 0 {
 		max = 100
 	}
 	if histMax <= 0 {
 		histMax = 50
 	}
+	if reserveNewPct <= 0 {
+		reserveNewPct = ReserveNewPct
+	}
+	if reserveChurnPct <= 0 {
+		reserveChurnPct = ReserveChurnPct
+	}
 	return &Ledger{
-		max:       max,
-		lines:     make(map[int64]Category),
-		snapAt:    make(map[int64]time.Time),
-		probeAt:   make(map[int64]time.Time),
-		histLines: make(map[int64]struct{}),
-		histMax:   histMax,
+		max:          max,
+		reserveNew:   reserveFor(max, reserveNewPct, minReserveNew),
+		reserveChurn: reserveFor(max, reserveChurnPct, minReserveChurn),
+		lines:        make(map[int64]Category),
+		snapAt:       make(map[int64]time.Time),
+		probeAt:      make(map[int64]time.Time),
+		histLines:    make(map[int64]struct{}),
+		histMax:      histMax,
 	}
 }
 
@@ -202,17 +266,23 @@ func (l *Ledger) grantDiscretionary(reqID int64, cat Category, reserve int, labe
 
 // GrantDiscretionaryNew records a first-quote background line — something
 // with no active, quoted line yet this session. Highest-priority
-// discretionary tier: grants until usage reaches ReserveNew below the cap.
+// discretionary tier: grants until usage reaches this ledger's first-quote
+// reserve below the cap.
 func (l *Ledger) GrantDiscretionaryNew(reqID int64) bool {
-	return l.grantDiscretionary(reqID, CategoryDiscretionaryNew, ReserveNew, "background first-quote")
+	return l.grantDiscretionary(reqID, CategoryDiscretionaryNew, l.reserveNew, "background first-quote")
 }
 
 // GrantDiscretionaryChurn records a background REFRESH of an already-active,
 // already-quoted line. Lowest-priority discretionary tier: stops being
-// granted at the tighter ReserveChurn threshold, well before
-// GrantDiscretionaryNew does.
+// granted at the tighter churn reserve, well before GrantDiscretionaryNew does.
 func (l *Ledger) GrantDiscretionaryChurn(reqID int64) bool {
-	return l.grantDiscretionary(reqID, CategoryDiscretionaryChurn, ReserveChurn, "background refresh")
+	return l.grantDiscretionary(reqID, CategoryDiscretionaryChurn, l.reserveChurn, "background refresh")
+}
+
+// Reserves reports this ledger's resolved discretionary thresholds, for
+// diagnostics that need to explain why a background grant was refused.
+func (l *Ledger) Reserves() (newReserve, churnReserve int) {
+	return l.reserveNew, l.reserveChurn
 }
 
 // GrantSnapshot records a transient snapshot line, granted only while

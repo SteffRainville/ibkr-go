@@ -260,6 +260,18 @@ type Options struct {
 	MaxMarketDataLines      int           // default 100
 	MaxHistoricalStreams    int           // default 50
 
+	// Discretionary market-data reserves, as a percentage of
+	// MaxMarketDataLines: the point below the cap at which background
+	// first-quote and background-refresh subscriptions stop being granted.
+	// Zero takes mdlines.ReserveNewPct / ReserveChurnPct (15 / 25).
+	//
+	// Lowering the churn reserve buys background strike refreshes with headroom
+	// otherwise held for position feeds and entry probes, so it is a risk
+	// decision rather than a way to fit a watchlist that is simply larger than
+	// the account's line entitlement.
+	MDLineReserveNewPct   int
+	MDLineReserveChurnPct int
+
 	Logger                         *log.Logger // default log.Default()
 	ScanLog, OptionLog, AccountLog io.Writer   // default io.Discard
 
@@ -269,8 +281,8 @@ type Options struct {
 	OnPositionSnapshot    func([]PositionInfo)                                   // full portfolio snapshot (PositionEnd)
 	OnPositionUpdate      func(PositionInfo)                                     // one confirmed real-time position update
 	OnPositionClosed      func(PositionInfo)                                     // a position confirmed closed by a fresh snapshot
-	OnPositionPriceUpdate func(symbol string, price float64)                    // fresh underlying price, for a positions-page display
+	OnPositionPriceUpdate func(symbol string, price float64)                     // fresh underlying price, for a positions-page display
 	OnAccountValue        func(summary AccountSummary, tag string, value string) // raw AccountSummary tag/value
 	OnError               func(ErrorEvent)
-	OnStall            func() // bar feed watchdog forced a reconnect
+	OnStall               func() // bar feed watchdog forced a reconnect
 }

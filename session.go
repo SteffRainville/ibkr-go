@@ -366,7 +366,8 @@ func NewSession(opts Options, book *quotes.Book, cs *candlestore.Store) *Session
 		},
 		acct: acctTracker{accounts: make(map[string]AccountSummary)},
 
-		mdLines: mdlines.NewLedger(opts.MaxMarketDataLines, opts.MaxHistoricalStreams),
+		mdLines: mdlines.NewLedgerWithReserves(opts.MaxMarketDataLines, opts.MaxHistoricalStreams,
+			opts.MDLineReserveNewPct, opts.MDLineReserveChurnPct),
 
 		logger:    opts.Logger,
 		scanLog:   writerLogger(opts.ScanLog),

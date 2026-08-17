@@ -37,11 +37,10 @@ type OptionChainInfo struct {
 // reqID in each phase's map (see handleOptionQueryContractDetailsEnd), so
 // the same *optQueryReq is reachable from either map while it is pending.
 type optQueryReq struct {
-	symbol      string
-	conID       int64
-	expirations []string
-	strikes     []float64
-	done        chan optQueryResult
+	symbol  string
+	conID   int64
+	classes map[string]*chainClass
+	done    chan optQueryResult
 }
 
 type optQueryResult struct {
@@ -149,9 +148,11 @@ func (s *Session) handleOptionQueryContractDetailsEnd(reqID int64) bool {
 }
 
 // handleOptionQuerySecDefOptParams accumulates one reqSecDefOptParams
-// exchange callback (SMART only — see options.go's identical rationale) for
-// a RequestOptionChain request.
-func (s *Session) handleOptionQuerySecDefOptParams(reqID int64, exchange string, expirations []string, strikes []float64) bool {
+// callback (SMART only — see options.go's identical rationale) for a
+// RequestOptionChain request, bucketed by trading class for the same reason
+// optChainReq is: this result populates the option chart's expiry and strike
+// pickers, and a union across classes offers combinations that do not exist.
+func (s *Session) handleOptionQuerySecDefOptParams(reqID int64, exchange, tradingClass, multiplier string, expirations []string, strikes []float64) bool {
 	s.optQuery.mu.Lock()
 	req, ok := s.optQuery.chainReqs[reqID]
 	if !ok {
@@ -159,26 +160,15 @@ func (s *Session) handleOptionQuerySecDefOptParams(reqID int64, exchange string,
 		return false
 	}
 	if exchange == "SMART" {
-		expSet := make(map[string]bool, len(req.expirations))
-		for _, e := range req.expirations {
-			expSet[e] = true
+		if req.classes == nil {
+			req.classes = make(map[string]*chainClass)
 		}
-		for _, e := range expirations {
-			if !expSet[e] {
-				expSet[e] = true
-				req.expirations = append(req.expirations, e)
-			}
+		cls, known := req.classes[tradingClass]
+		if !known {
+			cls = &chainClass{tradingClass: tradingClass, multiplier: multiplier}
+			req.classes[tradingClass] = cls
 		}
-		strikeSet := make(map[float64]bool, len(req.strikes))
-		for _, st := range req.strikes {
-			strikeSet[st] = true
-		}
-		for _, st := range strikes {
-			if !strikeSet[st] {
-				strikeSet[st] = true
-				req.strikes = append(req.strikes, st)
-			}
-		}
+		cls.mergeChainParams(expirations, strikes)
 	}
 	s.optQuery.mu.Unlock()
 	return true
@@ -195,10 +185,16 @@ func (s *Session) handleOptionQuerySecDefOptParamsEnd(reqID int64) bool {
 		return false
 	}
 	delete(s.optQuery.chainReqs, reqID)
-	expirations := append([]string(nil), req.expirations...)
-	strikes := append([]float64(nil), req.strikes...)
 	symbol := req.symbol
+	chosen, _ := pickChainClass(symbol, req.classes)
 	s.optQuery.mu.Unlock()
+
+	if chosen == nil {
+		req.done <- optQueryResult{err: fmt.Errorf("%w found for %s", ErrNoOptionChain, symbol)}
+		return true
+	}
+	expirations := append([]string(nil), chosen.expirations...)
+	strikes := append([]float64(nil), chosen.strikes...)
 
 	today := time.Now().Format("20060102")
 	future := expirations[:0:0]

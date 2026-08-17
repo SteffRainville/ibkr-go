@@ -6,7 +6,7 @@ import (
 )
 
 // TestLedger_DiscretionaryNewYieldsToReserve verifies first-quote background
-// lines stop being granted once usage reaches (max - ReserveNew), leaving
+// lines stop being granted once usage reaches (max - ReserveNewFor(max)), leaving
 // headroom.
 func TestLedger_DiscretionaryNewYieldsToReserve(t *testing.T) {
 	max := 100
@@ -18,16 +18,16 @@ func TestLedger_DiscretionaryNewYieldsToReserve(t *testing.T) {
 			granted++
 		}
 	}
-	if want := max - ReserveNew; granted != want {
-		t.Fatalf("DiscretionaryNew grants = %d, want %d (max %d − reserve %d)", granted, want, max, ReserveNew)
+	if want := max - ReserveNewFor(max); granted != want {
+		t.Fatalf("DiscretionaryNew grants = %d, want %d (max %d − reserve %d)", granted, want, max, ReserveNewFor(max))
 	}
-	if used, _ := l.Status(); used != max-ReserveNew {
-		t.Fatalf("used = %d, want %d", used, max-ReserveNew)
+	if used, _ := l.Status(); used != max-ReserveNewFor(max) {
+		t.Fatalf("used = %d, want %d", used, max-ReserveNewFor(max))
 	}
 }
 
 // TestLedger_DiscretionaryChurnYieldsToReserve verifies background-refresh
-// lines stop being granted at the tighter (max - ReserveChurn) threshold.
+// lines stop being granted at the tighter (max - ReserveChurnFor(max)) threshold.
 func TestLedger_DiscretionaryChurnYieldsToReserve(t *testing.T) {
 	max := 100
 	l := NewLedger(max, 50)
@@ -38,31 +38,31 @@ func TestLedger_DiscretionaryChurnYieldsToReserve(t *testing.T) {
 			granted++
 		}
 	}
-	if want := max - ReserveChurn; granted != want {
-		t.Fatalf("DiscretionaryChurn grants = %d, want %d (max %d − reserve %d)", granted, want, max, ReserveChurn)
+	if want := max - ReserveChurnFor(max); granted != want {
+		t.Fatalf("DiscretionaryChurn grants = %d, want %d (max %d − reserve %d)", granted, want, max, ReserveChurnFor(max))
 	}
-	if used, _ := l.Status(); used != max-ReserveChurn {
-		t.Fatalf("used = %d, want %d", used, max-ReserveChurn)
+	if used, _ := l.Status(); used != max-ReserveChurnFor(max) {
+		t.Fatalf("used = %d, want %d", used, max-ReserveChurnFor(max))
 	}
 }
 
 // TestLedger_DiscretionaryNewOutranksChurn is the core priority-tiering
 // test: once usage reaches the churn threshold, churn requests stop but
 // first-quote (new) requests keep being granted all the way to the wider
-// ReserveNew threshold, and guaranteed position lines are never refused
+// ReserveNewFor(max) threshold, and guaranteed position lines are never refused
 // throughout.
 func TestLedger_DiscretionaryNewOutranksChurn(t *testing.T) {
 	max := 100
 	l := NewLedger(max, 50)
 
 	// Saturate to the churn threshold using churn grants.
-	for i := int64(0); i < int64(max-ReserveChurn); i++ {
+	for i := int64(0); i < int64(max-ReserveChurnFor(max)); i++ {
 		if !l.GrantDiscretionaryChurn(i) {
 			t.Fatalf("churn grant %d refused before reaching the churn threshold", i)
 		}
 	}
-	if used, _ := l.Status(); used != max-ReserveChurn {
-		t.Fatalf("used after saturating churn = %d, want %d", used, max-ReserveChurn)
+	if used, _ := l.Status(); used != max-ReserveChurnFor(max) {
+		t.Fatalf("used after saturating churn = %d, want %d", used, max-ReserveChurnFor(max))
 	}
 
 	// Further churn requests must now be refused.
@@ -71,18 +71,18 @@ func TestLedger_DiscretionaryNewOutranksChurn(t *testing.T) {
 	}
 
 	// But new requests must keep being granted, since it's a wider,
-	// higher-priority reserve — up to max-ReserveNew.
+	// higher-priority reserve — up to max-ReserveNewFor(max).
 	newGranted := 0
-	for i := int64(2000); i < int64(2000+ReserveChurn-ReserveNew+5); i++ {
+	for i := int64(2000); i < int64(2000+ReserveChurnFor(max)-ReserveNewFor(max)+5); i++ {
 		if l.GrantDiscretionaryNew(i) {
 			newGranted++
 		}
 	}
-	if want := ReserveChurn - ReserveNew; newGranted != want {
+	if want := ReserveChurnFor(max) - ReserveNewFor(max); newGranted != want {
 		t.Fatalf("DiscretionaryNew grants past the churn threshold = %d, want %d (the freed 75-85 band)", newGranted, want)
 	}
-	if used, _ := l.Status(); used != max-ReserveNew {
-		t.Fatalf("used after saturating DiscretionaryNew too = %d, want %d", used, max-ReserveNew)
+	if used, _ := l.Status(); used != max-ReserveNewFor(max) {
+		t.Fatalf("used after saturating DiscretionaryNew too = %d, want %d", used, max-ReserveNewFor(max))
 	}
 
 	// Guaranteed position lines must never be refused, even now.
@@ -419,5 +419,70 @@ func TestLedger_AllReqIDs(t *testing.T) {
 		if id != 1001 && id != 1002 {
 			t.Errorf("AllHistReqIDs returned unexpected reqID %d", id)
 		}
+	}
+}
+
+// TestReserves_ProportionalToTheCap pins the two properties the percentage form
+// exists for: at the default cap of 100 it reproduces the fixed 15/25 the
+// reserves used to be — so the change is a no-op for an ordinary account — and
+// above that it scales, instead of a fixed 25 meaning "a quarter of the pool"
+// on one account and "a twentieth" on another.
+func TestReserves_ProportionalToTheCap(t *testing.T) {
+	tests := []struct {
+		max                int
+		wantNew, wantChurn int
+	}{
+		{max: 100, wantNew: 15, wantChurn: 25}, // the historical fixed values
+		{max: 250, wantNew: 37, wantChurn: 62},
+		{max: 500, wantNew: 75, wantChurn: 125},
+		{max: 20, wantNew: 4, wantChurn: 6}, // floors, not 3 and 5
+	}
+	for _, tc := range tests {
+		if got := ReserveNewFor(tc.max); got != tc.wantNew {
+			t.Errorf("ReserveNewFor(%d) = %d, want %d", tc.max, got, tc.wantNew)
+		}
+		if got := ReserveChurnFor(tc.max); got != tc.wantChurn {
+			t.Errorf("ReserveChurnFor(%d) = %d, want %d", tc.max, got, tc.wantChurn)
+		}
+		if ReserveChurnFor(tc.max) < ReserveNewFor(tc.max) {
+			t.Errorf("cap %d: churn reserve %d < new reserve %d — background refreshes must yield "+
+				"their headroom BEFORE first-quote subscriptions do",
+				tc.max, ReserveChurnFor(tc.max), ReserveNewFor(tc.max))
+		}
+	}
+
+	// A pathologically small cap must still leave one grantable line rather
+	// than refusing everything.
+	l := NewLedger(3, 5)
+	if !l.GrantDiscretionaryNew(1) {
+		t.Fatal("a 3-line cap granted nothing at all — the reserve must never reach the cap")
+	}
+}
+
+// TestNewLedgerWithReserves_Overrides verifies the configured percentages
+// actually move the thresholds, since the whole point of exposing them is that
+// an account whose entitlement differs from the library's assumptions can say so.
+func TestNewLedgerWithReserves_Overrides(t *testing.T) {
+	l := NewLedgerWithReserves(100, 50, 5, 10)
+	gotNew, gotChurn := l.Reserves()
+	if gotNew != 5 || gotChurn != 10 {
+		t.Fatalf("Reserves() = (%d, %d), want (5, 10)", gotNew, gotChurn)
+	}
+
+	granted := 0
+	for i := int64(0); i < 200; i++ {
+		if l.GrantDiscretionaryChurn(i) {
+			granted++
+		}
+	}
+	if want := 100 - 10; granted != want {
+		t.Fatalf("churn grants under a 10%% override = %d, want %d", granted, want)
+	}
+
+	// Zero means "take the default", not "no reserve at all".
+	d := NewLedgerWithReserves(100, 50, 0, 0)
+	if n, c := d.Reserves(); n != ReserveNewFor(100) || c != ReserveChurnFor(100) {
+		t.Fatalf("Reserves() with zero overrides = (%d, %d), want the defaults (%d, %d)",
+			n, c, ReserveNewFor(100), ReserveChurnFor(100))
 	}
 }

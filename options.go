@@ -6,11 +6,14 @@
 //  2. ContractDetailsEnd for those reqIDs calls ReqSecDefOptParams with the
 //     real conId.
 //  3. SecurityDefinitionOptionParameter accumulates expirations/strikes from
-//     the SMART exchange only (IBKR calls this once per available exchange;
-//     non-SMART exchanges may include phantom strikes not routable via SMART).
-//  4. SecurityDefinitionOptionParameterEnd fires when all exchanges have
-//     responded; picks the nearest expiry + ATM/target-delta strike from the
-//     SMART-only strike set, then subscribes to streaming market data.
+//     the SMART exchange only (non-SMART exchanges may include phantom strikes
+//     not routable via SMART), bucketed by TRADING CLASS — IBKR calls this once
+//     per (exchange, trading class), and two classes on one underlying have
+//     different expiry calendars and different strike ladders.
+//  4. SecurityDefinitionOptionParameterEnd fires when all callbacks have
+//     responded; picks ONE trading class, then the nearest expiry +
+//     ATM/target-delta strike from that class alone, then subscribes to
+//     streaming market data.
 //  5. If IB returns error 200 for both legs of a strike, handleOptionMktError
 //     automatically retries with the next nearest strike.
 //  6. TickPrice for option reqIDs updates cached prices and publishes
@@ -98,15 +101,129 @@ type optConIDReq struct {
 	requestedAt time.Time
 }
 
-// optChainReq tracks one pending reqSecDefOptParams call. IBKR may send
-// multiple SecurityDefinitionOptionParameter callbacks for the same reqID
-// (one per available exchange), so we merge them.
+// optChainReq tracks one pending reqSecDefOptParams call. IBKR sends one
+// SecurityDefinitionOptionParameter callback per (exchange, TRADING CLASS) —
+// not merely per exchange, which is what the old comment here claimed and the
+// old code assumed. One underlying routinely has several SMART classes: the
+// standard one, plus adjusted/mini classes from corporate actions, each with
+// its OWN expiry calendar and its OWN strike ladder.
+//
+// Flattening them into one expirations+strikes pair produces contracts that do
+// not exist: an expiry taken from class A paired with a strike taken from
+// class B. On 2026-08-17 that put MSFT on expiry 20260820 with the $5 ladder of
+// a different class, IB answered error 200 to every strike from 405 to 580,
+// and the retry walk finally settled on strike 400 — δ≈1.00, no bid, no ask,
+// untradable, and (because it then counted as an existing leg) unable to move
+// off it for the rest of the session.
+//
+// So the callbacks are bucketed per class and exactly one class is chosen at
+// the end. An expiry and a strike can then only ever come from the same ladder.
 type optChainReq struct {
 	chain       chainKey
 	waiters     []int
-	expirations []string
-	strikes     []float64
+	classes     map[string]*chainClass
 	requestedAt time.Time
+}
+
+// chainClass is one trading class's own view of an underlying's option chain.
+type chainClass struct {
+	tradingClass string
+	multiplier   string
+	expirations  []string
+	strikes      []float64
+}
+
+// mergeChainParams folds one SecurityDefinitionOptionParameter callback into
+// the class, deduplicating — IB may repeat a class across several callbacks.
+func (c *chainClass) mergeChainParams(expirations []string, strikes []float64) {
+	expSet := make(map[string]bool, len(c.expirations))
+	for _, e := range c.expirations {
+		expSet[e] = true
+	}
+	for _, e := range expirations {
+		if !expSet[e] {
+			expSet[e] = true
+			c.expirations = append(c.expirations, e)
+		}
+	}
+
+	strikeSet := make(map[float64]bool, len(c.strikes))
+	for _, st := range c.strikes {
+		strikeSet[st] = true
+	}
+	for _, st := range strikes {
+		if !strikeSet[st] {
+			strikeSet[st] = true
+			c.strikes = append(c.strikes, st)
+		}
+	}
+}
+
+// standardMultiplier is the deliverable of an ordinary equity option: 100
+// shares. A class with any other multiplier is a mini or an adjusted contract
+// from a corporate action — a different instrument, never what a watchlist row
+// asking for a δ-target strike means.
+const standardMultiplier = "100"
+
+// pickChainClass chooses the one trading class whose expiry calendar and
+// strike ladder the selection will use, preferring the underlying's own
+// standard class. Returns the choice and the classes passed over, so the
+// decision is visible in option-chain.log rather than implicit.
+//
+// Order: the class named after the symbol at multiplier 100; else the richest
+// multiplier-100 class; else the richest class of any multiplier (reported by
+// the caller as a warning — selecting strikes on a non-standard deliverable is
+// a last resort, but it beats returning nothing).
+func pickChainClass(symbol string, classes map[string]*chainClass) (chosen *chainClass, ignored []*chainClass) {
+	names := make([]string, 0, len(classes))
+	for name := range classes {
+		names = append(names, name)
+	}
+	sort.Strings(names) // deterministic tie-breaking
+
+	better := func(a, b *chainClass) bool {
+		if a.tradingClass == symbol && b.tradingClass != symbol {
+			return true
+		}
+		if a.tradingClass != symbol && b.tradingClass == symbol {
+			return false
+		}
+		aStd, bStd := a.multiplier == standardMultiplier, b.multiplier == standardMultiplier
+		if aStd != bStd {
+			return aStd
+		}
+		return len(a.expirations) > len(b.expirations)
+	}
+
+	for _, name := range names {
+		c := classes[name]
+		if len(c.expirations) == 0 || len(c.strikes) == 0 {
+			continue
+		}
+		if chosen == nil || better(c, chosen) {
+			chosen = c
+		}
+	}
+	for _, name := range names {
+		if c := classes[name]; c != chosen {
+			ignored = append(ignored, c)
+		}
+	}
+	return chosen, ignored
+}
+
+// describeChainClasses renders classes for a log line: "MSFT1 mult=100 (18 exp,
+// 62 strikes)".
+func describeChainClasses(classes []*chainClass) string {
+	if len(classes) == 0 {
+		return "none"
+	}
+	parts := make([]string, 0, len(classes))
+	for _, c := range classes {
+		parts = append(parts, fmt.Sprintf("%s mult=%s (%d exp, %d strikes)",
+			c.tradingClass, c.multiplier, len(c.expirations), len(c.strikes)))
+	}
+	return strings.Join(parts, ", ")
 }
 
 // legKey identifies one option contract — the unit of market-data
@@ -200,17 +317,59 @@ type pendingSwap struct {
 // anyway (on any usable price).
 const pendingPromoteGrace = 4 * time.Second
 
+// maxStrikeRetries bounds how many next-nearest strikes one selection may try
+// after error 200. The walk is unbounded work in the error path: each failure
+// fires the next ReqMktData synchronously from the callback, so an expiry whose
+// strikes are simply not listed produces a burst against IB's pacing limits.
+// On 2026-08-17 MSFT issued 35 subscribe attempts in 8 seconds.
+const maxStrikeRetries = 4
+
+// maxStrikeRetryDistancePct bounds how far from the underlying a retry may
+// wander, as a percentage. This is the bound that matters: the walk exists to
+// step over a gap in the ladder, not to find *any* contract that resolves. The
+// MSFT walk ran from 490 down to 400 against a $485 underlying and ended
+// holding a δ≈1.00 leg with no bid and no ask — nominally a success, in
+// practice an untradable row that could no longer be corrected. Refusing to
+// subscribe is the better answer: a blank row states the problem, and the
+// selector stays legless so its next attempt is a first-quote grant.
+const maxStrikeRetryDistancePct = 10.0
+
 // optStrikeRetry holds the sorted candidate strike list for a selector so
 // that if the nearest strike fails with error 200, the next nearest is tried
-// automatically.
+// automatically — subject to the two bounds above.
 type optStrikeRetry struct {
 	selectorID int
 	symbol     string
 	right      string
 	expiry     string
-	strikes    []float64
+	strikes    []float64 // sorted by distance from undPrice, nearest first
 	nextIdx    int
+	undPrice   float64
+	attempts   int
+	tried      []float64
 	busIdxs    []int
+}
+
+// nextCandidate advances to the next strike worth trying. ok is false when this
+// selection gives up, with reason naming which bound stopped it.
+func (r *optStrikeRetry) nextCandidate() (strike float64, reason string, ok bool) {
+	if r.attempts >= maxStrikeRetries {
+		return 0, fmt.Sprintf("stopped after %d retries", maxStrikeRetries), false
+	}
+	if r.nextIdx >= len(r.strikes) {
+		return 0, "no candidate strikes left in the chain", false
+	}
+	cand := r.strikes[r.nextIdx]
+	r.nextIdx++
+	// strikes is sorted nearest-first, so the first candidate outside the band
+	// means every remaining one is further still.
+	if r.undPrice > 0 && math.Abs(cand-r.undPrice)/r.undPrice*100 > maxStrikeRetryDistancePct {
+		return 0, fmt.Sprintf("nearest untried strike %.2f is more than %.0f%% from the underlying %.2f",
+			cand, maxStrikeRetryDistancePct, r.undPrice), false
+	}
+	r.attempts++
+	r.tried = append(r.tried, cand)
+	return cand, "", true
 }
 
 // deltaCandidate tracks one strike subscription used during delta-based
@@ -953,9 +1112,11 @@ func (s *Session) handleConIDContractDetailsEnd(reqID int64) bool {
 
 // SecurityDefinitionOptionParameter accumulates exchange callbacks for one
 // reqSecDefOptParams call. Only the SMART exchange response is kept — it
-// contains exactly the strikes routable via SMART for market data and orders.
+// contains exactly the strikes routable via SMART for market data and orders —
+// and each callback is filed under its own trading class, never merged across
+// classes (see optChainReq).
 func (s *Session) SecurityDefinitionOptionParameter(reqID int64, exchange string, underlyingConID int64, tradingClass string, multiplier string, expirations []string, strikes []float64) {
-	if s.handleOptionQuerySecDefOptParams(reqID, exchange, expirations, strikes) {
+	if s.handleOptionQuerySecDefOptParams(reqID, exchange, tradingClass, multiplier, expirations, strikes) {
 		return
 	}
 	if exchange != "SMART" {
@@ -968,28 +1129,15 @@ func (s *Session) SecurityDefinitionOptionParameter(reqID int64, exchange string
 		s.optChain.mu.Unlock()
 		return
 	}
-
-	expSet := make(map[string]bool, len(req.expirations))
-	for _, e := range req.expirations {
-		expSet[e] = true
+	if req.classes == nil {
+		req.classes = make(map[string]*chainClass)
 	}
-	for _, e := range expirations {
-		if !expSet[e] {
-			expSet[e] = true
-			req.expirations = append(req.expirations, e)
-		}
+	cls, ok := req.classes[tradingClass]
+	if !ok {
+		cls = &chainClass{tradingClass: tradingClass, multiplier: multiplier}
+		req.classes[tradingClass] = cls
 	}
-
-	strikeSet := make(map[float64]bool, len(req.strikes))
-	for _, st := range req.strikes {
-		strikeSet[st] = true
-	}
-	for _, st := range strikes {
-		if !strikeSet[st] {
-			strikeSet[st] = true
-			req.strikes = append(req.strikes, st)
-		}
-	}
+	cls.mergeChainParams(expirations, strikes)
 	s.optChain.mu.Unlock()
 }
 
@@ -1011,16 +1159,26 @@ func (s *Session) SecurityDefinitionOptionParameterEnd(reqID int64) {
 	chain := req.chain
 	waiters := append([]int(nil), req.waiters...)
 	symbol := chain.symbol
-	expirations := append([]string(nil), req.expirations...)
-	strikes := append([]float64(nil), req.strikes...)
+	chosen, ignored := pickChainClass(symbol, req.classes)
 	s.optChain.mu.Unlock()
 
-	s.optionLog.Printf("Option chain end: %s delay=%d (sels=%v) — %d SMART expirations, %d SMART strikes",
-		symbol, chain.optionDelay, waiters, len(expirations), len(strikes))
-
-	if len(expirations) == 0 || len(strikes) == 0 {
+	if chosen == nil {
+		s.optionLog.Printf("Option chain end: %s delay=%d (sels=%v) — no usable SMART trading class (saw: %s)",
+			symbol, chain.optionDelay, waiters, describeChainClasses(ignored))
 		s.logger.Printf("Option chain: %s — no SMART strikes/expirations found, skipping", symbol)
 		return
+	}
+
+	expirations := append([]string(nil), chosen.expirations...)
+	strikes := append([]float64(nil), chosen.strikes...)
+
+	s.optionLog.Printf("Option chain end: %s delay=%d (sels=%v) — class=%s mult=%s: %d expirations, %d strikes (ignored: %s)",
+		symbol, chain.optionDelay, waiters, chosen.tradingClass, chosen.multiplier,
+		len(expirations), len(strikes), describeChainClasses(ignored))
+
+	if chosen.multiplier != standardMultiplier {
+		s.logger.Printf("Option chain: %s — no standard (multiplier %s) SMART trading class; selecting strikes on %s mult=%s instead",
+			symbol, standardMultiplier, chosen.tradingClass, chosen.multiplier)
 	}
 
 	if filtered := wholeDollarStrikes(strikes); len(filtered) < len(strikes) {
@@ -1086,7 +1244,7 @@ func (s *Session) selectStrike(sel selector, snap chainSnapshot) {
 		s.optChain.mu.Lock()
 		s.optChain.retries[sel.id] = &optStrikeRetry{
 			selectorID: sel.id, symbol: sel.symbol, right: sel.right, expiry: expiry,
-			strikes: snap.strikes, nextIdx: 1, busIdxs: sel.busIdxs,
+			strikes: snap.strikes, nextIdx: 1, undPrice: undPrice, busIdxs: sel.busIdxs,
 		}
 		s.optChain.mu.Unlock()
 	}
@@ -1507,14 +1665,32 @@ func (s *Session) pointSelectorAt(sel selector, want legKey, fallback bool) {
 
 	reqID := s.optChain.nextMktID
 	s.optChain.nextMktID++
-	_, hadLeg := s.optChain.selCurrent[sel.id]
+	cur, hadLeg := s.optChain.selCurrent[sel.id]
+	// "Has a leg" and "has a quote" are different questions, and the tier below
+	// turns on the second one.
+	quoting := false
+	if hadLeg {
+		if leg, ok := s.optChain.legs[cur]; ok {
+			quoting = leg.quoteComplete()
+		}
+	}
 	s.optChain.mu.Unlock()
 
 	// (3) a fresh contract needs a line. Replacing a leg this selector already
-	// displays is churn (the lowest tier — losing the refresh costs nothing
-	// real); a selector with no leg at all is a first-quote request.
+	// displays AND that is genuinely quoting is churn (the lowest tier — losing
+	// the refresh costs nothing real). Anything else is a first-quote request:
+	// a selector with no leg, and equally a selector whose leg has never
+	// carried a two-sided quote, which is precisely what CategoryDiscretionaryNew
+	// is defined to mean.
+	//
+	// Grading the second case as churn is what made 2026-08-17's MSFT permanent.
+	// Its retry walk left it on a δ≈1.00 strike with no bid and no ask; because
+	// that counted as "has a leg", every attempt to move back to the δ 0.55
+	// strike asked for the churn tier, which is refused from 75/100 lines
+	// upward. The account sat at 79. A row that has never had a usable quote
+	// must not be starved by the tier meant to protect rows that already have one.
 	var granted bool
-	if hadLeg {
+	if quoting {
 		granted = s.mdLines.GrantDiscretionaryChurn(reqID)
 	} else {
 		granted = s.mdLines.GrantDiscretionaryNew(reqID)
@@ -1657,8 +1833,9 @@ func (s *Session) cancelLines(reqIDs []int64) {
 //
 // The line is granted as a first-quote request, not churn, even though a leg
 // exists: there is no WORKING line for this contract, and churn is refused
-// first under pressure (ReserveChurn 25 vs ReserveNew 15) — exactly when a
-// dead leg squatting on a line costs the most. If even that is refused, the
+// first under pressure (mdlines.ReserveChurnPct vs ReserveNewPct) — exactly
+// when a dead leg squatting on a line costs the most. pointSelectorAt reasons
+// the same way about an unquoted leg. If even that is refused, the
 // dead leg's own line is released to make room, since a brief gap where a buy
 // fails loudly beats filling one against a quote that stopped hours ago.
 func (s *Session) forceResubscribeLeg(key legKey, deltaSource string) {
@@ -1746,6 +1923,10 @@ func (s *Session) releaseOrphanedProbeCandidate(reqID int64) {
 // ResolveEntryStrike.
 func (s *Session) resolveDeltaCandidates(sel selector) (OptionQuote, EntryStrikeResult) {
 	symbol, right := sel.symbol, sel.right
+	// Read before the lock: getUnderlyingPrice takes the quote mutexes, which
+	// sit below optChain.mu, and nothing here needs it to be consistent with
+	// the chain state.
+	undPrice := s.getUnderlyingPrice(symbol)
 
 	s.optChain.mu.Lock()
 	res, ok := s.optChain.deltaRes[sel.id]
@@ -1789,7 +1970,6 @@ func (s *Session) resolveDeltaCandidates(sel selector) (OptionQuote, EntryStrike
 		if iv <= 0 {
 			iv = defaultFallbackIV
 		}
-		undPrice := s.getUnderlyingPrice(symbol)
 		estStrike := approximateStrikeForDelta(allStrikes, undPrice, iv, targetDelta, expiry, right)
 		s.optionLog.Printf("Option delta resolve: %s %s (sel=%d) — %s (%s), estimating strike=%.2f via target delta %.2f (iv=%.4f)",
 			symbol, right, sel.id, failure.Reason, failure.Detail, estStrike, targetDelta, iv)
@@ -1840,7 +2020,7 @@ func (s *Session) resolveDeltaCandidates(sel selector) (OptionQuote, EntryStrike
 
 	s.optChain.retries[sel.id] = &optStrikeRetry{
 		selectorID: sel.id, symbol: symbol, right: right, expiry: res.expiry,
-		strikes: res.allStrikes, nextIdx: 1, busIdxs: res.busIdxs,
+		strikes: res.allStrikes, nextIdx: 1, undPrice: undPrice, busIdxs: res.busIdxs,
 	}
 	s.optChain.mu.Unlock()
 
@@ -2210,25 +2390,31 @@ func (s *Session) handleOptionMktError(reqID int64, errStr string) bool {
 
 	// Each holding selector retries onto its own next-nearest strike. They are
 	// independent: one selector exhausting its candidate list says nothing
-	// about another's.
+	// about another's. The walk is bounded — see optStrikeRetry.nextCandidate.
 	type retryPlan struct {
 		sel    selector
 		strike float64
 		expiry string
 	}
+	type retryGaveUp struct {
+		selID  int
+		expiry string
+		reason string
+		tried  []float64
+	}
 	var plans []retryPlan
+	var gaveUp []retryGaveUp
 	for _, selID := range holders {
 		retry, hasRetry := s.optChain.retries[selID]
 		if !hasRetry {
 			continue
 		}
-		if retry.nextIdx >= len(retry.strikes) {
+		nextStrike, reason, ok := retry.nextCandidate()
+		if !ok {
 			delete(s.optChain.retries, selID)
-			s.logger.Printf("Option: %s %s (sel=%d) — all candidate strikes exhausted for expiry=%s, giving up", symbol, right, selID, retry.expiry)
+			gaveUp = append(gaveUp, retryGaveUp{selID, retry.expiry, reason, retry.tried})
 			continue
 		}
-		nextStrike := retry.strikes[retry.nextIdx]
-		retry.nextIdx++
 		if sel, ok := s.selectorByIDLocked(selID); ok {
 			plans = append(plans, retryPlan{sel, nextStrike, retry.expiry})
 		}
@@ -2238,6 +2424,16 @@ func (s *Session) handleOptionMktError(reqID int64, errStr string) bool {
 	for _, p := range plans {
 		s.optionLog.Printf("Option: %s %s (sel=%d) — retrying with next nearest strike=%.2f expiry=%s", symbol, right, p.sel.id, p.strike, p.expiry)
 		s.pointSelectorAt(p.sel, legKey{symbol, right, p.strike, p.expiry}, true)
+	}
+	// Giving up leaves the selector with NO leg (forgetLegLocked above already
+	// cleared selCurrent), which is the point: its row goes blank rather than
+	// showing a contract nobody asked for, and its next rotation attempt is a
+	// first-quote grant instead of the churn tier a stuck leg would have forced.
+	for _, g := range gaveUp {
+		s.optionLog.Printf("Option: WARNING %s %s (sel=%d) — giving up on expiry=%s: %s (tried %v); this row has NO option data until the next chain refresh",
+			symbol, right, g.selID, g.expiry, g.reason, g.tried)
+		s.logger.Printf("Option: %s %s (sel=%d) — no listed strike for expiry=%s: %s (tried %v)",
+			symbol, right, g.selID, g.expiry, g.reason, g.tried)
 	}
 	return true
 }

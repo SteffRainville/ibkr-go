@@ -41,10 +41,14 @@ func TestPointSelectorAt_SkipsWhenStrikeUnchanged(t *testing.T) {
 // so it must still try to grant a line; and (2) that attempt is routed to
 // GrantDiscretionaryChurn, not GrantDiscretionaryNew, so saturating the ledger
 // to exactly the churn threshold refuses it right there.
+//
+// The seeded leg carries a two-sided quote deliberately: churn means "refresh
+// something that is already working", and a leg with no bid and no ask is not
+// working. See TestPointSelectorAt_UnquotedLegTakesNewTier.
 func TestPointSelectorAt_ChurnRefusedAtChurnThreshold(t *testing.T) {
 	s := newRotationTestSession(nil)
 	s.mdLines = mdlines.NewLedger(100, 50)
-	for i := int64(0); i < int64(100-mdlines.ReserveChurn); i++ {
+	for i := int64(0); i < int64(100-mdlines.ReserveChurnFor(100)); i++ {
 		if !s.mdLines.GrantDiscretionaryChurn(i) {
 			t.Fatalf("setup: churn grant %d refused before reaching the churn threshold", i)
 		}
@@ -52,7 +56,8 @@ func TestPointSelectorAt_ChurnRefusedAtChurnThreshold(t *testing.T) {
 	usedBefore, _ := s.mdLines.Status()
 
 	sel := seedSelector(s, selector{id: 5, symbol: "QQQ", right: "call", targetDelta: 0.60, busIdxs: []int{0}})
-	seedLeg(s, lk("QQQ", "call", 480, "20260727"), legOpts{reqID: 1, selectors: []int{sel.id}})
+	seedLeg(s, lk("QQQ", "call", 480, "20260727"), legOpts{reqID: 1, selectors: []int{sel.id},
+		price: 8.5, bid: 8.4, ask: 8.6})
 
 	s.pointSelectorAt(sel, lk("QQQ", "call", 485, "20260727"), true)
 
@@ -62,6 +67,54 @@ func TestPointSelectorAt_ChurnRefusedAtChurnThreshold(t *testing.T) {
 	usedAfter, _ := s.mdLines.Status()
 	if usedAfter != usedBefore {
 		t.Fatalf("ledger usage changed from %d to %d — a refused grant must not touch the ledger", usedBefore, usedAfter)
+	}
+}
+
+// TestPointSelectorAt_UnquotedLegTakesNewTier is the regression for the second
+// half of the 2026-08-17 MSFT incident — the half that made it permanent.
+//
+// A bad strike guess left MSFT displaying a contract IB never quoted: no bid,
+// no ask, δ≈1.00 against a target of 0.55. Because the tier was chosen on "does
+// this selector have a leg", every attempt to move back to a real strike asked
+// for the churn tier, which is refused from the churn reserve upward. The
+// account sat just past that line all day, so the row could not be repaired for
+// the rest of the session.
+//
+// A leg that has never carried a two-sided quote is precisely what
+// CategoryDiscretionaryNew is defined to mean, so it must take that tier and
+// keep working in the band between the two reserves.
+func TestPointSelectorAt_UnquotedLegTakesNewTier(t *testing.T) {
+	s := withOfflineClient(newRotationTestSession(nil))
+	s.buses = []*eventbus.Bus{eventbus.New()}
+	s.mdLines = mdlines.NewLedger(100, 50)
+	// Saturate exactly to the churn threshold: churn is now refused, first-quote
+	// still has the band up to the new threshold.
+	for i := int64(0); i < int64(100-mdlines.ReserveChurnFor(100)); i++ {
+		if !s.mdLines.GrantDiscretionaryChurn(i) {
+			t.Fatalf("setup: churn grant %d refused before reaching the churn threshold", i)
+		}
+	}
+	if s.mdLines.GrantDiscretionaryChurn(999) {
+		t.Fatal("setup: churn is still being granted — the ledger is not at the churn threshold")
+	}
+
+	sel := seedSelector(s, selector{id: 5, symbol: "MSFT", right: "call", targetDelta: 0.55, busIdxs: []int{0}})
+	// The stuck leg: subscribed, ticking a price, but never a two-sided quote.
+	seedLeg(s, lk("MSFT", "call", 400, "20260820"), legOpts{
+		reqID: 1, selectors: []int{sel.id}, price: 94.42, delta: 0.9999,
+	})
+
+	want := lk("MSFT", "call", 485, "20260820")
+	s.pointSelectorAt(sel, want, true)
+
+	if _, _, ok := legHolders(s, want); !ok {
+		t.Fatal("the selector could not escape its unquoted leg — a row with no quote must not be " +
+			"starved by the tier that protects rows which already have one")
+	}
+	// The old leg stays until the replacement quotes (pendingSwap), so the
+	// selector still displays it — the escape is the new subscription existing.
+	if got := legCount(s); got != 2 {
+		t.Fatalf("legs = %d, want 2 (the stuck leg plus the replacement warming into place)", got)
 	}
 }
 
@@ -82,7 +135,7 @@ func TestPointSelectorAt_RefusedLineSharesExistingLeg(t *testing.T) {
 	ch1 := bus1.Subscribe(eventbus.KindOptionData)
 
 	s.mdLines = mdlines.NewLedger(100, 50)
-	for i := int64(0); i < int64(100-mdlines.ReserveNew); i++ {
+	for i := int64(0); i < int64(100-mdlines.ReserveNewFor(100)); i++ {
 		s.mdLines.GrantDiscretionaryNew(i)
 	}
 
