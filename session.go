@@ -752,9 +752,21 @@ func (s *Session) Error(reqID int64, errTime int64, errCode int64, errString str
 		s.orders.orderMu.Lock()
 		action, isOrder := s.orders.orderAction[reqID]
 		route := s.orders.orderRoutes[reqID]
+		// The BARE symbol, not resolveReqID's "MU (order)" display label: this
+		// one goes into the typed payload below, where the consumer keys a
+		// position map by it. Publishing the label made every keyed lookup
+		// downstream miss silently — the rejected MU entry of 2026-08-17 sat on
+		// the dashboard as "pending" for 5½ minutes because MarkPositionFailed
+		// was called with a symbol no map could ever hold. Falls back to the
+		// label only if the map has already forgotten the order, which cannot
+		// happen while orderAction still has it (both are deleted together).
+		orderSym, haveSym := s.orders.orderSymbol[reqID]
 		s.orders.orderMu.Unlock()
 		if isOrder {
 			s.settleInFlightSell(reqID)
+			if !haveSym {
+				orderSym = sym
+			}
 
 			if s.opts.OnError != nil {
 				s.opts.OnError(ErrorEvent{
@@ -766,12 +778,12 @@ func (s *Session) Error(reqID int64, errTime int64, errCode int64, errString str
 				route.bus.Publish(eventbus.Event{
 					Kind: eventbus.KindOrderRejected,
 					Payload: eventbus.OrderRejected{
-						OrderID: reqID, Symbol: sym, Tag: route.tag, Action: action,
+						OrderID: reqID, Symbol: orderSym, Tag: route.tag, Action: action,
 						Code: errCode, Message: errString,
 					},
 				})
 			}
-			s.logger.Printf("Order %d for %s (%s) rejected: %s", reqID, sym, action, errString)
+			s.logger.Printf("Order %d for %s (%s) rejected: %s", reqID, orderSym, action, errString)
 		}
 	}
 

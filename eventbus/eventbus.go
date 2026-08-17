@@ -107,6 +107,13 @@ type CommissionReport struct {
 // OrderRejected is published when the broker rejects a placed order.
 type OrderRejected struct {
 	OrderID int64
+	// Symbol is the bare contract symbol ("MU"), identical to what
+	// OrderFilled carries — consumers key position maps by it. It is NEVER a
+	// display string: the session's error path also builds a decorated label
+	// ("MU (order)") for logs, and publishing that here made every keyed
+	// lookup downstream miss without failing (2026-08-17: a rejected entry
+	// stayed "pending" on the dashboard because the position it named did not
+	// exist under that key). Message is the field for human-facing text.
 	Symbol  string
 	Tag     string
 	Action  string // "BUY" | "SELL" | "SHORT" | "COVER"
