@@ -36,29 +36,29 @@ func TestLegHealthAt(t *testing.T) {
 		want                              legHealth
 	}{
 		{
-			name: "ticking normally",
+			name:         "ticking normally",
 			subscribedAt: ago(time.Hour), lastTickAt: ago(2 * time.Second), lastAny: ago(time.Second),
 			want: legHealthy,
 		},
 		{
-			name: "just subscribed, no tick yet",
+			name:         "just subscribed, no tick yet",
 			subscribedAt: ago(3 * time.Second), lastTickAt: time.Time{}, lastAny: ago(time.Second),
 			want: legWarming,
 		},
 		{
-			name: "zero subscribedAt is never condemned",
+			name:         "zero subscribedAt is never condemned",
 			subscribedAt: time.Time{}, lastTickAt: time.Time{}, lastAny: ago(time.Second),
 			want: legWarming,
 		},
 		{
-			name: "past warmup, never ticked, feed alive",
+			name:         "past warmup, never ticked, feed alive",
 			subscribedAt: ago(5 * time.Minute), lastTickAt: time.Time{}, lastAny: ago(time.Second),
 			want: legSilent,
 		},
 		{
 			// The incident: ticked for a while, then IB stopped, while every
 			// other leg kept flowing.
-			name: "ticked then went silent, feed alive",
+			name:         "ticked then went silent, feed alive",
 			subscribedAt: ago(3 * time.Hour), lastTickAt: ago(2 * time.Hour), lastAny: ago(time.Second),
 			want: legStale,
 		},
@@ -66,18 +66,18 @@ func TestLegHealthAt(t *testing.T) {
 			// The false-positive guard. Identical to the case above except the
 			// whole feed is quiet — a halt, an outage, a weekend. Nothing can
 			// be concluded about this leg specifically.
-			name: "silent but the whole feed is silent",
+			name:         "silent but the whole feed is silent",
 			subscribedAt: ago(3 * time.Hour), lastTickAt: ago(2 * time.Hour), lastAny: ago(2 * time.Hour),
 			want: legFeedQuiet,
 		},
 		{
-			name: "no peer ticks recorded at all",
+			name:         "no peer ticks recorded at all",
 			subscribedAt: ago(3 * time.Hour), lastTickAt: ago(2 * time.Hour), lastAny: time.Time{},
 			want: legFeedQuiet,
 		},
 		{
 			// Silence that would be fatal during RTH is normal at 03:00.
-			name: "off-RTH uses the wider threshold",
+			name:         "off-RTH uses the wider threshold",
 			subscribedAt: ago(time.Hour), lastTickAt: ago(5 * time.Minute), lastAny: ago(time.Second),
 			want: legHealthy,
 		},
@@ -99,58 +99,24 @@ func TestLegHealthAt(t *testing.T) {
 	}
 }
 
-// TestShouldSkipReEstimate_StaleLegIsNotTrusted is the crux regression for the
-// 2026-08-03 incident. QQQ's put froze at delta -0.5672 against a 0.60 target
-// — drift 0.033, inside the 0.05 tolerance — so the old guard skipped
-// re-estimating it on every single rotation pass for the rest of the session.
-// The frozen delta was itself the reason the dead leg never got repaired.
-func TestShouldSkipReEstimate_StaleLegIsNotTrusted(t *testing.T) {
-	now := rthNoon()
-	const targetDelta = 0.60
-
-	newSessionWithLeg := func(lastTickAt time.Time, td float64) (*Session, selector) {
-		s := newRotationTestSession(nil)
-		sel := seedSelector(s, selector{id: 19, symbol: "QQQ", right: "put", targetDelta: td, busIdxs: []int{0}})
-		seedLeg(s, lk("QQQ", "put", 693, "20260805"), legOpts{
-			reqID: 1, selectors: []int{sel.id}, delta: -0.5672, deltaSource: "matched",
-			subscribedAt: now.Add(-3 * time.Hour), lastTickAt: lastTickAt,
-		})
-		s.optChain.lastAnyOptionTick = now.Add(-time.Second) // feed demonstrably alive
-		return s, sel
-	}
-
-	t.Run("stale leg must not be trusted", func(t *testing.T) {
-		s, sel := newSessionWithLeg(now.Add(-2*time.Hour), targetDelta)
-		skip, reason := s.shouldSkipReEstimateLocked(sel, now)
-		if skip {
-			t.Fatalf("skip = true for a leg that has not ticked in 2h — the frozen delta must not justify skipping (reason: %s)", reason)
-		}
-		if reason == "" {
-			t.Error("a forced re-estimate must explain itself in the log")
-		}
-	})
-
-	t.Run("healthy leg still skips", func(t *testing.T) {
-		s, sel := newSessionWithLeg(now.Add(-2*time.Second), targetDelta)
-		skip, _ := s.shouldSkipReEstimateLocked(sel, now)
-		if !skip {
-			t.Fatal("skip = false for a live leg inside tolerance — this would churn a perfectly good strike every tick")
-		}
-	})
-
-	t.Run("drifted delta re-estimates regardless of freshness", func(t *testing.T) {
-		s, sel := newSessionWithLeg(now.Add(-2*time.Second), 0.30)
-		skip, _ := s.shouldSkipReEstimateLocked(sel, now)
-		if skip {
-			t.Fatal("skip = true for a delta far outside tolerance")
-		}
-	})
-}
+// TestShouldSkipReEstimate_StaleLegIsNotTrusted stood here. It was the crux
+// regression for the 2026-08-03 incident: QQQ's put froze at delta -0.5672
+// against a 0.60 target — drift 0.033, inside the 0.05 tolerance — so the old
+// guard skipped re-estimating it on every rotation pass for the rest of the
+// session, the frozen delta itself being the reason the dead leg was never
+// repaired.
+//
+// There is no re-estimate to skip any more. The rotation it guarded selected a
+// strike for a watchlist row; rows hold no contract now. The 2026-08-03 failure
+// mode is addressed at its root rather than by a better guard — a leg only
+// exists while a position holds it, and legHealthAt (tested above) plus
+// reapDeadOptionLegs repair it on liveness alone, never on what its cached
+// delta claims.
 
 // seedStaleLeg installs a leg that has been silent for 2h.
-func seedStaleLeg(s *Session, now time.Time, reqID int64, selectorID int, symbol, right string, strike float64) {
+func seedStaleLeg(s *Session, now time.Time, reqID int64, symbol, right string, strike float64) {
 	seedLeg(s, lk(symbol, right, strike, "20260805"), legOpts{
-		reqID: reqID, selectors: []int{selectorID},
+		reqID: reqID, pins: 1,
 		subscribedAt: now.Add(-3 * time.Hour), lastTickAt: now.Add(-2 * time.Hour),
 	})
 }
@@ -163,7 +129,7 @@ func TestPlanDeadLegRepairs_QuietFeedActsOnNothing(t *testing.T) {
 	now := rthNoon()
 	s := newRotationTestSession(nil)
 	for i := range 10 {
-		seedStaleLeg(s, now, int64(i), i, "SYM", "call", float64(100+i))
+		seedStaleLeg(s, now, int64(i), "SYM", "call", float64(100+i))
 	}
 	s.optChain.lastAnyOptionTick = now.Add(-2 * time.Hour) // whole feed quiet
 
@@ -179,7 +145,7 @@ func TestPlanDeadLegRepairs_CapsPerTick(t *testing.T) {
 	now := rthNoon()
 	s := newRotationTestSession(nil)
 	for i := range 10 {
-		seedStaleLeg(s, now, int64(i), i, "SYM", "call", float64(100+i))
+		seedStaleLeg(s, now, int64(i), "SYM", "call", float64(100+i))
 	}
 	s.optChain.lastAnyOptionTick = now.Add(-time.Second)
 
@@ -194,7 +160,7 @@ func TestPlanDeadLegRepairs_CapsPerTick(t *testing.T) {
 func TestPlanDeadLegRepairs_CooldownPreventsStorm(t *testing.T) {
 	now := rthNoon()
 	s := newRotationTestSession(nil)
-	seedStaleLeg(s, now, 1, 19, "QQQ", "put", 693)
+	seedStaleLeg(s, now, 1, "QQQ", "put", 693)
 	s.optChain.lastAnyOptionTick = now.Add(-time.Second)
 
 	if repair, _ := s.planDeadLegRepairsLocked(now); len(repair) != 1 {
@@ -223,7 +189,7 @@ func TestPlanDeadLegRepairs_NeverTickedIsNotForceResubscribed(t *testing.T) {
 	now := rthNoon()
 	s := newRotationTestSession(nil)
 	seedLeg(s, lk("THIN", "call", 50, "20260805"), legOpts{
-		reqID: 1, selectors: []int{7},
+		reqID:        1,
 		subscribedAt: now.Add(-5 * time.Minute), // past warmup, never ticked
 	})
 	s.optChain.lastAnyOptionTick = now.Add(-time.Second)
@@ -267,7 +233,7 @@ func TestPlanDeadLegRepairs_PinnedLegIsFlagged(t *testing.T) {
 func TestTickSizeStampsLegLiveness(t *testing.T) {
 	s := newRotationTestSession(nil)
 	key := lk("QQQ", "call", 480, "20260805")
-	seedLeg(s, key, legOpts{reqID: 1, selectors: []int{5}, subscribedAt: time.Now().Add(-time.Hour)})
+	seedLeg(s, key, legOpts{reqID: 1, subscribedAt: time.Now().Add(-time.Hour)})
 
 	s.TickSize(1, 0, ibapi.StringToDecimal("100"))
 

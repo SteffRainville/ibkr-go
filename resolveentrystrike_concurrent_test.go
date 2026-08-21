@@ -60,7 +60,7 @@ func TestResolveEntryStrike_SiblingInFlightWaitsInsteadOfDuplicateProbe(t *testi
 		if s.optChain.resolvedEntry == nil {
 			s.optChain.resolvedEntry = make(map[int]resolvedEntryLeg)
 		}
-		s.optChain.resolvedEntry[1] = resolvedEntryLeg{strike: 735, expiry: "20260731", delta: -0.65, at: time.Now()}
+		s.optChain.resolvedEntry[1] = resolvedEntryLeg{strike: 735, expiry: "20260731", delta: -0.65, bid: 6.50, ask: 6.60, at: time.Now()}
 		s.optChain.mu.Unlock()
 	}()
 

@@ -21,14 +21,10 @@
 package ibkr
 
 import (
-	"encoding/csv"
 	"fmt"
 	"math"
-	"os"
-	"path/filepath"
 	"slices"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -267,18 +263,17 @@ type optLeg struct {
 	// without one).
 	deltaSource string
 
-	// selectors is every selector holding this contract — whether it is the
-	// one that selector currently displays or one it is warming into (see
-	// pendingSwap). pins counts open-position holders.
+	// pins counts open-position holders, and is now the ONLY holder kind: a
+	// leg exists because some position needs its contract priced.
 	//
-	// These are the two holder kinds, and the line is released only when both
-	// are empty. Position-pinned legs have worked this way since the
-	// 2026-08-04 incident where one robot's exit cancelled a contract a
-	// sibling's still-open IWM 298 PUT was pricing its stops against;
-	// background legs get the same treatment here, since the failure is
-	// identical and the old code had no defence against it at all.
-	selectors map[int]struct{}
-	pins      int
+	// The refcount stays essential even so. It is what stopped one robot's exit
+	// cancelling a contract a sibling's still-open IWM 298 PUT was pricing its
+	// stops against (2026-08-04), and two robots holding the same contract —
+	// including a live position and its own simulated mirror — is routine.
+	//
+	// A `selectors map[int]struct{}` sat beside this, counting watchlist rows
+	// displaying the contract. Those rows no longer hold subscriptions.
+	pins int
 
 	// subscribedAt is when ReqMktData was issued for this reqID, and
 	// lastTickAt when IB last delivered ANY message for it (zero = never).
@@ -298,83 +293,12 @@ func (l *optLeg) key() legKey {
 }
 
 // held reports whether anything still wants this contract.
-func (l *optLeg) held() bool { return len(l.selectors) > 0 || l.pins > 0 }
-
-// quoteComplete reports whether the leg carries a two-sided price.
-func (l *optLeg) quoteComplete() bool { return l.bid > 0 && l.ask > 0 }
-
-// pendingSwap is one selector's in-flight move onto a different contract. The
-// selector keeps displaying its previous leg until `to` carries a complete
-// quote (or pendingPromoteGrace elapses on any usable price), so a strike roll
-// never blanks the row or leaves a buy without a price.
-type pendingSwap struct {
-	to    legKey
-	since time.Time
-}
-
-// pendingPromoteGrace bounds how long a replacement option leg may stay
-// pending waiting for a complete two-sided quote before it is promoted
-// anyway (on any usable price).
-const pendingPromoteGrace = 4 * time.Second
-
-// maxStrikeRetries bounds how many next-nearest strikes one selection may try
-// after error 200. The walk is unbounded work in the error path: each failure
-// fires the next ReqMktData synchronously from the callback, so an expiry whose
-// strikes are simply not listed produces a burst against IB's pacing limits.
-// On 2026-08-17 MSFT issued 35 subscribe attempts in 8 seconds.
-const maxStrikeRetries = 4
-
-// maxStrikeRetryDistancePct bounds how far from the underlying a retry may
-// wander, as a percentage. This is the bound that matters: the walk exists to
-// step over a gap in the ladder, not to find *any* contract that resolves. The
-// MSFT walk ran from 490 down to 400 against a $485 underlying and ended
-// holding a δ≈1.00 leg with no bid and no ask — nominally a success, in
-// practice an untradable row that could no longer be corrected. Refusing to
-// subscribe is the better answer: a blank row states the problem, and the
-// selector stays legless so its next attempt is a first-quote grant.
-const maxStrikeRetryDistancePct = 10.0
-
-// optStrikeRetry holds the sorted candidate strike list for a selector so
-// that if the nearest strike fails with error 200, the next nearest is tried
-// automatically — subject to the two bounds above.
-type optStrikeRetry struct {
-	selectorID int
-	symbol     string
-	right      string
-	expiry     string
-	strikes    []float64 // sorted by distance from undPrice, nearest first
-	nextIdx    int
-	undPrice   float64
-	attempts   int
-	tried      []float64
-	busIdxs    []int
-}
-
-// nextCandidate advances to the next strike worth trying. ok is false when this
-// selection gives up, with reason naming which bound stopped it.
-func (r *optStrikeRetry) nextCandidate() (strike float64, reason string, ok bool) {
-	if r.attempts >= maxStrikeRetries {
-		return 0, fmt.Sprintf("stopped after %d retries", maxStrikeRetries), false
-	}
-	if r.nextIdx >= len(r.strikes) {
-		return 0, "no candidate strikes left in the chain", false
-	}
-	cand := r.strikes[r.nextIdx]
-	r.nextIdx++
-	// strikes is sorted nearest-first, so the first candidate outside the band
-	// means every remaining one is further still.
-	if r.undPrice > 0 && math.Abs(cand-r.undPrice)/r.undPrice*100 > maxStrikeRetryDistancePct {
-		return 0, fmt.Sprintf("nearest untried strike %.2f is more than %.0f%% from the underlying %.2f",
-			cand, maxStrikeRetryDistancePct, r.undPrice), false
-	}
-	r.attempts++
-	r.tried = append(r.tried, cand)
-	return cand, "", true
-}
+func (l *optLeg) held() bool { return l.pins > 0 }
 
 // deltaCandidate tracks one strike subscription used during delta-based
-// strike selection. Multiple candidates are subscribed simultaneously; the
-// one closest to the target delta is promoted to a leg, the rest cancelled.
+// strike selection. Multiple candidates are subscribed simultaneously; the one
+// closest to the target delta supplies the entry quote, and ALL of them are
+// then cancelled — the winner included, since nothing displays it afterwards.
 type deltaCandidate struct {
 	selectorID int
 	symbol     string
@@ -383,6 +307,7 @@ type deltaCandidate struct {
 	expiry     string
 	reqID      int64
 	delta      float64
+	iv         float64
 	bid        float64
 	ask        float64
 	ready      bool
@@ -579,13 +504,6 @@ type optionChainTracker struct {
 	legs       map[legKey]*optLeg
 	legByReqID map[int64]legKey
 
-	// selCurrent is the contract each selector currently displays; selPending
-	// is an in-flight move onto a different one. A selector with neither has
-	// no leg yet.
-	selCurrent map[int]legKey
-	selPending map[int]pendingSwap
-
-	retries      map[int]*optStrikeRetry
 	deltaCands   map[int64]*deltaCandidate
 	deltaRes     map[int]*deltaResolution
 	rotation     []selector
@@ -639,7 +557,7 @@ type optionChainTracker struct {
 	lastProbeLaunch map[int]time.Time
 
 	// lastAttempt records when the rotation last committed to resolving a
-	// selector — i.e. resolveSelector got past the selectorResolvingLocked
+	// selector — i.e. refreshChainFor got past the selectorResolvingLocked
 	// guard and actually did the work, as opposed to being skipped because a
 	// resolution was already in flight. Read by selectorLastServicedLocked as
 	// the rotation score (see that function for why it must NOT be quote
@@ -669,14 +587,26 @@ type resubState struct {
 	attempts int
 }
 
-// resolvedEntryLeg is one selector's most recently resolved entry contract
-// (strike + expiry + the delta that won it), with the wall-clock time it
-// was resolved.
+// resolvedEntryLeg is one selector's most recently resolved entry contract —
+// strike, expiry, the delta that won it, and the two-sided quote it carried —
+// with the wall-clock time it was resolved.
+//
+// The quote is stored here rather than re-read from the quotes.Book, because
+// a probe's ticks never reach the Book (they land on a *deltaCandidate, which
+// is dropped when the probe resolves) and the winning candidate's market-data
+// line is cancelled the moment the probe finishes. There is no live feed on
+// this contract to consult afterwards — the whole point of the change — so the
+// resolution has to carry its own answer. resolvedEntryTTL (5s) is what keeps
+// that answer honest.
 type resolvedEntryLeg struct {
-	strike float64
-	expiry string
-	delta  float64
-	at     time.Time
+	strike   float64
+	expiry   string
+	delta    float64
+	iv       float64
+	bid, ask float64
+	bidTime  time.Time
+	askTime  time.Time
+	at       time.Time
 }
 
 // chainSnapshot is one (symbol, optionDelay)'s cached expiry + SMART strike
@@ -728,7 +658,7 @@ func (s *Session) requestOptionChains() {
 	s.optChain.mu.Unlock()
 
 	for _, sel := range sels {
-		s.resolveSelector(sel)
+		s.refreshChainFor(sel)
 	}
 }
 
@@ -831,12 +761,12 @@ func (s *Session) buildSelectors() []selector {
 	return fresh
 }
 
-// resolveSelector re-selects the contract one selector should track. It uses
+// refreshChainFor re-selects the contract one selector should track. It uses
 // the cached chain when there is a fresh one for this (symbol, optionDelay) —
 // selecting a strike is pure computation over the strike list and a live
 // underlying price — and otherwise fires the conId lookup that leads to one.
 // Skips when a prior resolution for the same selector is still in flight.
-func (s *Session) resolveSelector(sel selector) {
+func (s *Session) refreshChainFor(sel selector) {
 	now := time.Now()
 
 	s.optChain.mu.Lock()
@@ -851,8 +781,10 @@ func (s *Session) resolveSelector(sel selector) {
 		cached = false
 	}
 	if cached {
+		// A fresh chain IS the whole job. Nothing is selected or subscribed as
+		// a result — ResolveEntryStrike reads this snapshot when an entry
+		// actually needs a contract.
 		s.optChain.mu.Unlock()
-		s.selectStrike(sel, snap)
 		return
 	}
 
@@ -920,19 +852,31 @@ func (s *Session) selectorByIDLocked(id int) (selector, bool) {
 	return selector{}, false
 }
 
-// rotateOptionStrikes re-resolves the next selector in the rotation and
-// advances the cursor. Driven by a steady ticker so strike renewal is a
-// permanent slow rotation rather than a synchronized burst.
-func (s *Session) rotateOptionStrikes() {
+// refreshOptionChains keeps the option-chain snapshot cache warm. One selector
+// per tick, oldest-serviced first, so chain lookups stay a slow steady trickle
+// rather than a synchronized burst — and a selector whose chain is still inside
+// chainSnapshotTTL costs nothing but a map read.
+//
+// This is what ResolveEntryStrike depends on. It reads lastChainInfo and never
+// fetches a chain itself, so an entry arriving on a cold or expired snapshot
+// pays for the round trip inline. Keeping the cache warm is the difference
+// between a ~1.3s entry probe and one that also waits on a conId lookup.
+//
+// It used to do considerably more: pick a selector, re-estimate its strike from
+// the cached chain, and subscribe/roll a market-data line onto the result. That
+// was the background-leg rotation, and it is gone — along with the ATM
+// starvation, dead legs, and cross-robot eviction that came with it. What
+// remains costs no market-data lines at all.
+func (s *Session) refreshOptionChains() {
 	s.reapStuckChainRequests()
 	s.reapDeadOptionLegs()
 	s.optChain.mu.Lock()
-	sel, ok := s.pickRotationSelectorLocked()
+	sel, ok := s.pickChainRefreshSelectorLocked()
 	s.optChain.mu.Unlock()
 	if !ok {
 		return
 	}
-	s.resolveSelector(sel)
+	s.refreshChainFor(sel)
 }
 
 // chainResolutionMaxAge bounds how long a conId lookup or chain-params
@@ -944,7 +888,7 @@ func (s *Session) rotateOptionStrikes() {
 // simultaneously at startup (requestOptionChains), which produces neither a
 // success nor an error callback, so nothing else ever clears the entry.
 // Without this, those selectors' "resolving" flag never clears, permanently
-// excluding them from pickRotationSelectorLocked's oldest-first pick and
+// excluding them from pickChainRefreshSelectorLocked's oldest-first pick and
 // leaving them stuck at zero background lines for the rest of the session —
 // while the handful that did resolve become the only eligible candidates and
 // get endlessly re-picked instead.
@@ -952,7 +896,7 @@ const chainResolutionMaxAge = 20 * time.Second
 
 // reapStuckChainRequests frees any conId-lookup or chain-params request
 // older than chainResolutionMaxAge whose IB response never arrived, so the
-// next rotateOptionStrikes tick can retry instead of leaving its selectors
+// next refreshOptionChains tick can retry instead of leaving its selectors
 // stuck "resolving" forever. Logs each one loudly — this indicates a
 // request IB silently dropped, not routine behavior.
 func (s *Session) reapStuckChainRequests() {
@@ -979,9 +923,9 @@ func (s *Session) reapStuckChainRequests() {
 	}
 }
 
-// pickRotationSelectorLocked chooses the next selector to refresh, oldest
+// pickChainRefreshSelectorLocked chooses the next selector to refresh, oldest
 // data first. Must be called with s.optChain.mu held.
-func (s *Session) pickRotationSelectorLocked() (selector, bool) {
+func (s *Session) pickChainRefreshSelectorLocked() (selector, bool) {
 	n := len(s.optChain.rotation)
 	if n == 0 {
 		return selector{}, false
@@ -1206,84 +1150,21 @@ func (s *Session) SecurityDefinitionOptionParameterEnd(reqID int64) {
 
 	snap := chainSnapshot{expiry: expiry, strikes: append([]float64(nil), strikes...), at: time.Now()}
 
+	// Caching the snapshot IS the result. Every selector that queued on this
+	// round trip reads it from here on demand — at entry time, via
+	// ResolveEntryStrike. Nothing is subscribed as a consequence of a chain
+	// arriving any more: a chain tells us which contracts EXIST, which is a
+	// different question from which one we want a live price for, and only an
+	// imminent entry or an open position makes that second question worth a
+	// market-data line.
 	s.optChain.mu.Lock()
 	s.optChain.lastChainInfo[chain] = snap
-	sels := make([]selector, 0, len(waiters))
-	for _, id := range waiters {
-		if sel, ok := s.selectorByIDLocked(id); ok {
-			sels = append(sels, sel)
-		}
-	}
 	s.optChain.mu.Unlock()
-
-	// Every selector that was waiting on this chain gets served from it — the
-	// round trip they shared is exactly why they queued together.
-	for _, sel := range sels {
-		s.selectStrike(sel, snap)
-	}
 }
 
 // isATMDelta reports whether a target delta sits in the band where the library
 // refuses delta-based selection and simply takes the nearest strike.
 func isATMDelta(td float64) bool { return td >= 0.48 && td <= 0.52 }
-
-// selectStrike picks the contract one selector should track from a resolved
-// chain and subscribes it. Pure computation plus one possible subscription —
-// no IB chain round trip — which is what lets the rotation re-select a strike
-// from a cached chain.
-func (s *Session) selectStrike(sel selector, snap chainSnapshot) {
-	if len(snap.strikes) == 0 {
-		return
-	}
-	undPrice := s.getUnderlyingPrice(sel.symbol)
-	if undPrice <= 0 {
-		undPrice = snap.strikes[len(snap.strikes)/2]
-	}
-
-	setRetry := func(expiry string) {
-		s.optChain.mu.Lock()
-		s.optChain.retries[sel.id] = &optStrikeRetry{
-			selectorID: sel.id, symbol: sel.symbol, right: sel.right, expiry: expiry,
-			strikes: snap.strikes, nextIdx: 1, undPrice: undPrice, busIdxs: sel.busIdxs,
-		}
-		s.optChain.mu.Unlock()
-	}
-
-	if isATMDelta(sel.targetDelta) {
-		strike := snap.strikes[0]
-		s.optionLog.Printf("Option chain resolved: %s %s (sel=%d) expiry=%s strike=%.2f (underlying≈%.2f, ATM, subs=%v)",
-			sel.symbol, sel.right, sel.id, snap.expiry, strike, undPrice, sel.busIdxs)
-		s.pointSelectorAt(sel, legKey{sel.symbol, sel.right, strike, snap.expiry}, false)
-		setRetry(snap.expiry)
-		return
-	}
-
-	s.optChain.mu.Lock()
-	skip, skipReason := s.shouldSkipReEstimateLocked(sel, time.Now())
-	s.optChain.mu.Unlock()
-	if skip {
-		s.optionLog.Printf("Option: skipping strike re-estimate %s %s (sel=%d) — %s", sel.symbol, sel.right, sel.id, skipReason)
-		return
-	}
-	if skipReason != "" {
-		s.optionLog.Printf("Option: WARNING forcing re-estimate %s %s (sel=%d) — %s", sel.symbol, sel.right, sel.id, skipReason)
-	}
-
-	s.optChain.mu.Lock()
-	iv := s.optChain.lastIV[sel.symbol]
-	s.optChain.mu.Unlock()
-	if iv <= 0 {
-		iv = defaultFallbackIV
-	}
-	strike := approximateStrikeForDelta(snap.strikes, undPrice, iv, sel.targetDelta, snap.expiry, sel.right)
-	s.optionLog.Printf("Option chain: %s %s (sel=%d) — estimating strike=%.2f via target delta %.2f (iv=%.4f)",
-		sel.symbol, sel.right, sel.id, strike, sel.targetDelta, iv)
-	s.logDeltaMiss(sel.symbol, sel.right, sel.targetDelta, undPrice, snap.strikes, "estimate_default", strike, iv)
-	if strike > 0 {
-		s.pointSelectorAt(sel, legKey{sel.symbol, sel.right, strike, snap.expiry}, true)
-		setRetry(snap.expiry)
-	}
-}
 
 // selectITMCandidates picks up to n strikes on the ITM side of the
 // underlying. For calls, ITM = strikes below undPrice. For puts, ITM =
@@ -1324,32 +1205,6 @@ func selectITMCandidates(sortedStrikes []float64, undPrice float64, right string
 // still using this?" is the question the old (symbol, right) ownership model
 // could not ask.
 
-// attachSelectorLocked records that a selector holds a contract. Caller holds
-// s.optChain.mu.
-func (s *Session) attachSelectorLocked(key legKey, selectorID int) {
-	leg, ok := s.optChain.legs[key]
-	if !ok {
-		return
-	}
-	if leg.selectors == nil {
-		leg.selectors = make(map[int]struct{})
-	}
-	leg.selectors[selectorID] = struct{}{}
-	s.mdLines.Reclassify(leg.reqID, legCategory(leg))
-}
-
-// detachSelectorLocked drops a selector's hold on a contract and returns the
-// reqID the caller must cancel at IB, or 0 when other holders remain. Caller
-// holds s.optChain.mu.
-func (s *Session) detachSelectorLocked(key legKey, selectorID int) int64 {
-	leg, ok := s.optChain.legs[key]
-	if !ok {
-		return 0
-	}
-	delete(leg.selectors, selectorID)
-	return s.releaseLegIfUnheldLocked(leg)
-}
-
 // releaseLegIfUnheldLocked removes a leg once nothing holds it, returning the
 // reqID to cancel (0 when it is still held). Caller holds s.optChain.mu.
 func (s *Session) releaseLegIfUnheldLocked(leg *optLeg) int64 {
@@ -1364,179 +1219,12 @@ func (s *Session) releaseLegIfUnheldLocked(leg *optLeg) int64 {
 	return leg.reqID
 }
 
-// legCategory is a leg's market-data priority: the highest any of its holders
-// warrants. An open position makes the line guaranteed — a held contract must
-// never lose its feed to line pressure, whether or not a watchlist row happens
-// to point at the same strike.
-func legCategory(leg *optLeg) mdlines.Category {
-	if leg.pins > 0 {
-		return mdlines.CategoryPosition
-	}
-	return mdlines.CategoryDiscretionaryNew
-}
-
-// legDisplayBusesLocked returns the subscriber buses that must receive this
-// contract's option data: those of every selector currently DISPLAYING it. A
-// selector merely warming into it (pendingSwap) is excluded — publishing to it
-// early is exactly what the pending state exists to prevent, since the row
-// would jump to a contract that has no quote yet. Caller holds s.optChain.mu.
-func (s *Session) legDisplayBusesLocked(key legKey) []int {
-	leg, ok := s.optChain.legs[key]
-	if !ok {
-		return nil
-	}
-	var out []int
-	for selID := range leg.selectors {
-		if s.optChain.selCurrent[selID] != key {
-			continue
-		}
-		sel, ok := s.selectorByIDLocked(selID)
-		if !ok {
-			continue
-		}
-		for _, b := range sel.busIdxs {
-			if !slices.Contains(out, b) {
-				out = append(out, b)
-			}
-		}
-	}
-	sort.Ints(out) // map iteration is random; publish order must not be
-	return out
-}
-
-// selectorLegLocked returns the leg a selector currently displays. Caller
-// holds s.optChain.mu.
-func (s *Session) selectorLegLocked(selectorID int) (*optLeg, bool) {
-	key, ok := s.optChain.selCurrent[selectorID]
-	if !ok {
-		return nil, false
-	}
-	leg, ok := s.optChain.legs[key]
-	return leg, ok
-}
-
-// nearestLegForLocked returns an existing leg for want's (symbol, right) to
-// fall back on when a line cannot be granted — preferring one that actually
-// quotes, then the closest strike to what was wanted. Deterministic despite
-// random map order, so a fallback is reproducible. Caller holds s.optChain.mu.
-func (s *Session) nearestLegForLocked(want legKey) (*optLeg, bool) {
-	var best *optLeg
-	for _, leg := range s.optChain.legs {
-		if leg.symbol != want.symbol || leg.right != want.right {
-			continue
-		}
-		if best == nil {
-			best = leg
-			continue
-		}
-		if best.quoteComplete() != leg.quoteComplete() {
-			if leg.quoteComplete() {
-				best = leg
-			}
-			continue
-		}
-		bd, ld := math.Abs(best.strike-want.strike), math.Abs(leg.strike-want.strike)
-		if ld < bd || (ld == bd && leg.strike < best.strike) {
-			best = leg
-		}
-	}
-	return best, best != nil
-}
-
-// promotePendingLocked promotes a selector's warming leg to displayed once it
-// carries a complete two-sided quote — or, after pendingPromoteGrace, on any
-// usable price. Returns the reqID of the leg it replaced, when that leg lost
-// its last holder and must be cancelled. Caller holds s.optChain.mu.
-func (s *Session) promotePendingLocked(selectorID int, now time.Time) (cancel int64, promoted bool) {
-	sw, waiting := s.optChain.selPending[selectorID]
-	if !waiting {
-		return 0, false
-	}
-	leg, ok := s.optChain.legs[sw.to]
-	if !ok {
-		delete(s.optChain.selPending, selectorID) // target vanished; stay put
-		return 0, false
-	}
-	usable := leg.price > 0 || leg.bid > 0 || leg.ask > 0
-	if !leg.quoteComplete() && !(usable && now.Sub(sw.since) > pendingPromoteGrace) {
-		return 0, false
-	}
-	delete(s.optChain.selPending, selectorID)
-	old, hadOld := s.optChain.selCurrent[selectorID]
-	s.optChain.selCurrent[selectorID] = sw.to
-	if hadOld && old != sw.to {
-		return s.detachSelectorLocked(old, selectorID), true
-	}
-	return 0, true
-}
-
-// promoteWaitersLocked promotes every selector warming into key that is now
-// ready, returning the reqIDs to cancel. Caller holds s.optChain.mu.
-func (s *Session) promoteWaitersLocked(key legKey, now time.Time) []int64 {
-	leg, ok := s.optChain.legs[key]
-	if !ok {
-		return nil
-	}
-	var cancel []int64
-	for selID := range leg.selectors {
-		if sw, waiting := s.optChain.selPending[selID]; !waiting || sw.to != key {
-			continue
-		}
-		if id, ok := s.promotePendingLocked(selID, now); ok && id != 0 {
-			cancel = append(cancel, id)
-		}
-	}
-	return cancel
-}
-
-// shouldSkipReEstimateLocked reports whether the leg this selector already
-// displays is close enough to its target delta that re-estimating the strike
-// would be wasted work. reason is a human-readable explanation for the
-// caller's log line — non-empty on a forced re-estimate too, so the operator
-// can see WHY a leg that looks fine on paper is being refreshed anyway.
-// Must be called with s.optChain.mu held.
-//
-// It reads THIS SELECTOR's own leg, never whatever leg happens to exist for
-// the (symbol, right). Under the old ownership model a selector could skip
-// because a sibling's leg looked healthy — while its own buses were attached
-// to nothing — so the skip actively guaranteed the row would stay blank. That
-// is one of the three mechanisms that blanked QQQ on 2026-08-13.
-//
-// The freshness test is the other half. leg.delta is a CACHED field, written
-// only when IB delivers a greeks tick, so it freezes at its last value the
-// instant a leg goes dead — and a frozen delta near the target is
-// indistinguishable from a live one. Before this check the frozen value was
-// what justified skipping the refresh, so a dead leg permanently talked the
-// rotation out of repairing it: the 2026-08-03 incident, where QQQ's put froze
-// at δ -0.5672 against a 0.60 target (drift 0.033, inside the 0.05 tolerance)
-// and skipped re-estimation for the rest of the session while its quote aged
-// past two hours. The old log line called it "live delta", which is precisely
-// the false claim that hid the bug.
-func (s *Session) shouldSkipReEstimateLocked(sel selector, now time.Time) (skip bool, reason string) {
-	// A move onto a different contract is already under way; leave it alone
-	// rather than starting a second one on top of it.
-	if _, waiting := s.optChain.selPending[sel.id]; waiting {
-		return true, "a strike change for this selector is already in flight"
-	}
-	leg, has := s.selectorLegLocked(sel.id)
-	if !has {
-		return false, ""
-	}
-	if leg.deltaSource != "matched" {
-		return false, ""
-	}
-	if math.Abs(math.Abs(leg.delta)-sel.targetDelta) > deltaDriftTolerance {
-		return false, ""
-	}
-
-	health := legHealthAt(leg.subscribedAt, leg.lastTickAt, s.optChain.lastAnyOptionTick, now)
-	if health == legHealthy || health == legWarming {
-		return true, fmt.Sprintf("live delta %.4f (last tick %s ago) still within %.2f of target %.2f",
-			leg.delta, legAgeString(leg.lastTickAt, now), deltaDriftTolerance, sel.targetDelta)
-	}
-	return false, fmt.Sprintf("cached delta %.4f is STALE (last tick %s ago, health=%s) — refusing to trust it",
-		leg.delta, legAgeString(leg.lastTickAt, now), health)
-}
+// legCategory is a leg's market-data priority. Every leg is held by at least
+// one open position — that is the only thing that opens one — so this is
+// always guaranteed. It survives as a function because openLegLocked and the
+// resubscribe path both classify through it, and a future non-position holder
+// would need exactly one place to change.
+func legCategory(*optLeg) mdlines.Category { return mdlines.CategoryPosition }
 
 // legAgeString renders a leg's last-tick age for logs, distinguishing "never
 // ticked" from "ticked a while ago" — they call for different repairs.
@@ -1605,192 +1293,11 @@ func (s *Session) optionKeyForReqIDLocked(reqID int64) (key quotes.ContractKey, 
 func (s *Session) openLegLocked(key legKey, reqID int64, deltaSource string, now time.Time) *optLeg {
 	leg := &optLeg{
 		reqID: reqID, symbol: key.symbol, right: key.right, strike: key.strike, expiry: key.expiry,
-		deltaSource: deltaSource, selectors: make(map[int]struct{}), subscribedAt: now,
+		deltaSource: deltaSource, subscribedAt: now,
 	}
 	s.optChain.legs[key] = leg
 	s.optChain.legByReqID[reqID] = key
 	return leg
-}
-
-// pointSelectorAt moves one selector onto the contract it should be tracking.
-//
-// The four outcomes, in the order they are tried:
-//
-//  1. Already displaying it — nothing to do.
-//  2. A leg for that exact contract already exists (another selector's, or an
-//     open position's pin) — ATTACH to it. This costs no market-data line at
-//     all, which is the whole point of keying legs by contract: two robots
-//     that want the same strike want the same IB feed.
-//  3. No leg yet — subscribe one, warming into it while the selector keeps
-//     displaying whatever it had, so a strike roll never blanks the row.
-//  4. The line budget refused (3) — attach to the nearest existing leg for
-//     this (symbol, right) rather than returning empty-handed. A slightly-off
-//     shared strike is strictly better than a blank row, and this is the
-//     branch whose absence blanked QQQ for 41 minutes on 2026-08-13: the
-//     refusal path was a bare `return` with no log line and no fallback.
-//
-// fallback marks a strike chosen without a genuine live delta match.
-//
-// Repairing a leg IB has silently stopped serving is NOT one of these
-// outcomes: the contract is already right and only its subscription is dead,
-// so that path is forceResubscribeLeg, which keeps every holder attached.
-func (s *Session) pointSelectorAt(sel selector, want legKey, fallback bool) {
-	deltaSource := "matched"
-	if fallback {
-		deltaSource = "atm_fallback"
-	}
-	now := time.Now()
-
-	s.optChain.mu.Lock()
-
-	// (1) already there.
-	if cur, ok := s.optChain.selCurrent[sel.id]; ok && cur == want {
-		delete(s.optChain.selPending, sel.id) // abandon any move away from it
-		s.optChain.mu.Unlock()
-		s.optionLog.Printf("Option: skipping background refresh %s %s (sel=%d) — estimate strike unchanged at %.2f",
-			sel.symbol, sel.right, sel.id, want.strike)
-		return
-	}
-
-	// (2) somebody already holds this contract — share their line.
-	if _, exists := s.optChain.legs[want]; exists {
-		od, cancel := s.adoptLegLocked(sel, want, now)
-		s.optChain.mu.Unlock()
-		s.cancelLines(cancel)
-		s.optionLog.Printf("Option: %s %s (sel=%d) joining existing subscription at strike=%.2f expiry=%s (no new line)",
-			sel.symbol, sel.right, sel.id, want.strike, want.expiry)
-		s.publishOptionData(od)
-		return
-	}
-
-	reqID := s.optChain.nextMktID
-	s.optChain.nextMktID++
-	cur, hadLeg := s.optChain.selCurrent[sel.id]
-	// "Has a leg" and "has a quote" are different questions, and the tier below
-	// turns on the second one.
-	quoting := false
-	if hadLeg {
-		if leg, ok := s.optChain.legs[cur]; ok {
-			quoting = leg.quoteComplete()
-		}
-	}
-	s.optChain.mu.Unlock()
-
-	// (3) a fresh contract needs a line. Replacing a leg this selector already
-	// displays AND that is genuinely quoting is churn (the lowest tier — losing
-	// the refresh costs nothing real). Anything else is a first-quote request:
-	// a selector with no leg, and equally a selector whose leg has never
-	// carried a two-sided quote, which is precisely what CategoryDiscretionaryNew
-	// is defined to mean.
-	//
-	// Grading the second case as churn is what made 2026-08-17's MSFT permanent.
-	// Its retry walk left it on a δ≈1.00 strike with no bid and no ask; because
-	// that counted as "has a leg", every attempt to move back to the δ 0.55
-	// strike asked for the churn tier, which is refused from 75/100 lines
-	// upward. The account sat at 79. A row that has never had a usable quote
-	// must not be starved by the tier meant to protect rows that already have one.
-	var granted bool
-	if quoting {
-		granted = s.mdLines.GrantDiscretionaryChurn(reqID)
-	} else {
-		granted = s.mdLines.GrantDiscretionaryNew(reqID)
-	}
-
-	if !granted {
-		// (4) refused. Never return blank: share whatever leg exists.
-		used, max, _, _, _, _ := s.mdLines.StatusAll()
-		s.optChain.mu.Lock()
-		alt, haveAlt := s.nearestLegForLocked(want)
-		if !haveAlt {
-			s.optChain.mu.Unlock()
-			s.optionLog.Printf("Option: WARNING %s %s (sel=%d) could not subscribe strike=%.2f — market-data lines %d/%d and no existing %s leg to share; this row has NO option data",
-				sel.symbol, sel.right, sel.id, want.strike, used, max, sel.right)
-			return
-		}
-		altKey := alt.key()
-		od, cancel := s.adoptLegLocked(sel, altKey, now)
-		s.optChain.mu.Unlock()
-		s.cancelLines(cancel)
-		s.optionLog.Printf("Option: WARNING %s %s (sel=%d) could not subscribe strike=%.2f — market-data lines %d/%d; sharing the existing strike=%.2f leg instead",
-			sel.symbol, sel.right, sel.id, want.strike, used, max, altKey.strike)
-		s.publishOptionData(od)
-		return
-	}
-
-	s.optChain.mu.Lock()
-	// The lock was released across the grant, so another goroutine — an entry
-	// probe promoting this very contract, a sibling selector resolving onto it
-	// — may have subscribed it meanwhile. Overwriting it here would orphan its
-	// reqID: a live IB subscription with nothing left pointing at it, and a
-	// ledger line nothing will ever release.
-	if _, raced := s.optChain.legs[want]; raced {
-		od, cancel := s.adoptLegLocked(sel, want, now)
-		s.mdLines.Release(reqID)
-		s.optChain.mu.Unlock()
-		s.cancelLines(cancel)
-		s.optionLog.Printf("Option: %s %s (sel=%d) joining strike=%.2f subscribed concurrently — giving back the line just granted",
-			sel.symbol, sel.right, sel.id, want.strike)
-		s.publishOptionData(od)
-		return
-	}
-
-	leg := s.openLegLocked(want, reqID, deltaSource, now)
-	leg.selectors[sel.id] = struct{}{}
-	if hadLeg {
-		// Keep showing the old contract until this one quotes.
-		s.optChain.selPending[sel.id] = pendingSwap{to: want, since: now}
-	} else {
-		s.optChain.selCurrent[sel.id] = want
-	}
-	warming := hadLeg
-	// Built under the lock: a tick may mutate this leg the instant it is
-	// released.
-	od := optionDataFor(leg, sel.busIdxs)
-	s.optChain.mu.Unlock()
-
-	s.optionLog.Printf("Option: subscribing market data %s %s (sel=%d) strike=%.2f expiry=%s (reqID=%d, warming=%v)",
-		sel.symbol, sel.right, sel.id, want.strike, want.expiry, reqID, warming)
-	ibRight := "C"
-	if want.right == "put" {
-		ibRight = "P"
-	}
-	s.client.ReqMktData(reqID, makeOptionContract(want.symbol, ibRight, want.strike, want.expiry), "", false, false, nil)
-
-	if !warming {
-		s.publishOptionData(od)
-	}
-}
-
-// adoptLegLocked attaches a selector to an existing leg. When that leg already
-// quotes the selector switches to it immediately (there is nothing to wait
-// for); otherwise it warms into it, keeping its previous contract on screen.
-// Returns the option data to publish (empty when nothing is displayable yet)
-// and any reqID left unheld. Caller holds s.optChain.mu.
-func (s *Session) adoptLegLocked(sel selector, key legKey, now time.Time) (optionDataPublish, []int64) {
-	leg, ok := s.optChain.legs[key]
-	if !ok {
-		return optionDataPublish{}, nil
-	}
-	s.attachSelectorLocked(key, sel.id)
-
-	cur, hadLeg := s.optChain.selCurrent[sel.id]
-	if hadLeg && cur == key {
-		delete(s.optChain.selPending, sel.id)
-		return optionDataFor(leg, sel.busIdxs), nil
-	}
-	if !hadLeg || leg.quoteComplete() {
-		delete(s.optChain.selPending, sel.id)
-		s.optChain.selCurrent[sel.id] = key
-		var cancel []int64
-		if hadLeg {
-			if id := s.detachSelectorLocked(cur, sel.id); id != 0 {
-				cancel = append(cancel, id)
-			}
-		}
-		return optionDataFor(leg, sel.busIdxs), cancel
-	}
-	s.optChain.selPending[sel.id] = pendingSwap{to: key, since: now}
-	return optionDataPublish{}, nil
 }
 
 // optionDataPublish is one KindOptionData event plus its destination buses,
@@ -1831,14 +1338,13 @@ func (s *Session) cancelLines(reqIDs []int64) {
 // stopped serving: the contract is right, the subscription behind it is dead,
 // and re-asking for the same contract is the only thing that fixes it.
 //
-// The line is granted as a first-quote request, not churn, even though a leg
-// exists: there is no WORKING line for this contract, and churn is refused
-// first under pressure (mdlines.ReserveChurnPct vs ReserveNewPct) — exactly
-// when a dead leg squatting on a line costs the most. pointSelectorAt reasons
-// the same way about an unquoted leg. If even that is refused, the
-// dead leg's own line is released to make room, since a brief gap where a buy
-// fails loudly beats filling one against a quote that stopped hours ago.
-func (s *Session) forceResubscribeLeg(key legKey, deltaSource string) {
+// Every leg reaching here is position-pinned — the only kind that exists now —
+// so the replacement line is granted, never refused. A held contract losing its
+// feed is what silently disarms stop-loss and trailing-stop evaluation, and the
+// old code's careful dance around discretionary reserves (surrender the dead
+// leg's line, retry, put it back if that failed too) existed only because
+// background legs competed for the same headroom. They no longer exist.
+func (s *Session) forceResubscribeLeg(key legKey) {
 	s.optChain.mu.Lock()
 	old, ok := s.optChain.legs[key]
 	if !ok {
@@ -1850,26 +1356,7 @@ func (s *Session) forceResubscribeLeg(key legKey, deltaSource string) {
 	s.optChain.nextMktID++
 	s.optChain.mu.Unlock()
 
-	granted := s.mdLines.GrantDiscretionaryNew(reqID)
-	surrendered := false
-	if !granted {
-		s.optionLog.Printf("Option: WARNING forced re-subscribe %s %s strike=%.2f could not get a line — releasing the dead leg (reqID=%d) to make room",
-			key.symbol, key.right, key.strike, oldReqID)
-		s.mdLines.Release(oldReqID)
-		surrendered = true
-		granted = s.mdLines.GrantDiscretionaryNew(reqID)
-	}
-	if !granted {
-		if surrendered {
-			// Put the dead leg's line back on the books. It is still subscribed
-			// at IB and still the leg's reqID, so leaving it unaccounted would
-			// make the ledger under-count for the rest of the session.
-			s.mdLines.GrantGuaranteed(oldReqID, mdlines.CategoryDiscretionaryNew)
-		}
-		s.optionLog.Printf("Option: WARNING forced re-subscribe %s %s strike=%.2f refused a market-data line — leaving the dead leg in place",
-			key.symbol, key.right, key.strike)
-		return
-	}
+	s.mdLines.GrantGuaranteed(reqID, mdlines.CategoryPosition)
 
 	s.optChain.mu.Lock()
 	cur, stillThere := s.optChain.legs[key]
@@ -1884,12 +1371,8 @@ func (s *Session) forceResubscribeLeg(key legKey, deltaSource string) {
 	cur.reqID = reqID
 	cur.subscribedAt = time.Now()
 	cur.lastTickAt = time.Time{}
-	if deltaSource != "" {
-		cur.deltaSource = deltaSource
-	}
 	delete(s.optChain.legByReqID, oldReqID)
 	s.optChain.legByReqID[reqID] = key
-	s.mdLines.Reclassify(reqID, legCategory(cur))
 	s.optChain.mu.Unlock()
 
 	s.mdLines.Release(oldReqID)
@@ -1919,14 +1402,18 @@ func (s *Session) releaseOrphanedProbeCandidate(reqID int64) {
 }
 
 // resolveDeltaCandidates picks the candidate with delta closest to the
-// target, promotes it to a live leg, and cancels the rest. Only called from
-// ResolveEntryStrike.
+// target, reads its quote, and cancels every candidate including the winner.
+// Only called from ResolveEntryStrike.
+//
+// Nothing survives this call as a subscription. The winner used to graduate
+// into a persistent background leg so a dashboard row could keep displaying
+// it; now the quote is returned by value, cached in resolvedEntry for the
+// sibling fast path, and the line goes straight back to the pool. If the
+// entry that triggered this probe actually fills, SubscribePositionStrike
+// opens a guaranteed CategoryPosition line for the same contract — which is
+// the only reason to hold an option feed at all.
 func (s *Session) resolveDeltaCandidates(sel selector) (OptionQuote, EntryStrikeResult) {
 	symbol, right := sel.symbol, sel.right
-	// Read before the lock: getUnderlyingPrice takes the quote mutexes, which
-	// sit below optChain.mu, and nothing here needs it to be consistent with
-	// the chain state.
-	undPrice := s.getUnderlyingPrice(symbol)
 
 	s.optChain.mu.Lock()
 	res, ok := s.optChain.deltaRes[sel.id]
@@ -1961,78 +1448,30 @@ func (s *Session) resolveDeltaCandidates(sel selector) (OptionQuote, EntryStrike
 			s.mdLines.Release(c.reqID)
 			s.client.CancelMktData(c.reqID)
 		}
-		iv := s.optChain.lastIV[symbol]
-		allStrikes := res.allStrikes
-		targetDelta := res.targetDelta
-		expiry := res.expiry
 		s.optChain.mu.Unlock()
 
-		if iv <= 0 {
-			iv = defaultFallbackIV
-		}
-		estStrike := approximateStrikeForDelta(allStrikes, undPrice, iv, targetDelta, expiry, right)
-		s.optionLog.Printf("Option delta resolve: %s %s (sel=%d) — %s (%s), estimating strike=%.2f via target delta %.2f (iv=%.4f)",
-			symbol, right, sel.id, failure.Reason, failure.Detail, estStrike, targetDelta, iv)
-		s.logDeltaMiss(symbol, right, targetDelta, undPrice, allStrikes, failure.Reason, estStrike, iv)
-		if estStrike > 0 {
-			s.pointSelectorAt(sel, legKey{symbol, right, estStrike, expiry}, true)
-		}
+		s.optionLog.Printf("Option delta resolve: %s %s (sel=%d) — %s (%s)",
+			symbol, right, sel.id, failure.Reason, failure.Detail)
 		return OptionQuote{}, failure
 	}
 
-	// The winner is already subscribed (as a probe) and already ticking — that
-	// is how it won on delta — so it graduates into a leg in place, reusing its
-	// reqID and its line rather than paying for a second subscription to the
-	// same contract.
-	key := legKey{best.symbol, best.right, best.strike, best.expiry}
 	now := time.Now()
-	delete(s.optChain.deltaCands, best.reqID)
-
-	if existing, ok := s.optChain.legs[key]; ok {
-		// A sibling selector already holds this exact contract. Keep the older
-		// subscription and give the probe's line back.
-		existing.delta, existing.deltaSource = best.delta, "matched"
-		if best.bid > 0 {
-			existing.bid = best.bid
-		}
-		if best.ask > 0 {
-			existing.ask = best.ask
-		}
-		s.mdLines.Release(best.reqID)
-		s.client.CancelMktData(best.reqID)
-	} else {
-		leg := s.openLegLocked(key, best.reqID, "matched", now)
-		leg.delta, leg.bid, leg.ask = best.delta, best.bid, best.ask
-		leg.lastTickAt = now
-		s.mdLines.Reclassify(best.reqID, mdlines.CategoryDiscretionaryNew)
-	}
-	od, cancel := s.adoptLegLocked(sel, key, now)
-	displayed := len(od.buses) > 0
-
+	var cancel []int64
 	for _, c := range res.candidates {
-		if c.reqID == best.reqID {
-			continue
-		}
 		delete(s.optChain.deltaCands, c.reqID)
 		s.mdLines.Release(c.reqID)
 		cancel = append(cancel, c.reqID)
 	}
-
-	s.optChain.retries[sel.id] = &optStrikeRetry{
-		selectorID: sel.id, symbol: symbol, right: right, expiry: res.expiry,
-		strikes: res.allStrikes, nextIdx: 1, undPrice: undPrice, busIdxs: res.busIdxs,
-	}
 	s.optChain.mu.Unlock()
 
 	s.cancelLines(cancel)
-	s.optionLog.Printf("Option delta resolved: %s %s (sel=%d) target=%.2f → strike=%.2f (actual delta=%.4f, displayed=%v)",
-		symbol, right, sel.id, res.targetDelta, best.strike, best.delta, displayed)
-	s.publishOptionData(od)
+	s.optionLog.Printf("Option delta resolved: %s %s (sel=%d) target=%.2f → strike=%.2f (actual delta=%.4f)",
+		symbol, right, sel.id, res.targetDelta, best.strike, best.delta)
 
 	// best.bid/best.ask arrived during this synchronous, bounded probe (within
 	// entryDeltaProbeTimeout), so `now` is an accurate freshness stamp for them —
 	// there is no separate per-tick timestamp cached on deltaCandidate to read back.
-	q := OptionQuote{Strike: best.strike, Expiry: best.expiry, Bid: best.bid, Ask: best.ask, Delta: best.delta, BidTime: now, AskTime: now}
+	q := OptionQuote{Strike: best.strike, Expiry: best.expiry, Bid: best.bid, Ask: best.ask, Delta: best.delta, IV: best.iv, BidTime: now, AskTime: now}
 	if !q.Valid() {
 		// A winner on delta with no two-sided price. Callers already refused to
 		// trade this (Valid() is the entry precondition); reporting it as its
@@ -2119,7 +1558,7 @@ func (s *Session) ResolveEntryStrike(sub Subscriber, symbol, right string, timeo
 			Detail: fmt.Sprintf("no cached option chain for %s yet (conId/chain-params lookup has not returned)", symbol)}
 	}
 
-	if q, ok := s.sharedResolvedEntry(sel.id, symbol, right); ok {
+	if q, ok := s.sharedResolvedEntry(sel.id); ok {
 		return q, EntryStrikeResult{OK: true}
 	}
 
@@ -2176,21 +1615,11 @@ func (s *Session) ResolveEntryStrike(sub Subscriber, symbol, right string, timeo
 		selectorID: sel.id, symbol: symbol, right: right, targetDelta: targetDelta,
 		expiry: info.expiry, allStrikes: info.strikes, busIdxs: sel.busIdxs,
 	}
-	var evictedLines []int64
 	for _, cs := range candidates {
 		reqID := s.optChain.nextMktID
 		s.optChain.nextMktID++
-		evicted, ok := s.mdLines.GrantProbe(reqID)
-		if !ok {
+		if !s.mdLines.GrantProbe(reqID) {
 			continue
-		}
-		if evicted != 0 {
-			// The ledger preempted a background line. Drop the leg it belonged
-			// to — with every holder — since its IB subscription is going away.
-			if leg, found := s.legByReqIDLocked(evicted); found {
-				s.forgetLegLocked(leg)
-			}
-			evictedLines = append(evictedLines, evicted)
 		}
 		cand := &deltaCandidate{selectorID: sel.id, symbol: symbol, right: right, strike: cs, expiry: info.expiry, reqID: reqID, busIdxs: sel.busIdxs}
 		s.optChain.deltaCands[reqID] = cand
@@ -2206,14 +1635,12 @@ func (s *Session) ResolveEntryStrike(sub Subscriber, symbol, right string, timeo
 	}
 	if len(res.candidates) == 0 {
 		s.optChain.mu.Unlock()
-		s.cancelLines(evictedLines)
 		return OptionQuote{}, EntryStrikeResult{Reason: entryFailNoMDLines,
 			Detail: fmt.Sprintf("market-data line budget refused all %d probe candidates for %s %s", len(candidates), symbol, right)}
 	}
 	s.optChain.deltaRes[sel.id] = res
 	s.optChain.lastProbeLaunch[sel.id] = time.Now()
 	s.optChain.mu.Unlock()
-	s.cancelLines(evictedLines)
 
 	const pollInterval = 100 * time.Millisecond
 	deadline := time.Now().Add(timeout)
@@ -2232,7 +1659,7 @@ func (s *Session) ResolveEntryStrike(sub Subscriber, symbol, right string, timeo
 		if s.optChain.resolvedEntry == nil {
 			s.optChain.resolvedEntry = make(map[int]resolvedEntryLeg)
 		}
-		s.optChain.resolvedEntry[sel.id] = resolvedEntryLeg{strike: q.Strike, expiry: q.Expiry, delta: q.Delta, at: time.Now()}
+		s.optChain.resolvedEntry[sel.id] = resolvedEntryLeg{strike: q.Strike, expiry: q.Expiry, delta: q.Delta, iv: q.IV, bid: q.Bid, ask: q.Ask, bidTime: q.BidTime, askTime: q.AskTime, at: time.Now()}
 		delete(s.optChain.lastEntryFailure, sel.id)
 	} else {
 		// Publish the cause for siblings still polling waitForEntryResolution,
@@ -2250,20 +1677,18 @@ func (s *Session) ResolveEntryStrike(sub Subscriber, symbol, right string, timeo
 	return q, res2
 }
 
-// forgetLegLocked drops a leg and every selector's reference to it without
-// touching the ledger — for a line the ledger has ALREADY taken back (a probe
-// preemption). Selectors left with no contract are simply blank until their
-// next rotation turn, which is the honest state. Caller holds s.optChain.mu.
+// forgetLegLocked drops a leg from the registry without touching the ledger —
+// for a line the ledger has ALREADY taken back, or one IB has told us does not
+// exist (error 200). Caller holds s.optChain.mu.
+//
+// It deliberately does NOT decrement pins or notify the positions holding it.
+// A leg reaching here is gone at IB whatever the hub believes; leaving the pin
+// count alone means the next UnsubscribePositionStrike still balances, and
+// ORBtrader's stale-position monitor sees a held position with no leg — its
+// staleNoLeg case — and re-subscribes. That is the intended repair path, and
+// it is the one that can also tell the operator.
 func (s *Session) forgetLegLocked(leg *optLeg) {
 	key := leg.key()
-	for selID := range leg.selectors {
-		if s.optChain.selCurrent[selID] == key {
-			delete(s.optChain.selCurrent, selID)
-		}
-		if sw, ok := s.optChain.selPending[selID]; ok && sw.to == key {
-			delete(s.optChain.selPending, selID)
-		}
-	}
 	delete(s.optChain.legs, key)
 	delete(s.optChain.legByReqID, leg.reqID)
 	delete(s.optChain.forcedResub, key)
@@ -2272,18 +1697,18 @@ func (s *Session) forgetLegLocked(leg *optLeg) {
 // sharedResolvedEntry returns a fresh, Book-priced quote for the contract
 // another subscriber recently resolved for this selector — the
 // shared-selection fast path for ResolveEntryStrike.
-func (s *Session) sharedResolvedEntry(selectorID int, symbol, right string) (OptionQuote, bool) {
+func (s *Session) sharedResolvedEntry(selectorID int) (OptionQuote, bool) {
 	s.optChain.mu.Lock()
 	leg, ok := s.optChain.resolvedEntry[selectorID]
 	s.optChain.mu.Unlock()
-	if !ok || time.Since(leg.at) > resolvedEntryTTL || s.book == nil {
+	if !ok || time.Since(leg.at) > resolvedEntryTTL {
 		return OptionQuote{}, false
 	}
-	bq, ok := s.book.Option(quotes.ContractKey{Symbol: symbol, Right: right, Strike: leg.strike, Expiry: leg.expiry})
-	if !ok {
-		return OptionQuote{}, false
+	q := OptionQuote{
+		Strike: leg.strike, Expiry: leg.expiry,
+		Bid: leg.bid, Ask: leg.ask, Delta: leg.delta, IV: leg.iv,
+		BidTime: leg.bidTime, AskTime: leg.askTime,
 	}
-	q := OptionQuote{Strike: leg.strike, Expiry: leg.expiry, Bid: bq.Bid, Ask: bq.Ask, Last: bq.Last, Delta: leg.delta, BidTime: bq.BidTime, AskTime: bq.AskTime}
 	if !q.Valid() {
 		return OptionQuote{}, false
 	}
@@ -2311,7 +1736,7 @@ func (s *Session) waitForEntryResolution(sel selector, timeout time.Duration) (O
 		}
 		time.Sleep(pollInterval)
 	}
-	if q, ok := s.sharedResolvedEntry(sel.id, sel.symbol, sel.right); ok {
+	if q, ok := s.sharedResolvedEntry(sel.id); ok {
 		return q, EntryStrikeResult{OK: true}
 	}
 	// Report the owner's actual cause rather than "the other one failed too" —
@@ -2374,67 +1799,34 @@ func (s *Session) handleOptionMktError(reqID int64, errStr string) bool {
 	symbol, right, strike, expiry := key.symbol, key.right, key.strike, key.expiry
 	pinned := leg.pins > 0
 
-	// The contract itself is bad, so every holder must let go of it — this is
-	// the one case where dropping a leg out from under other holders is
-	// correct, because the subscription behind it does not exist.
-	holders := make([]int, 0, len(leg.selectors))
-	for selID := range leg.selectors {
-		holders = append(holders, selID)
-	}
+	// The contract itself is bad, so the leg must go — its IB subscription does
+	// not exist.
 	s.forgetLegLocked(leg)
 	s.mdLines.Release(reqID)
-
-	s.optionLog.Printf("Option market data FAILED: %s %s strike=%.2f expiry=%s (reqID=%d, sels=%v, pinned=%v) — contract not found, skipping",
-		symbol, right, strike, expiry, reqID, holders, pinned)
-	s.logger.Printf("Option market data FAILED: %s %s strike=%.2f expiry=%s — %s", symbol, right, strike, expiry, errStr)
-
-	// Each holding selector retries onto its own next-nearest strike. They are
-	// independent: one selector exhausting its candidate list says nothing
-	// about another's. The walk is bounded — see optStrikeRetry.nextCandidate.
-	type retryPlan struct {
-		sel    selector
-		strike float64
-		expiry string
-	}
-	type retryGaveUp struct {
-		selID  int
-		expiry string
-		reason string
-		tried  []float64
-	}
-	var plans []retryPlan
-	var gaveUp []retryGaveUp
-	for _, selID := range holders {
-		retry, hasRetry := s.optChain.retries[selID]
-		if !hasRetry {
-			continue
-		}
-		nextStrike, reason, ok := retry.nextCandidate()
-		if !ok {
-			delete(s.optChain.retries, selID)
-			gaveUp = append(gaveUp, retryGaveUp{selID, retry.expiry, reason, retry.tried})
-			continue
-		}
-		if sel, ok := s.selectorByIDLocked(selID); ok {
-			plans = append(plans, retryPlan{sel, nextStrike, retry.expiry})
-		}
-	}
 	s.optChain.mu.Unlock()
 
-	for _, p := range plans {
-		s.optionLog.Printf("Option: %s %s (sel=%d) — retrying with next nearest strike=%.2f expiry=%s", symbol, right, p.sel.id, p.strike, p.expiry)
-		s.pointSelectorAt(p.sel, legKey{symbol, right, p.strike, p.expiry}, true)
-	}
-	// Giving up leaves the selector with NO leg (forgetLegLocked above already
-	// cleared selCurrent), which is the point: its row goes blank rather than
-	// showing a contract nobody asked for, and its next rotation attempt is a
-	// first-quote grant instead of the churn tier a stuck leg would have forced.
-	for _, g := range gaveUp {
-		s.optionLog.Printf("Option: WARNING %s %s (sel=%d) — giving up on expiry=%s: %s (tried %v); this row has NO option data until the next chain refresh",
-			symbol, right, g.selID, g.expiry, g.reason, g.tried)
-		s.logger.Printf("Option: %s %s (sel=%d) — no listed strike for expiry=%s: %s (tried %v)",
-			symbol, right, g.selID, g.expiry, g.reason, g.tried)
-	}
+	s.optionLog.Printf("Option market data FAILED: %s %s strike=%.2f expiry=%s (reqID=%d, pinned=%v) — contract not found, dropping the leg",
+		symbol, right, strike, expiry, reqID, pinned)
+	s.logger.Printf("Option market data FAILED: %s %s strike=%.2f expiry=%s — %s", symbol, right, strike, expiry, errStr)
+
+	// There is deliberately no next-nearest-strike retry walk here any more.
+	// It existed to keep a watchlist row populated when the estimated strike
+	// turned out not to be listed: step to the next strike, and the next, until
+	// something resolved. Those rows are gone, and with them the only caller
+	// that wanted "any contract that works" rather than "the contract I asked
+	// for". Both remaining leg kinds want the opposite —
+	//
+	//   a position-pinned leg names a contract the account demonstrably holds,
+	//   so error 200 against it is a real anomaly to surface, not something to
+	//   paper over by subscribing a DIFFERENT strike the position does not hold;
+	//
+	//   an entry probe already subscribes five candidates at once and picks on
+	//   delta, so a dead strike among them costs nothing and needs no walk.
+	//
+	// The walk was also a liability in its own right: unbounded work in an
+	// error path, firing the next ReqMktData synchronously from the callback,
+	// which is how MSFT issued 35 subscribe attempts in 8 seconds on 2026-08-17
+	// and settled on a δ≈1.00 leg with no bid and no ask.
 	return true
 }
 
@@ -2462,26 +1854,18 @@ func (s *Session) handleOptionTick(reqID int64, tickType int64, price float64) b
 			s.optChain.mu.Unlock()
 			return true
 		}
-		key := leg.key()
-		now := time.Now()
-		// A quote arriving here may be the one a selector has been warming for.
-		cancel := s.promoteWaitersLocked(key, now)
 		od := eventbus.OptionData{
 			Symbol: leg.symbol, Right: leg.right, Strike: leg.strike, Expiry: leg.expiry,
 			Price: leg.price, Bid: leg.bid, Ask: leg.ask, Delta: leg.delta, DeltaSource: leg.deltaSource,
 		}
-		// One leg can be both a watchlist row's display contract and an open
-		// position's pinned contract; they are different questions and each
-		// consumer subscribes to its own event kind, so both are published.
-		buses := s.legDisplayBusesLocked(key)
 		pinned := leg.pins > 0
 		s.optChain.mu.Unlock()
 
-		s.cancelLines(cancel)
 		s.bookOption(od)
-		if len(buses) > 0 {
-			s.publishTo(buses, eventbus.Event{Kind: eventbus.KindOptionData, Payload: od})
-		}
+		// Only KindPositionOptionData is published. Its sibling KindOptionData
+		// carried a watchlist row's display contract to the dashboard; there is
+		// no such contract any more, so a leg reaching here is always an open
+		// position's and always belongs on the position channel.
 		if pinned {
 			s.publish(eventbus.Event{Kind: eventbus.KindPositionOptionData, Payload: od})
 		}
@@ -2503,260 +1887,7 @@ func (s *Session) handleOptionTick(reqID int64, tickType int64, price float64) b
 	return false
 }
 
-// resolvedOption is the currently-subscribed ATM option leg for one symbol+right.
-type resolvedOption struct {
-	contract *ibapi.Contract
-	strike   float64
-	expiry   string
-	bid      float64
-	ask      float64
-	mid      float64
-}
-
-// currentOptionContract returns the live option leg subscribed for symbol +
-// right ("call"/"put") for the requesting subscriber (busIdx), or false if
-// the chain has not resolved a contract yet.
-func (s *Session) currentOptionContract(symbol, right string, busIdx int) (resolvedOption, bool) {
-	s.optChain.mu.Lock()
-	defer s.optChain.mu.Unlock()
-
-	sel, ok := s.selectorForLocked(symbol, right, busIdx)
-	if !ok {
-		return resolvedOption{}, false
-	}
-	if leg, ok := s.selectorLegLocked(sel.id); ok {
-		return resolveOptionLeg(leg), true
-	}
-	// Nothing displayed yet, but a contract this selector is warming into is
-	// still the contract it means — better than reporting none at all.
-	if sw, waiting := s.optChain.selPending[sel.id]; waiting {
-		if leg, ok := s.optChain.legs[sw.to]; ok {
-			return resolveOptionLeg(leg), true
-		}
-	}
-	return resolvedOption{}, false
-}
-
-// resolveOptionLeg builds a resolvedOption from a leg.
-func resolveOptionLeg(leg *optLeg) resolvedOption {
-	ibRight := "C"
-	if leg.right == "put" {
-		ibRight = "P"
-	}
-	mid := leg.price
-	switch {
-	case leg.bid > 0 && leg.ask > 0:
-		mid = (leg.bid + leg.ask) / 2
-	case leg.ask > 0:
-		mid = leg.ask
-	case leg.bid > 0:
-		mid = leg.bid
-	}
-	return resolvedOption{
-		contract: makeOptionContract(leg.symbol, ibRight, leg.strike, leg.expiry),
-		strike:   leg.strike, expiry: leg.expiry, bid: leg.bid, ask: leg.ask, mid: mid,
-	}
-}
-
 // ── Helper functions ──────────────────────────────────────────────────────
-
-// defaultFallbackIV is used by approximateStrikeForDelta only when no live
-// IV sample exists at all for a symbol — a rare edge case limited to the
-// very first resolution of a session before any option tick has arrived.
-const defaultFallbackIV = 0.25
-
-// deltaDriftTolerance bounds how far a delta-target leg's live,
-// IB-confirmed delta may wander from its target_delta before the
-// background rotation bothers re-estimating and resubscribing a closer strike.
-const deltaDriftTolerance = 0.05
-
-// approximateStrikeForDelta estimates the whole-dollar strike (from the
-// candidates actually available in the chain) whose Black-Scholes delta is
-// closest to targetDelta, for use when a live IB delta probe returns no
-// usable quotes.
-//
-// Derivation: for a call, delta = N(d1); for a put, delta = N(d1) - 1 (so a
-// put magnitude of targetDelta corresponds to N(d1) = 1 - targetDelta).
-// Solving the standard d1 = (ln(S/K) + 0.5·σ²·T) / (σ√T) for K given a
-// target d1 yields K = S / exp(d1·σ√T − 0.5·σ²·T).
-func approximateStrikeForDelta(strikes []float64, undPrice, iv, targetDelta float64, expiry string, right string) float64 {
-	if len(strikes) == 0 {
-		return 0
-	}
-	if iv <= 0 || undPrice <= 0 || targetDelta <= 0 || targetDelta >= 1 {
-		return strikes[0]
-	}
-	t := yearsToExpiry(expiry)
-	if t <= 0 {
-		return strikes[0]
-	}
-
-	var d1 float64
-	if right == "call" {
-		d1 = invNormCDF(targetDelta)
-	} else {
-		d1 = invNormCDF(1 - targetDelta)
-	}
-
-	sqrtT := math.Sqrt(t)
-	exponent := d1*iv*sqrtT - 0.5*iv*iv*t
-	target := undPrice / math.Exp(exponent)
-
-	best := strikes[0]
-	bestDist := math.Abs(strikes[0] - target)
-	for _, st := range strikes {
-		if d := math.Abs(st - target); d < bestDist {
-			bestDist = d
-			best = st
-		}
-	}
-	return best
-}
-
-// yearsToExpiry converts an option's "YYYYMMDD" expiry into a year fraction
-// from now, floored at 30 minutes so a same-day (0DTE) expiry never divides
-// by (near-)zero. Treats expiry as 16:00 local time (US market close).
-func yearsToExpiry(expiry string) float64 {
-	exp, err := time.ParseInLocation("20060102", expiry, time.Local)
-	if err != nil {
-		return 0
-	}
-	closeTime := time.Date(exp.Year(), exp.Month(), exp.Day(), 16, 0, 0, 0, time.Local)
-	d := time.Until(closeTime)
-	const minDuration = 30 * time.Minute
-	if d < minDuration {
-		d = minDuration
-	}
-	const hoursPerYear = 24 * 365.25
-	return d.Hours() / hoursPerYear
-}
-
-// invNormCDF returns the inverse of the standard normal CDF (the probit
-// function) via Peter Acklam's rational approximation — accurate to about
-// 1.15e-9 relative error. p must be in (0, 1).
-func invNormCDF(p float64) float64 {
-	if p <= 0 {
-		p = 1e-10
-	} else if p >= 1 {
-		p = 1 - 1e-10
-	}
-
-	const (
-		a1 = -3.969683028665376e+01
-		a2 = 2.209460984245205e+02
-		a3 = -2.759285104469687e+02
-		a4 = 1.383577518672690e+02
-		a5 = -3.066479806614716e+01
-		a6 = 2.506628277459239e+00
-
-		b1 = -5.447609879822406e+01
-		b2 = 1.615858368580409e+02
-		b3 = -1.556989798598866e+02
-		b4 = 6.680131188771972e+01
-		b5 = -1.328068155288572e+01
-
-		c1 = -7.784894002430293e-03
-		c2 = -3.223964580411365e-01
-		c3 = -2.400758277161838e+00
-		c4 = -2.549732539343734e+00
-		c5 = 4.374664141464968e+00
-		c6 = 2.938163982698783e+00
-
-		d1 = 7.784695709041462e-03
-		d2 = 3.224671290700398e-01
-		d3 = 2.445134137142996e+00
-		d4 = 3.754408661907416e+00
-
-		pLow  = 0.02425
-		pHigh = 1 - pLow
-	)
-
-	switch {
-	case p < pLow:
-		q := math.Sqrt(-2 * math.Log(p))
-		return (((((c1*q+c2)*q+c3)*q+c4)*q+c5)*q + c6) /
-			((((d1*q+d2)*q+d3)*q+d4)*q + 1)
-	case p <= pHigh:
-		q := p - 0.5
-		r := q * q
-		return (((((a1*r+a2)*r+a3)*r+a4)*r+a5)*r + a6) * q /
-			(((((b1*r+b2)*r+b3)*r+b4)*r+b5)*r + 1)
-	default:
-		q := math.Sqrt(-2 * math.Log(1-p))
-		return -(((((c1*q+c2)*q+c3)*q+c4)*q+c5)*q + c6) /
-			((((d1*q+d2)*q+d3)*q+d4)*q + 1)
-	}
-}
-
-// ── Delta-miss logging ────────────────────────────────────────────────────
-
-var deltaMissMu sync.Mutex
-var deltaMissFile *os.File
-var deltaMissWriter *csv.Writer
-var deltaMissDate string
-
-var deltaMissHeader = []string{
-	"timestamp", "symbol", "right", "target_delta", "underlying_price",
-	"candidates_probed", "reason", "fallback_strike", "estimated_via_formula", "iv_used",
-}
-
-// logDeltaMiss appends one row for a delta-probe fallback event to a
-// day-rotated CSV under "log/" (created if needed) so the frequency of
-// delta-probe fallbacks is a simple CSV load away, rather than a manual
-// option-log scrape.
-func (s *Session) logDeltaMiss(symbol, right string, targetDelta, undPrice float64, candidates []float64, reason string, estimatedStrike, ivUsed float64) {
-	deltaMissMu.Lock()
-	defer deltaMissMu.Unlock()
-
-	today := time.Now().Format("2006-01-02")
-	if deltaMissWriter == nil || deltaMissDate != today {
-		if deltaMissFile != nil {
-			deltaMissWriter.Flush()
-			deltaMissFile.Close()
-		}
-		dir := "log"
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			s.logger.Printf("delta-misses: cannot create log directory: %v", err)
-			return
-		}
-		path := filepath.Join(dir, today+"-delta-misses.csv")
-		writeHeader := true
-		if info, err := os.Stat(path); err == nil && info.Size() > 0 {
-			writeHeader = false
-		}
-		f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-		if err != nil {
-			s.logger.Printf("delta-misses: cannot open %s: %v", path, err)
-			return
-		}
-		deltaMissFile = f
-		deltaMissWriter = csv.NewWriter(f)
-		deltaMissDate = today
-		if writeHeader {
-			_ = deltaMissWriter.Write(deltaMissHeader)
-		}
-	}
-
-	strikeStrs := make([]string, len(candidates))
-	for i, st := range candidates {
-		strikeStrs[i] = strconv.FormatFloat(st, 'f', 2, 64)
-	}
-	estimatedViaFormula := "true"
-	if ivUsed <= 0 {
-		estimatedViaFormula = "false"
-	}
-	row := []string{
-		time.Now().Format("2006-01-02 15:04:05"), symbol, right,
-		strconv.FormatFloat(targetDelta, 'f', 4, 64), strconv.FormatFloat(undPrice, 'f', 2, 64),
-		strings.Join(strikeStrs, "|"), reason, strconv.FormatFloat(estimatedStrike, 'f', 2, 64),
-		estimatedViaFormula, strconv.FormatFloat(ivUsed, 'f', 4, 64),
-	}
-	if err := deltaMissWriter.Write(row); err != nil {
-		s.logger.Printf("delta-misses: write failed: %v", err)
-		return
-	}
-	deltaMissWriter.Flush()
-}
 
 // wholeDollarStrikes returns only the strikes with no fractional dollar
 // part (75, 76 — never 75.50). If the underlying lists no whole-dollar

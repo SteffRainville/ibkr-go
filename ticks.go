@@ -226,13 +226,9 @@ func (s *Session) TickOptionComputation(reqID int64, tickType int64, tickAttrib 
 			Symbol: leg.symbol, Right: leg.right, Strike: leg.strike, Expiry: leg.expiry,
 			Price: leg.price, Bid: leg.bid, Ask: leg.ask, Delta: leg.delta, IV: impliedVol, DeltaSource: leg.deltaSource,
 		}
-		buses := s.legDisplayBusesLocked(leg.key())
 		pinned := leg.pins > 0
 		s.optChain.mu.Unlock()
 		s.bookOption(od)
-		if len(buses) > 0 {
-			s.publishTo(buses, eventbus.Event{Kind: eventbus.KindOptionData, Payload: od})
-		}
 		if pinned {
 			s.publish(eventbus.Event{Kind: eventbus.KindPositionOptionData, Payload: od})
 		}
@@ -241,6 +237,7 @@ func (s *Session) TickOptionComputation(reqID int64, tickType int64, tickAttrib 
 
 	if cand, ok := s.optChain.deltaCands[reqID]; ok {
 		cand.delta = delta
+		cand.iv = impliedVol
 		cand.ready = true
 		s.optChain.mu.Unlock()
 		return

@@ -63,8 +63,8 @@ func TestResolveEntryStrike_DifferentTargetDeltaGroupsResolveIndependently(t *te
 	// strike, plus Book prices, and confirm each subscriber gets its OWN
 	// strike back — not whichever selector sorts first.
 	s.optChain.mu.Lock()
-	s.optChain.resolvedEntry[10] = resolvedEntryLeg{strike: 296, expiry: "20260806", delta: 0.55, at: time.Now()}
-	s.optChain.resolvedEntry[11] = resolvedEntryLeg{strike: 297, expiry: "20260806", delta: 0.6083, at: time.Now()}
+	s.optChain.resolvedEntry[10] = resolvedEntryLeg{strike: 296, expiry: "20260806", delta: 0.55, bid: 1.60, ask: 1.70, at: time.Now()}
+	s.optChain.resolvedEntry[11] = resolvedEntryLeg{strike: 297, expiry: "20260806", delta: 0.6083, bid: 2.11, ask: 2.20, at: time.Now()}
 	s.optChain.mu.Unlock()
 
 	key10 := quotes.ContractKey{Symbol: "IWM", Right: "call", Strike: 296, Expiry: "20260806"}
@@ -110,7 +110,7 @@ func TestResolveEntryStrike_SameTargetDeltaSharedAcrossBusIdxs(t *testing.T) {
 		s.book.SetOptionAsk(key, 2.20)
 		s.optChain.mu.Lock()
 		delete(s.optChain.deltaRes, 11)
-		s.optChain.resolvedEntry[11] = resolvedEntryLeg{strike: 297, expiry: "20260806", delta: 0.6083, at: time.Now()}
+		s.optChain.resolvedEntry[11] = resolvedEntryLeg{strike: 297, expiry: "20260806", delta: 0.6083, bid: 2.11, ask: 2.20, at: time.Now()}
 		s.optChain.mu.Unlock()
 	}()
 

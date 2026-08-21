@@ -258,8 +258,8 @@ func withDefaults(o Options) Options {
 	if o.ConnectTimeout <= 0 {
 		o.ConnectTimeout = 10 * time.Second
 	}
-	if o.OptionRotationInterval <= 0 {
-		o.OptionRotationInterval = 5 * time.Second
+	if o.OptionChainRefreshInterval <= 0 {
+		o.OptionChainRefreshInterval = 5 * time.Second
 	}
 	if o.PositionRefreshInterval <= 0 {
 		o.PositionRefreshInterval = 5 * time.Minute
@@ -340,9 +340,6 @@ func NewSession(opts Options, book *quotes.Book, cs *candlestore.Store) *Session
 			chainReqs:        make(map[int64]*optChainReq),
 			legs:             make(map[legKey]*optLeg),
 			legByReqID:       make(map[int64]legKey),
-			selCurrent:       make(map[int]legKey),
-			selPending:       make(map[int]pendingSwap),
-			retries:          make(map[int]*optStrikeRetry),
 			deltaCands:       make(map[int64]*deltaCandidate),
 			deltaRes:         make(map[int]*deltaResolution),
 			lastIV:           make(map[string]float64),
@@ -366,8 +363,7 @@ func NewSession(opts Options, book *quotes.Book, cs *candlestore.Store) *Session
 		},
 		acct: acctTracker{accounts: make(map[string]AccountSummary)},
 
-		mdLines: mdlines.NewLedgerWithReserves(opts.MaxMarketDataLines, opts.MaxHistoricalStreams,
-			opts.MDLineReserveNewPct, opts.MDLineReserveChurnPct),
+		mdLines: mdlines.NewLedger(opts.MaxMarketDataLines, opts.MaxHistoricalStreams),
 
 		logger:    opts.Logger,
 		scanLog:   writerLogger(opts.ScanLog),
@@ -540,12 +536,12 @@ func (s *Session) Run(subs []Subscriber, stop time.Time) (bool, error) {
 	}()
 
 	go func() {
-		ticker := time.NewTicker(s.opts.OptionRotationInterval)
+		ticker := time.NewTicker(s.opts.OptionChainRefreshInterval)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
-				s.rotateOptionStrikes()
+				s.refreshOptionChains()
 			case <-ctx.Done():
 				return
 			}

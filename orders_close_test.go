@@ -96,24 +96,22 @@ func TestEnsureOptionHeldForClose_BlocksDriftedATMFallback(t *testing.T) {
 
 // ── resolveCloseContract: the identity-carrying core ─────────────────────────
 
-// TestResolveCloseContract_UsesCarriedIdentityNotATM is the key regression
-// lock for a drifted-ATM incident. The OrderRequest carries the held
-// contract's exact strike/expiry (708). Even though the option chain's
-// current ATM leg has drifted to 709, resolveCloseContract must return 708
-// and MUST NOT consult the chain — proving the wrong-strike class of bug is
-// structurally impossible once the identity is carried on the order.
-func TestResolveCloseContract_UsesCarriedIdentityNotATM(t *testing.T) {
+// TestResolveCloseContract_UsesCarriedIdentity is the key regression lock for a
+// drifted-ATM incident. The OrderRequest carries the held contract's exact
+// strike/expiry (708) and resolveCloseContract must return precisely that,
+// together with the quote the caller priced against — proving the wrong-strike
+// class of bug is structurally impossible once the identity is on the order.
+func TestResolveCloseContract_UsesCarriedIdentity(t *testing.T) {
 	s := newTestSession()
-	seedDisplayedLeg(s, "QQQ", "call", 709, "20260710", 0, 0)
 
 	o := OrderRequest{Symbol: "QQQ", Tag: "call", SecType: "OPT", Qty: 600, Strike: 708, OptionExpiry: "20260710", Bid: 6.10, Ask: 6.20}
 
-	strike, expiry, bid, ask, _, err := s.resolveCloseContract(o, -1)
+	strike, expiry, bid, ask, _, err := s.resolveCloseContract(o)
 	if err != nil {
 		t.Fatalf("resolveCloseContract() error = %v, want nil", err)
 	}
 	if strike != 708 {
-		t.Errorf("strike = %v, want 708 (the carried identity), NOT the drifted ATM 709", strike)
+		t.Errorf("strike = %v, want the carried 708", strike)
 	}
 	if expiry != "20260710" {
 		t.Errorf("expiry = %q, want carried 20260710", expiry)
@@ -123,37 +121,32 @@ func TestResolveCloseContract_UsesCarriedIdentityNotATM(t *testing.T) {
 	}
 }
 
-// TestResolveCloseContract_FallsBackToATMWhenIdentityAbsent verifies the
-// one legitimate ATM path: a fully-absent identity (untracked manual close)
-// resolves the current ATM leg.
-func TestResolveCloseContract_FallsBackToATMWhenIdentityAbsent(t *testing.T) {
-	s := newTestSession()
-	seedDisplayedLeg(s, "QQQ", "call", 709, "20260710", 5.9, 6.0)
-
-	o := OrderRequest{Symbol: "QQQ", Tag: "call", Qty: 600} // no strike/expiry
-
-	strike, expiry, _, _, _, err := s.resolveCloseContract(o, -1)
-	if err != nil {
-		t.Fatalf("resolveCloseContract() error = %v, want nil", err)
-	}
-	if strike != 709 || expiry != "20260710" {
-		t.Errorf("strike/expiry = %v/%q, want ATM 709/20260710", strike, expiry)
-	}
-}
-
-// TestResolveCloseContract_RefusesPartialIdentity verifies a corrupt
-// identity (strike present, expiry missing) is refused rather than
-// silently ATM-resolved.
-func TestResolveCloseContract_RefusesPartialIdentity(t *testing.T) {
-	s := newTestSession()
-	o := OrderRequest{Symbol: "QQQ", Tag: "call", SecType: "OPT", Qty: 700, Strike: 723}
-
-	_, _, _, _, _, err := s.resolveCloseContract(o, -1)
-	if err == nil {
-		t.Fatal("resolveCloseContract() = nil error, want refusal for partial identity")
-	}
-	if !strings.Contains(err.Error(), "missing strike/expiry") {
-		t.Errorf("error = %q, want it to mention missing strike/expiry", err.Error())
+// TestResolveCloseContract_RefusesIncompleteIdentity covers both an absent and
+// a half-present identity, which are now one case.
+//
+// A fully-absent identity used to resolve the current ATM leg — safe only
+// because ClosePosition gates the resulting SELL against IB's own portfolio.
+// With background legs gone there is no ATM leg to read, and no close needs one:
+// the identity comes off the stored Position, which is where a close should get
+// it from anyway.
+func TestResolveCloseContract_RefusesIncompleteIdentity(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		o    OrderRequest
+	}{
+		{"absent", OrderRequest{Symbol: "QQQ", Tag: "call", Qty: 600}},
+		{"strike without expiry", OrderRequest{Symbol: "QQQ", Tag: "call", SecType: "OPT", Qty: 700, Strike: 723}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestSession()
+			_, _, _, _, _, err := s.resolveCloseContract(tc.o)
+			if err == nil {
+				t.Fatal("resolveCloseContract() = nil error, want refusal")
+			}
+			if !strings.Contains(err.Error(), "missing strike/expiry") {
+				t.Errorf("error = %q, want it to mention missing strike/expiry", err.Error())
+			}
+		})
 	}
 }
 
@@ -179,22 +172,27 @@ func TestClosePosition_RefusesNakedShort_IdentityNotAtIB(t *testing.T) {
 	}
 }
 
-// TestClosePosition_RefusesNakedShort_DriftedATMFallback covers the
-// untracked manual-close path: the OrderRequest has no carried identity, so
-// resolution falls back to the current ATM leg, which has drifted to a
-// strike (709) the account does not actually hold (only 708 is held). The
-// gate must refuse rather than short 709.
-func TestClosePosition_RefusesNakedShort_DriftedATMFallback(t *testing.T) {
+// TestClosePosition_RefusesNakedShort_WrongStrike is the naked-short gate seen
+// through the real entry point, on a carried identity that is simply wrong: the
+// order names 709, the account holds only 708.
+//
+// It replaces TestClosePosition_RefusesNakedShort_DriftedATMFallback, which
+// reached the same state by leaving the identity absent and letting resolution
+// fall back to a drifted ATM leg. That fallback is gone (an incomplete identity
+// is now refused outright, see TestResolveCloseContract_RefusesIncompleteIdentity),
+// so the only way to arrive at a wrong contract is to be handed one — and the
+// gate, which checks against IB's own portfolio rather than against how the
+// contract was chosen, must still refuse it.
+func TestClosePosition_RefusesNakedShort_WrongStrike(t *testing.T) {
 	s := newTestSession()
 	seedHeldOption(s, "QQQ", "C", 708, "20260710", 6)
-	seedDisplayedLeg(s, "QQQ", "call", 709, "20260710", 0, 0)
 	sub := newTestSubscriber()
 
-	o := OrderRequest{Symbol: "QQQ", Tag: "call", Qty: 600} // untracked -> ATM fallback
+	o := OrderRequest{Symbol: "QQQ", Tag: "call", SecType: "OPT", Qty: 600, Strike: 709, OptionExpiry: "20260710"}
 
 	_, err := s.ClosePosition(sub, o)
 	if err == nil {
-		t.Fatal("ClosePosition() = nil error, want refusal — the drifted ATM leg (709) is not held, only 708 is")
+		t.Fatal("ClosePosition() = nil error, want refusal — 709 is not held, only 708 is")
 	}
 	if !strings.Contains(err.Error(), "naked short") {
 		t.Errorf("error = %q, want it to mention a naked short", err.Error())

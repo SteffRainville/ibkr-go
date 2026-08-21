@@ -31,7 +31,7 @@ func TestPositionStrikeSub_SharedAcrossHolders(t *testing.T) {
 	// must join the existing subscription, not attempt a second ReqMktData.
 	s.SubscribePositionStrike("IWM", "put", 298, "20260806")
 
-	_, pins, ok := legHolders(s, key)
+	pins, ok := legPins(s, key)
 	if !ok {
 		t.Fatal("subscription for second holder vanished — expected it to join the existing one")
 	}
@@ -43,7 +43,7 @@ func TestPositionStrikeSub_SharedAcrossHolders(t *testing.T) {
 	// feed must survive — OrbOptionRobot's position is still open on it.
 	s.UnsubscribePositionStrike("IWM", "put", 298, "20260806")
 
-	_, pins, ok = legHolders(s, key)
+	pins, ok = legPins(s, key)
 	if !ok {
 		t.Fatal("subscription was torn down after only one of two holders released it — this is the 2026-08-04 IWM incident: a sibling's exit freezes this position's stop-loss quote")
 	}
@@ -67,34 +67,31 @@ func TestPositionStrikeSub_SameStrikeDifferentExpiryIsADifferentContract(t *test
 
 	s.UnsubscribePositionStrike("SPY", "put", 640, "20260807")
 
-	if _, _, ok := legHolders(s, weekly); ok {
+	if _, ok := legPins(s, weekly); ok {
 		t.Fatal("the weekly's leg survived its only holder releasing it")
 	}
-	if _, pins, ok := legHolders(s, monthly); !ok || pins != 1 {
+	if pins, ok := legPins(s, monthly); !ok || pins != 1 {
 		t.Fatal("releasing the WEEKLY tore down the MONTHLY — same strike, different contract")
 	}
 }
 
-// TestPositionStrikeSub_SelectorKeepsTheFeedAfterTheExit is the new half of the
-// guarantee. Background legs now live in the same registry as pinned ones, so
-// an exit must not blank a watchlist row that is displaying the same contract —
-// and, symmetrically, a watchlist row moving on must not disarm a position's
-// stops.
-func TestPositionStrikeSub_SelectorKeepsTheFeedAfterTheExit(t *testing.T) {
+// TestPositionStrikeSub_LastHolderTearsTheFeedDown is the other half of the
+// refcount guarantee: once nothing holds a contract, its line goes back.
+//
+// This used to be TestPositionStrikeSub_SelectorKeepsTheFeedAfterTheExit,
+// asserting that an exit did not blank a watchlist row displaying the same
+// contract. Rows hold no contract now, so pins are the only holders and
+// "the last one leaves" is the whole condition — which makes the release path
+// simpler, not weaker: the sibling-position case above is the one that
+// actually mattered (the 2026-08-04 IWM incident) and it still holds.
+func TestPositionStrikeSub_LastHolderTearsTheFeedDown(t *testing.T) {
 	s := withOfflineClient(newRotationTestSession(nil))
 	key := lk("IWM", "put", 298, "20260806")
-	seedLeg(s, key, legOpts{reqID: 10011, pins: 1, selectors: []int{5}})
+	seedLeg(s, key, legOpts{reqID: 10011, pins: 1})
 
 	s.UnsubscribePositionStrike("IWM", "put", 298, "20260806")
 
-	sels, pins, ok := legHolders(s, key)
-	if !ok {
-		t.Fatal("the position's exit cancelled a contract a watchlist row was still displaying")
-	}
-	if pins != 0 || len(sels) != 1 {
-		t.Fatalf("holders = selectors %v / pins %d, want the selector alone", sels, pins)
-	}
-	if k, ok := displayedKey(s, 5); !ok || k != key {
-		t.Fatal("the watchlist row lost its contract when an unrelated position exited")
+	if pins, ok := legPins(s, key); ok {
+		t.Fatalf("the leg survived its last holder releasing it (pins=%d) — its market-data line is leaked", pins)
 	}
 }

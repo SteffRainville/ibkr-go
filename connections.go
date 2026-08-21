@@ -20,12 +20,13 @@ func (s *Session) MarketDataLineStatus() (used, max, histUsed, histMax, stockUse
 // watchlist size and live line count.
 func (s *Session) ConnectionsSnapshot() ConnectionsStatus {
 	used, max, histUsed, histMax, _, _ := s.mdLines.StatusAll()
-	stock, position, discNew, discChurn, snapshot, probe := s.mdLines.CategoryCounts()
+	stock, position, snapshot, probe := s.mdLines.CategoryCounts()
 
 	stockRows, optionRows, uniqueUnderlyings := s.configuredRowCounts()
 
 	s.optChain.mu.Lock()
-	groups := len(s.optChain.rotation)
+	selectors := len(s.optChain.rotation)
+	chains := len(s.optChain.lastChainInfo)
 	s.optChain.mu.Unlock()
 
 	return ConnectionsStatus{
@@ -34,28 +35,26 @@ func (s *Session) ConnectionsSnapshot() ConnectionsStatus {
 		HistUsed: histUsed,
 		HistMax:  histMax,
 
-		StockLines:              stock,
-		PositionLines:           position,
-		DiscretionaryNewLines:   discNew,
-		DiscretionaryChurnLines: discChurn,
-		SnapshotLines:           snapshot,
-		ProbeLines:              probe,
-		BufferLines:             mdlines.Buffer,
+		StockLines:    stock,
+		PositionLines: position,
+		SnapshotLines: snapshot,
+		ProbeLines:    probe,
+		BufferLines:   mdlines.Buffer,
 
 		ConfiguredStockRows:  stockRows,
 		ConfiguredOptionRows: optionRows,
 		UniqueUnderlyings:    uniqueUnderlyings,
-		OptionGroups:         groups,
+		OptionSelectors:      selectors,
+		CachedChains:         chains,
 
-		RotationIntervalSeconds: int(s.opts.OptionRotationInterval.Seconds()),
+		ChainRefreshIntervalSeconds: int(s.opts.OptionChainRefreshInterval.Seconds()),
 	}
 }
 
 // ConnectionLine describes one currently-active market-data line for the
 // connections diagnostics page — a subscribed underlying (Right/Strike/Expiry
-// zero) or a held option contract. "Held" means a selector is displaying it
-// or a position is pinned to it; a leg that is only warming into place
-// (pendingSwap) is not yet a connection a user would recognize.
+// zero) or a held option contract. Every option line is now pinned by an open
+// position; watchlist rows no longer hold lines at all.
 //
 // The quote and delta fields exist because "this line is active" and "this line
 // is usable" are different claims, and the page previously made only the first.
@@ -73,16 +72,19 @@ type ConnectionLine struct {
 	// not traded.
 	Bid, Ask float64
 
-	// Delta as IB reported it, DeltaSource "matched" (a genuine live match or a
-	// deliberate ATM pick) or "atm_fallback" (chosen without one), and
-	// TargetDelta the largest target among the selectors holding this contract
-	// — 0 when only an open position pins it, which has no target.
+	// Delta as IB reported it, and DeltaSource "matched" (a genuine live match
+	// or a deliberate ATM pick) or "atm_fallback" (chosen without one).
+	//
+	// TargetDelta is gone: it was the largest target_delta among the selectors
+	// holding this contract, and no selector holds one any more. A pinned leg's
+	// contract was fixed at entry, so "how far is it from target" stopped being
+	// a question about this line and became a question about that entry — which
+	// the trade CSV's own delta column already answers.
 	Delta       float64
 	DeltaSource string
-	TargetDelta float64
 
-	// Pinned reports that an open position holds this contract, so it stays
-	// subscribed regardless of what the watchlist rotation wants.
+	// Pinned reports that an open position holds this contract. Always true for
+	// an option line; kept so the page can state it rather than imply it.
 	Pinned bool
 }
 
@@ -106,17 +108,11 @@ func (s *Session) ConnectionsLines() []ConnectionLine {
 		if !leg.held() {
 			continue
 		}
-		line := ConnectionLine{
+		optLines = append(optLines, ConnectionLine{
 			Symbol: key.symbol, Right: key.right, Strike: key.strike, Expiry: key.expiry,
 			Bid: leg.bid, Ask: leg.ask, Delta: leg.delta, DeltaSource: leg.deltaSource,
 			Pinned: leg.pins > 0,
-		}
-		for selID := range leg.selectors {
-			if sel, ok := s.selectorByIDLocked(selID); ok && sel.targetDelta > line.TargetDelta {
-				line.TargetDelta = sel.targetDelta
-			}
-		}
-		optLines = append(optLines, line)
+		})
 	}
 	s.optChain.mu.Unlock()
 	sort.Slice(optLines, func(i, j int) bool {

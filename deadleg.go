@@ -188,8 +188,12 @@ func (a deadLegAction) strike() float64 { return a.key.strike }
 //
 // Only legStale legs are re-subscribed at the same strike. A legSilent leg
 // has never ticked at all, so the strike itself may be unquotable and
-// re-requesting it would fail identically; those are logged and left to the
-// rotation to re-estimate onto a different strike.
+// re-requesting it would fail identically; those are logged for the operator
+// and for ORBtrader's stale-position monitor, which owns the harder repair.
+//
+// Every leg it can see is position-pinned. Background watchlist legs used to
+// dominate this scan and were the reason it existed; they are gone, so this
+// now guards exactly one thing — the feed a live stop-loss prices against.
 func (s *Session) reapDeadOptionLegs() {
 	now := time.Now()
 
@@ -198,7 +202,7 @@ func (s *Session) reapDeadOptionLegs() {
 	s.optChain.mu.Unlock()
 
 	for _, a := range silent {
-		s.optionLog.Printf("Option: WARNING %s %s strike=%.2f (reqID=%d) has NEVER ticked (health=%s) — leaving it for the rotation to re-estimate onto another strike",
+		s.optionLog.Printf("Option: WARNING %s %s strike=%.2f (reqID=%d) has NEVER ticked (health=%s) — the strike itself may be unquotable",
 			a.symbol(), a.right(), a.strike(), a.reqID, a.health)
 	}
 
@@ -211,10 +215,9 @@ func (s *Session) reapDeadOptionLegs() {
 		}
 		s.optionLog.Printf("Option: WARNING %s %s strike=%.2f (reqID=%d, pinned=%v) went SILENT (last tick %s ago) while the option feed is live — forcing re-subscribe of the same contract",
 			a.symbol(), a.right(), a.strike(), a.reqID, a.pinned, a.age)
-		s.forceResubscribeLeg(a.key, "")
+		s.forceResubscribeLeg(a.key)
 	}
 
-	s.sweepStuckPendingLegs(now)
 }
 
 // alertFrozenPositionQuote raises the operator-facing alarm for a
@@ -249,9 +252,6 @@ func (s *Session) planDeadLegRepairsLocked(now time.Time) (repair, silent []dead
 	lastAny := s.optChain.lastAnyOptionTick
 
 	for key, leg := range s.optChain.legs {
-		if s.legIsOnlyWarmingLocked(key) {
-			continue // handled by the promote-or-abandon sweep instead
-		}
 		health := legHealthAt(leg.subscribedAt, leg.lastTickAt, lastAny, now)
 		if health != legStale && health != legSilent {
 			continue
@@ -296,76 +296,4 @@ func sortDeadLegActions(as []deadLegAction) {
 		}
 		return as[i].key.expiry < as[j].key.expiry
 	})
-}
-
-// legIsOnlyWarmingLocked reports whether every selector holding this contract
-// is still warming into it and no position pins it — the state the
-// promote-or-abandon sweep owns. Caller holds s.optChain.mu.
-func (s *Session) legIsOnlyWarmingLocked(key legKey) bool {
-	leg, ok := s.optChain.legs[key]
-	if !ok || leg.pins > 0 || len(leg.selectors) == 0 {
-		return false
-	}
-	for selID := range leg.selectors {
-		if s.optChain.selCurrent[selID] == key {
-			return false
-		}
-	}
-	return true
-}
-
-// sweepStuckPendingLegs promotes or abandons replacement legs stuck pending.
-//
-// promoteIfReadyLocked is only ever reached from a price tick, so a
-// replacement that receives greeks but no price — or nothing at all — stays
-// pending forever while the leg it was meant to replace stays active. That
-// was harmless when replacements only ever appeared on a strike change; the
-// forced-re-subscribe path makes it reachable for a leg that is already known
-// to be dead, which would leave the dead leg in place indefinitely.
-func (s *Session) sweepStuckPendingLegs(now time.Time) {
-	s.optChain.mu.Lock()
-	lastAny := s.optChain.lastAnyOptionTick
-	type stuck struct {
-		reqID int64
-		key   legKey
-		age   string
-	}
-	var abandoned []stuck
-	var cancel []int64
-	for selID, sw := range s.optChain.selPending {
-		if sw.since.IsZero() || now.Sub(sw.since) <= pendingPromoteGrace {
-			continue
-		}
-		// Try the normal promotion first — it succeeds if any usable price
-		// arrived while nothing called it.
-		if id, promoted := s.promotePendingLocked(selID, now); promoted {
-			if id != 0 {
-				cancel = append(cancel, id)
-			}
-			continue
-		}
-		leg, ok := s.optChain.legs[sw.to]
-		if !ok {
-			delete(s.optChain.selPending, selID)
-			continue
-		}
-		switch legHealthAt(leg.subscribedAt, leg.lastTickAt, lastAny, now) {
-		case legStale, legSilent:
-			// fall through to abandon
-		default:
-			continue
-		}
-		delete(s.optChain.selPending, selID)
-		if id := s.detachSelectorLocked(sw.to, selID); id != 0 {
-			abandoned = append(abandoned, stuck{id, sw.to, legAgeString(leg.lastTickAt, now)})
-			cancel = append(cancel, id)
-		}
-	}
-	s.optChain.mu.Unlock()
-
-	s.cancelLines(cancel)
-	for _, a := range abandoned {
-		s.optionLog.Printf("Option: WARNING abandoning stuck pending leg %s %s strike=%.2f (reqID=%d) — never produced a usable quote (last tick %s ago)",
-			a.key.symbol, a.key.right, a.key.strike, a.reqID, a.age)
-	}
 }

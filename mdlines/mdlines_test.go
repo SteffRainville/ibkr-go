@@ -5,123 +5,44 @@ import (
 	"time"
 )
 
-// TestLedger_DiscretionaryNewYieldsToReserve verifies first-quote background
-// lines stop being granted once usage reaches (max - ReserveNewFor(max)), leaving
-// headroom.
-func TestLedger_DiscretionaryNewYieldsToReserve(t *testing.T) {
-	max := 100
-	l := NewLedger(max, 50)
+// The three reserve tests that used to open this file are gone with the
+// reserves themselves. They pinned how far CategoryDiscretionaryNew and
+// CategoryDiscretionaryChurn could grow before yielding headroom to positions
+// and probes — a policy that only existed because one streaming line per
+// watchlist option row competed with them. Nothing is rationed any more; what
+// remains is the guarantee those reserves were protecting, tested directly
+// below: a position line is never refused, and a probe is refused only at the
+// hard cap.
 
-	granted := 0
-	for i := int64(0); i < 200; i++ {
-		if l.GrantDiscretionaryNew(i) {
-			granted++
-		}
-	}
-	if want := max - ReserveNewFor(max); granted != want {
-		t.Fatalf("DiscretionaryNew grants = %d, want %d (max %d − reserve %d)", granted, want, max, ReserveNewFor(max))
-	}
-	if used, _ := l.Status(); used != max-ReserveNewFor(max) {
-		t.Fatalf("used = %d, want %d", used, max-ReserveNewFor(max))
-	}
-}
-
-// TestLedger_DiscretionaryChurnYieldsToReserve verifies background-refresh
-// lines stop being granted at the tighter (max - ReserveChurnFor(max)) threshold.
-func TestLedger_DiscretionaryChurnYieldsToReserve(t *testing.T) {
-	max := 100
-	l := NewLedger(max, 50)
-
-	granted := 0
-	for i := int64(0); i < 200; i++ {
-		if l.GrantDiscretionaryChurn(i) {
-			granted++
-		}
-	}
-	if want := max - ReserveChurnFor(max); granted != want {
-		t.Fatalf("DiscretionaryChurn grants = %d, want %d (max %d − reserve %d)", granted, want, max, ReserveChurnFor(max))
-	}
-	if used, _ := l.Status(); used != max-ReserveChurnFor(max) {
-		t.Fatalf("used = %d, want %d", used, max-ReserveChurnFor(max))
-	}
-}
-
-// TestLedger_DiscretionaryNewOutranksChurn is the core priority-tiering
-// test: once usage reaches the churn threshold, churn requests stop but
-// first-quote (new) requests keep being granted all the way to the wider
-// ReserveNewFor(max) threshold, and guaranteed position lines are never refused
-// throughout.
-func TestLedger_DiscretionaryNewOutranksChurn(t *testing.T) {
-	max := 100
-	l := NewLedger(max, 50)
-
-	// Saturate to the churn threshold using churn grants.
-	for i := int64(0); i < int64(max-ReserveChurnFor(max)); i++ {
-		if !l.GrantDiscretionaryChurn(i) {
-			t.Fatalf("churn grant %d refused before reaching the churn threshold", i)
-		}
-	}
-	if used, _ := l.Status(); used != max-ReserveChurnFor(max) {
-		t.Fatalf("used after saturating churn = %d, want %d", used, max-ReserveChurnFor(max))
-	}
-
-	// Further churn requests must now be refused.
-	if l.GrantDiscretionaryChurn(1000) {
-		t.Fatal("churn grant succeeded past the churn threshold — should be refused")
-	}
-
-	// But new requests must keep being granted, since it's a wider,
-	// higher-priority reserve — up to max-ReserveNewFor(max).
-	newGranted := 0
-	for i := int64(2000); i < int64(2000+ReserveChurnFor(max)-ReserveNewFor(max)+5); i++ {
-		if l.GrantDiscretionaryNew(i) {
-			newGranted++
-		}
-	}
-	if want := ReserveChurnFor(max) - ReserveNewFor(max); newGranted != want {
-		t.Fatalf("DiscretionaryNew grants past the churn threshold = %d, want %d (the freed 75-85 band)", newGranted, want)
-	}
-	if used, _ := l.Status(); used != max-ReserveNewFor(max) {
-		t.Fatalf("used after saturating DiscretionaryNew too = %d, want %d", used, max-ReserveNewFor(max))
-	}
-
-	// Guaranteed position lines must never be refused, even now.
-	for i := int64(5000); i < 5010; i++ {
-		if !l.GrantGuaranteed(i, CategoryPosition) {
-			t.Fatalf("position line %d refused — positions must never be refused", i)
-		}
-	}
-}
-
-// TestLedger_PositionsUseReserve verifies that guaranteed position lines can
-// be placed in the reserve band that discretionary lines are forbidden
-// from — the core "positions win" guarantee.
-func TestLedger_PositionsUseReserve(t *testing.T) {
+// TestLedger_GuaranteedGrantsSurviveAFullPool is the "positions win" guarantee
+// that the reserve band used to protect: with the pool completely full of
+// probes, an open position's line must still be placed.
+func TestLedger_GuaranteedGrantsSurviveAFullPool(t *testing.T) {
 	l := NewLedger(100, 50)
 
-	// Saturate the DiscretionaryNew discretionary budget.
-	for i := int64(0); i < 100; i++ {
-		l.GrantDiscretionaryNew(i)
-	}
-	used, _ := l.Status()
-	if used != 85 {
-		t.Fatalf("after saturation used = %d, want 85", used)
-	}
-
-	// Positions must still be grantable — they draw from the reserve.
-	for i := int64(1000); i < 1020; i++ {
-		if !l.GrantGuaranteed(i, CategoryPosition) {
-			t.Fatalf("position line %d refused — positions must never be refused", i)
+	granted := 0
+	for i := int64(0); i < 200; i++ {
+		if l.GrantProbe(i) {
+			granted++
 		}
 	}
-	used, _ = l.Status()
-	if used != 105 {
-		t.Fatalf("used = %d, want 105 (85 DiscretionaryNew + 20 positions)", used)
+	// Probes fill to the hard cap — buffer included, since a probe may dip into
+	// it — and are refused beyond it.
+	if granted != 100 {
+		t.Fatalf("probe grants = %d, want 100 (up to the hard cap)", granted)
+	}
+	if l.GrantProbe(9999) {
+		t.Fatal("a probe was granted past the hard cap")
 	}
 
-	// A fresh DiscretionaryNew request is still blocked.
-	if l.GrantDiscretionaryNew(2000) {
-		t.Fatal("DiscretionaryNew grant succeeded inside the positions reserve")
+	// Positions are still grantable, and go over the cap rather than be refused.
+	for i := int64(1000); i < 1020; i++ {
+		if !l.GrantGuaranteed(i, CategoryPosition) {
+			t.Fatalf("position line %d refused — a held contract must never lose its feed", i)
+		}
+	}
+	if used, _ := l.Status(); used != 120 {
+		t.Fatalf("used = %d, want 120 (100 probes + 20 positions)", used)
 	}
 }
 
@@ -143,21 +64,21 @@ func TestLedger_GuaranteedNeverRefusedOverCap(t *testing.T) {
 // discretionary budget, and that double-release / unknown-release are safe.
 func TestLedger_ReleaseFreesLine(t *testing.T) {
 	l := NewLedger(100, 50)
-	for i := int64(0); i < 85; i++ {
-		l.GrantDiscretionaryNew(i)
+	for i := int64(0); i < 100; i++ {
+		l.GrantProbe(i)
 	}
-	if l.GrantDiscretionaryNew(999) {
-		t.Fatal("expected DiscretionaryNew block at reserve boundary")
+	if l.GrantProbe(999) {
+		t.Fatal("expected a probe to be refused at the hard cap")
 	}
 	l.Release(0)      // free one
 	l.Release(123456) // unknown — must be a no-op
-	if !l.GrantDiscretionaryNew(999) {
-		t.Fatal("DiscretionaryNew should be grantable after a release")
+	if !l.GrantProbe(999) {
+		t.Fatal("a probe should be grantable after a release")
 	}
 	l.Release(999)
 	l.Release(999) // double release — must not underflow
-	if used, _ := l.Status(); used != 84 {
-		t.Fatalf("used = %d, want 84", used)
+	if used, _ := l.Status(); used != 99 {
+		t.Fatalf("used = %d, want 99", used)
 	}
 }
 
@@ -219,11 +140,8 @@ func TestLedger_StatusAllSplitsStockAndOption(t *testing.T) {
 	for i := int64(10); i < 13; i++ {
 		l.GrantGuaranteed(i, CategoryPosition) // 3 position lines
 	}
-	for i := int64(20); i < 24; i++ {
-		l.GrantDiscretionaryNew(i) // 4 first-quote lines
-	}
-	for i := int64(30); i < 32; i++ {
-		l.GrantDiscretionaryChurn(i) // 2 refresh lines
+	for i := int64(20); i < 26; i++ {
+		l.GrantProbe(i) // 6 in-flight entry probes
 	}
 	l.TrackSnapshot(40) // 1 snapshot line — must be excluded from both buckets
 
@@ -231,10 +149,10 @@ func TestLedger_StatusAllSplitsStockAndOption(t *testing.T) {
 	if stockUsed != 5 {
 		t.Errorf("stockUsed = %d, want 5", stockUsed)
 	}
-	if optionUsed != 9 { // 3 position + 4 new + 2 churn
+	if optionUsed != 9 { // 3 position + 6 probe
 		t.Errorf("optionUsed = %d, want 9", optionUsed)
 	}
-	if used != 15 { // 5 + 3 + 4 + 2 + 1 snapshot
+	if used != 15 { // 5 + 3 + 6 + 1 snapshot
 		t.Errorf("used = %d, want 15", used)
 	}
 	if max != 100 {
@@ -253,7 +171,7 @@ func TestLedger_OnChangeFires(t *testing.T) {
 	l.SetOnChange(func(used, _ int) { lastUsed = used; calls++ })
 
 	l.GrantGuaranteed(1, CategoryStock)
-	l.GrantDiscretionaryNew(2)
+	l.GrantProbe(2)
 	l.Release(1)
 	if calls < 3 {
 		t.Fatalf("onChange calls = %d, want ≥3", calls)
@@ -289,7 +207,7 @@ func TestLedger_ReapSnapshots(t *testing.T) {
 		t.Errorf("reaped = %v, want exactly {101,102}", reaped)
 	}
 	// The fresh snapshot and the guaranteed line remain.
-	if _, _, _, _, snap, _ := l.CategoryCounts(); snap != 1 {
+	if _, _, snap, _ := l.CategoryCounts(); snap != 1 {
 		t.Errorf("snapshot count = %d after reap, want 1 (the fresh one)", snap)
 	}
 	if used := func() int { u, _ := l.Status(); return u }(); used != 2 {
@@ -315,14 +233,13 @@ func TestLedger_ReapProbes(t *testing.T) {
 	l := NewLedger(100, 50)
 
 	l.GrantGuaranteed(1, CategoryStock) // non-probe — must never be reaped
-	evicted, ok := l.GrantProbe(100)    // fresh probe — must survive
-	if !ok || evicted != 0 {
-		t.Fatalf("GrantProbe(100) = (%d,%v), want (0,true)", evicted, ok)
+	if !l.GrantProbe(100) {             // fresh probe — must survive
+		t.Fatal("GrantProbe(100) refused")
 	}
-	if _, ok := l.GrantProbe(101); !ok { // will be aged past maxAge — must be reaped
+	if !l.GrantProbe(101) { // will be aged past maxAge — must be reaped
 		t.Fatal("GrantProbe(101) refused")
 	}
-	if _, ok := l.GrantProbe(102); !ok { // will be aged past maxAge — must be reaped
+	if !l.GrantProbe(102) { // will be aged past maxAge — must be reaped
 		t.Fatal("GrantProbe(102) refused")
 	}
 
@@ -339,7 +256,7 @@ func TestLedger_ReapProbes(t *testing.T) {
 	if !got[101] || !got[102] {
 		t.Errorf("reaped = %v, want exactly {101,102}", reaped)
 	}
-	if _, _, _, _, _, probe := l.CategoryCounts(); probe != 1 {
+	if _, _, _, probe := l.CategoryCounts(); probe != 1 {
 		t.Errorf("probe count = %d after reap, want 1 (the fresh one)", probe)
 	}
 	if used := func() int { u, _ := l.Status(); return u }(); used != 2 {
@@ -365,10 +282,10 @@ func TestLedger_ReapProbes(t *testing.T) {
 func TestLedger_ReclassifyClearsProbeAge(t *testing.T) {
 	l := NewLedger(100, 50)
 
-	if _, ok := l.GrantProbe(1); !ok {
+	if !l.GrantProbe(1) {
 		t.Fatal("GrantProbe(1) refused")
 	}
-	l.Reclassify(1, CategoryDiscretionaryNew)
+	l.Reclassify(1, CategoryPosition)
 	if _, ok := l.probeAt[1]; ok {
 		t.Fatal("probeAt[1] still set after Reclassify out of CategoryProbe")
 	}
@@ -378,8 +295,8 @@ func TestLedger_ReclassifyClearsProbeAge(t *testing.T) {
 	if len(reaped) != 0 {
 		t.Errorf("ReapProbes reaped %v, want none — line 1 is no longer CategoryProbe", reaped)
 	}
-	if _, _, discNew, _, _, _ := l.CategoryCounts(); discNew != 1 {
-		t.Errorf("discretionaryNew count = %d, want 1 — Reclassify must not have been undone", discNew)
+	if _, pos, _, _ := l.CategoryCounts(); pos != 1 {
+		t.Errorf("position count = %d, want 1 — Reclassify must not have been undone", pos)
 	}
 }
 
@@ -390,8 +307,8 @@ func TestLedger_AllReqIDs(t *testing.T) {
 	l := NewLedger(100, 50)
 	l.GrantGuaranteed(1, CategoryStock)
 	l.GrantGuaranteed(2, CategoryPosition)
-	l.GrantDiscretionaryNew(3)
-	l.GrantDiscretionaryChurn(4)
+	l.GrantProbe(3)
+	l.GrantGuaranteed(4, CategoryPosition)
 	l.GrantSnapshot(5)
 	l.GrantHist(1001)
 	l.GrantHist(1002)
@@ -422,67 +339,10 @@ func TestLedger_AllReqIDs(t *testing.T) {
 	}
 }
 
-// TestReserves_ProportionalToTheCap pins the two properties the percentage form
-// exists for: at the default cap of 100 it reproduces the fixed 15/25 the
-// reserves used to be — so the change is a no-op for an ordinary account — and
-// above that it scales, instead of a fixed 25 meaning "a quarter of the pool"
-// on one account and "a twentieth" on another.
-func TestReserves_ProportionalToTheCap(t *testing.T) {
-	tests := []struct {
-		max                int
-		wantNew, wantChurn int
-	}{
-		{max: 100, wantNew: 15, wantChurn: 25}, // the historical fixed values
-		{max: 250, wantNew: 37, wantChurn: 62},
-		{max: 500, wantNew: 75, wantChurn: 125},
-		{max: 20, wantNew: 4, wantChurn: 6}, // floors, not 3 and 5
-	}
-	for _, tc := range tests {
-		if got := ReserveNewFor(tc.max); got != tc.wantNew {
-			t.Errorf("ReserveNewFor(%d) = %d, want %d", tc.max, got, tc.wantNew)
-		}
-		if got := ReserveChurnFor(tc.max); got != tc.wantChurn {
-			t.Errorf("ReserveChurnFor(%d) = %d, want %d", tc.max, got, tc.wantChurn)
-		}
-		if ReserveChurnFor(tc.max) < ReserveNewFor(tc.max) {
-			t.Errorf("cap %d: churn reserve %d < new reserve %d — background refreshes must yield "+
-				"their headroom BEFORE first-quote subscriptions do",
-				tc.max, ReserveChurnFor(tc.max), ReserveNewFor(tc.max))
-		}
-	}
-
-	// A pathologically small cap must still leave one grantable line rather
-	// than refusing everything.
-	l := NewLedger(3, 5)
-	if !l.GrantDiscretionaryNew(1) {
-		t.Fatal("a 3-line cap granted nothing at all — the reserve must never reach the cap")
-	}
-}
-
-// TestNewLedgerWithReserves_Overrides verifies the configured percentages
-// actually move the thresholds, since the whole point of exposing them is that
-// an account whose entitlement differs from the library's assumptions can say so.
-func TestNewLedgerWithReserves_Overrides(t *testing.T) {
-	l := NewLedgerWithReserves(100, 50, 5, 10)
-	gotNew, gotChurn := l.Reserves()
-	if gotNew != 5 || gotChurn != 10 {
-		t.Fatalf("Reserves() = (%d, %d), want (5, 10)", gotNew, gotChurn)
-	}
-
-	granted := 0
-	for i := int64(0); i < 200; i++ {
-		if l.GrantDiscretionaryChurn(i) {
-			granted++
-		}
-	}
-	if want := 100 - 10; granted != want {
-		t.Fatalf("churn grants under a 10%% override = %d, want %d", granted, want)
-	}
-
-	// Zero means "take the default", not "no reserve at all".
-	d := NewLedgerWithReserves(100, 50, 0, 0)
-	if n, c := d.Reserves(); n != ReserveNewFor(100) || c != ReserveChurnFor(100) {
-		t.Fatalf("Reserves() with zero overrides = (%d, %d), want the defaults (%d, %d)",
-			n, c, ReserveNewFor(100), ReserveChurnFor(100))
-	}
-}
+// TestReserves_ProportionalToTheCap and TestNewLedgerWithReserves_Overrides
+// used to close this file. Both tested the percentage-based discretionary
+// reserves — that at a cap of 100 they reproduced the fixed 15/25 they replaced,
+// and that a caller could override them. There are no reserves to size or
+// override now: the categories they rationed have no members, and a pool that
+// holds only underlyings, held positions and in-flight probes has nothing to
+// ration between.

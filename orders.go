@@ -475,23 +475,18 @@ func (s *Session) settleInFlightSell(orderID int64) {
 // NEVER consulted — this is what makes the drifted-ATM class of bug
 // structurally impossible for a tracked close.
 //
-// Only when the identity is absent does it fall back to the current ATM
-// leg. That fallback stays safe because ClosePosition gates the resulting
-// SELL through ensureOptionHeldForClose against IB's own portfolio.
-func (s *Session) resolveCloseContract(o OrderRequest, busIdx int) (strike float64, expiry string, bid, ask, mid float64, err error) {
-	switch {
-	case o.Strike > 0 && o.OptionExpiry != "":
-		return o.Strike, o.OptionExpiry, o.Bid, o.Ask, 0, nil
-	case o.Strike <= 0 && o.OptionExpiry == "":
-		opt, ok := s.currentOptionContract(o.Symbol, o.Tag, busIdx)
-		if !ok {
-			return 0, "", 0, 0, 0, fmt.Errorf("no resolved option contract for %s %s yet", o.Symbol, o.Tag)
-		}
-		return opt.strike, opt.expiry, opt.bid, opt.ask, opt.mid, nil
-	default:
+// The identity is now mandatory, as it is for resolveBuyContract. It used to
+// fall back to the current ATM leg when fully absent — safe only because
+// ClosePosition gates the SELL through ensureOptionHeldForClose against IB's
+// own portfolio — but with background legs gone there is no ATM leg to read.
+// Every close in practice carries the identity already: it comes off the
+// stored Position, which is where a close should get it from anyway.
+func (s *Session) resolveCloseContract(o OrderRequest) (strike float64, expiry string, bid, ask, mid float64, err error) {
+	if o.Strike <= 0 || o.OptionExpiry == "" {
 		return 0, "", 0, 0, 0, fmt.Errorf("cannot close %s %s: position missing strike/expiry (strike=%.0f expiry=%q)",
 			o.Symbol, o.Tag, o.Strike, o.OptionExpiry)
 	}
+	return o.Strike, o.OptionExpiry, o.Bid, o.Ask, 0, nil
 }
 
 // ClosePosition places an order to close a position leg. Stocks: a
@@ -508,7 +503,7 @@ func (s *Session) ClosePosition(sub Subscriber, o OrderRequest) (OrderResult, er
 			ibRight = "P"
 		}
 
-		strike, expiry, bid, ask, mid, err := s.resolveCloseContract(o, s.busIndex(bus))
+		strike, expiry, bid, ask, mid, err := s.resolveCloseContract(o)
 		if err != nil {
 			return OrderResult{}, err
 		}
@@ -560,31 +555,31 @@ func (s *Session) ClosePosition(sub Subscriber, o OrderRequest) (OrderResult, er
 // without this, the real order could silently target a different strike
 // than the one the caller priced and recorded.
 //
-// Only when the identity is fully absent does it fall back to the current
-// ATM leg. A partial identity (exactly one of strike/expiry set) is refused
-// rather than guessed.
-func (s *Session) resolveBuyContract(o OrderRequest, busIdx int) (strike float64, expiry string, bid, ask, mid float64, err error) {
-	switch {
-	case o.Strike > 0 && o.OptionExpiry != "":
-		switch {
-		case o.Bid > 0 && o.Ask > 0:
-			mid = (o.Bid + o.Ask) / 2
-		case o.Ask > 0:
-			mid = o.Ask
-		case o.Bid > 0:
-			mid = o.Bid
-		}
-		return o.Strike, o.OptionExpiry, o.Bid, o.Ask, mid, nil
-	case o.Strike <= 0 && o.OptionExpiry == "":
-		opt, ok := s.currentOptionContract(o.Symbol, o.Tag, busIdx)
-		if !ok {
-			return 0, "", 0, 0, 0, fmt.Errorf("no resolved option contract for %s %s yet", o.Symbol, o.Tag)
-		}
-		return opt.strike, opt.expiry, opt.bid, opt.ask, opt.mid, nil
-	default:
-		return 0, "", 0, 0, 0, fmt.Errorf("cannot buy %s %s: partial contract identity (strike=%.0f expiry=%q)",
+// The identity is now MANDATORY. There used to be a fallback to "whatever
+// contract the background ATM leg currently displays" for an order that
+// carried no strike/expiry — which in practice meant the manual dashboard buy
+// button, the one caller that never ran a delta probe. Background legs are
+// gone, so there is nothing left to fall back TO; the manual buy path resolves
+// its own contract through ResolveEntryStrike first, exactly as the bot does,
+// and arrives here with a full identity.
+//
+// Requiring it is also the stronger design: an option order whose contract was
+// chosen by a display heuristic rather than by the code that priced it is the
+// drifted-ATM bug (2026-07-08) with extra steps.
+func (s *Session) resolveBuyContract(o OrderRequest) (strike float64, expiry string, bid, ask, mid float64, err error) {
+	if o.Strike <= 0 || o.OptionExpiry == "" {
+		return 0, "", 0, 0, 0, fmt.Errorf("cannot buy %s %s: contract identity required (strike=%.0f expiry=%q) — resolve it with ResolveEntryStrike first",
 			o.Symbol, o.Tag, o.Strike, o.OptionExpiry)
 	}
+	switch {
+	case o.Bid > 0 && o.Ask > 0:
+		mid = (o.Bid + o.Ask) / 2
+	case o.Ask > 0:
+		mid = o.Ask
+	case o.Bid > 0:
+		mid = o.Bid
+	}
+	return o.Strike, o.OptionExpiry, o.Bid, o.Ask, mid, nil
 }
 
 // OpenPosition opens a position leg. o.Tag is "long"/"short" (stock) or
@@ -597,7 +592,7 @@ func (s *Session) OpenPosition(sub Subscriber, o OrderRequest) (OrderResult, err
 	priority := sub.OrderPriority("buy")
 
 	if isOptionTag(o.Tag) {
-		strike, expiry, bid, ask, mid, err := s.resolveBuyContract(o, s.busIndex(bus))
+		strike, expiry, bid, ask, mid, err := s.resolveBuyContract(o)
 		if err != nil {
 			return OrderResult{}, err
 		}

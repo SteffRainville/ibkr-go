@@ -204,7 +204,7 @@ func TestPickRotationSelectorLocked_TiedRotateFairly(t *testing.T) {
 	seen := map[string]int{}
 	for i := 0; i < 6; i++ {
 		s.optChain.mu.Lock()
-		sel, ok := s.pickRotationSelectorLocked()
+		sel, ok := s.pickChainRefreshSelectorLocked()
 		s.optChain.mu.Unlock()
 		if !ok {
 			t.Fatalf("pick %d: expected a selector, got none", i)
@@ -232,7 +232,7 @@ func TestPickRotationSelectorLocked_SkipsResolving(t *testing.T) {
 
 	for i := 0; i < 4; i++ {
 		s.optChain.mu.Lock()
-		sel, ok := s.pickRotationSelectorLocked()
+		sel, ok := s.pickChainRefreshSelectorLocked()
 		s.optChain.mu.Unlock()
 		if !ok {
 			t.Fatalf("pick %d: expected BBB, got none", i)
@@ -252,7 +252,7 @@ func TestPickRotationSelectorLocked_EmptyWhenAllResolving(t *testing.T) {
 	s.optChain.conIDReqs[500] = &optConIDReq{chain: chainKey{"AAA", 0}, waiters: []int{0}}
 
 	s.optChain.mu.Lock()
-	_, ok := s.pickRotationSelectorLocked()
+	_, ok := s.pickChainRefreshSelectorLocked()
 	s.optChain.mu.Unlock()
 	if ok {
 		t.Fatal("expected no selector when the only one is still resolving")
@@ -278,20 +278,20 @@ func TestPickRotationSelectorLocked_UnquotedLegDoesNotStarveForever(t *testing.T
 		{id: 1, symbol: "GOOD", right: "call"},
 	}
 
-	seedLeg(s, lk("GOOD", "call", 100, ""), legOpts{reqID: 10, selectors: []int{1}})
+	seedLeg(s, lk("GOOD", "call", 100, ""), legOpts{reqID: 10})
 	s.book.SetOptionBid(quotes.ContractKey{Symbol: "GOOD", Right: "call", Strike: 100}, 1.0)
 	goodQuotedAt := time.Now()
 
 	// STUCK has a leg (already attempted once, hence it exists) but has never
 	// received a book tick — the illiquid-strike case.
-	seedLeg(s, lk("STUCK", "call", 50, ""), legOpts{reqID: 20, selectors: []int{0}})
+	seedLeg(s, lk("STUCK", "call", 50, ""), legOpts{reqID: 20})
 
 	time.Sleep(2 * time.Millisecond) // ensure strictly-ordered timestamps below
 
 	// First pick: STUCK has never been recorded in lastAttempt, so it still
 	// correctly scores as maximally stale and goes first.
 	s.optChain.mu.Lock()
-	sel, ok := s.pickRotationSelectorLocked()
+	sel, ok := s.pickChainRefreshSelectorLocked()
 	s.optChain.mu.Unlock()
 	if !ok || sel.symbol != "STUCK" {
 		t.Fatalf("first pick = %v (ok=%v), want STUCK", sel.symbol, ok)
@@ -309,7 +309,7 @@ func TestPickRotationSelectorLocked_UnquotedLegDoesNotStarveForever(t *testing.T
 	// due — must win. Before the fix STUCK would still score zero and win again,
 	// forever.
 	s.optChain.mu.Lock()
-	sel, ok = s.pickRotationSelectorLocked()
+	sel, ok = s.pickChainRefreshSelectorLocked()
 	s.optChain.mu.Unlock()
 	if !ok || sel.symbol != "GOOD" {
 		t.Fatalf("second pick = %v (ok=%v), want GOOD — STUCK must not win indefinitely after its own attempt", sel.symbol, ok)
@@ -343,8 +343,8 @@ func TestPickRotationSelectorLocked_OverdueLiquidWins(t *testing.T) {
 		{id: 0, symbol: "LIQUID", right: "call"},
 		{id: 1, symbol: "THIN", right: "call"},
 	}
-	seedLeg(s, lk("LIQUID", "call", 100, ""), legOpts{reqID: 10, selectors: []int{0}})
-	seedLeg(s, lk("THIN", "call", 50, ""), legOpts{reqID: 20, selectors: []int{1}})
+	seedLeg(s, lk("LIQUID", "call", 100, ""), legOpts{reqID: 10})
+	seedLeg(s, lk("THIN", "call", 50, ""), legOpts{reqID: 20})
 
 	// LIQUID is badly overdue for a strike re-estimate; THIN was serviced a
 	// moment ago. On need alone LIQUID must win.
@@ -357,7 +357,7 @@ func TestPickRotationSelectorLocked_OverdueLiquidWins(t *testing.T) {
 	s.book.SetOptionBid(quotes.ContractKey{Symbol: "LIQUID", Right: "call", Strike: 100}, 1.25)
 
 	s.optChain.mu.Lock()
-	sel, ok := s.pickRotationSelectorLocked()
+	sel, ok := s.pickChainRefreshSelectorLocked()
 	s.optChain.mu.Unlock()
 
 	if !ok {
@@ -382,14 +382,14 @@ func TestPickRotationSelectorLocked_LeglessDoesNotMonopolize(t *testing.T) {
 		{id: 0, symbol: "LEGLESS", right: "call"},
 		{id: 1, symbol: "NORMAL", right: "call"},
 	}
-	seedLeg(s, lk("NORMAL", "call", 50, ""), legOpts{reqID: 20, selectors: []int{1}})
+	seedLeg(s, lk("NORMAL", "call", 50, ""), legOpts{reqID: 20})
 
 	// LEGLESS was serviced most recently, so NORMAL is the one due.
 	s.optChain.lastAttempt[0] = now.Add(-1 * time.Second)
 	s.optChain.lastAttempt[1] = now.Add(-10 * time.Second)
 
 	s.optChain.mu.Lock()
-	sel, ok := s.pickRotationSelectorLocked()
+	sel, ok := s.pickChainRefreshSelectorLocked()
 	s.optChain.mu.Unlock()
 
 	if !ok {

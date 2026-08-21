@@ -70,55 +70,17 @@ func TestBuildSelectors_ParameterChangeIsANewSelector(t *testing.T) {
 	}
 }
 
-// TestReleaseDepartedSelectors_FreesTheirLines verifies a selector that no
-// longer exists after a rebuild lets go of the contract it was holding. Without
-// this, editing a row's target_delta would strand its old leg's market-data
-// line for the rest of the session — the new selector is a different id, so
-// nothing would ever detach the old one.
-func TestReleaseDepartedSelectors_FreesTheirLines(t *testing.T) {
-	s := withOfflineClient(newRotationTestSession([][]SymbolSpec{{
-		{Symbol: "QQQ", Tag: "call", TargetDelta: 0.50},
-	}}))
-	s.buildSelectors()
-	oldID := s.optChain.rotation[0].id
-	key := lk("QQQ", "call", 480, "20260817")
-	seedLeg(s, key, legOpts{reqID: 1, selectors: []int{oldID}})
-
-	s.subSymbols = [][]SymbolSpec{{
-		{Symbol: "QQQ", Tag: "call", TargetDelta: 0.70},
-	}}
-	s.buildSelectors()
-	s.releaseDepartedSelectors()
-
-	if _, _, ok := legHolders(s, key); ok {
-		t.Fatal("the departed selector's leg survived — its market-data line is stranded for the session")
-	}
-}
-
-// TestReleaseDepartedSelectors_KeepsAPinnedContract verifies the refcount still
-// protects an open position: a watchlist row disappearing must not cancel a
-// contract a position is pricing its stops against.
-func TestReleaseDepartedSelectors_KeepsAPinnedContract(t *testing.T) {
-	s := newRotationTestSession([][]SymbolSpec{{
-		{Symbol: "QQQ", Tag: "call", TargetDelta: 0.50},
-	}})
-	s.buildSelectors()
-	oldID := s.optChain.rotation[0].id
-	key := lk("QQQ", "call", 480, "20260817")
-	seedLeg(s, key, legOpts{reqID: 1, selectors: []int{oldID}, pins: 1})
-
-	s.subSymbols = [][]SymbolSpec{{}}
-	s.buildSelectors()
-	s.releaseDepartedSelectors()
-
-	sels, pins, ok := legHolders(s, key)
-	if !ok {
-		t.Fatal("a held position's contract was cancelled by an unrelated watchlist edit")
-	}
-	if len(sels) != 0 || pins != 1 {
-		t.Fatalf("holders = selectors %v / pins %d, want the pin alone", sels, pins)
-	}
-}
+// TestReleaseDepartedSelectors_FreesTheirLines and
+// ..._KeepsAPinnedContract stood here. Both exercised releaseDepartedSelectors,
+// which walked selCurrent/selPending after a rebuild and cancelled the lines of
+// selectors that no longer existed — necessary when editing a row's target_delta
+// would otherwise strand its old leg's subscription for the session.
+//
+// A selector holds no market-data line now, so dropping it from the rotation IS
+// releasing it and there is nothing left to walk. The half that still matters —
+// a watchlist edit must never cancel a contract an open position is pricing its
+// stops against — is unconditional rather than guarded: only a pin holds a leg,
+// and only the exit path releases one. possub_refcount_test.go covers it.
 
 // TestSymbolRegistry_IDsAreNeverReissued covers the reqID allocation rule
 // ResyncSymbols relies on. Index-derived IDs are unique only while the

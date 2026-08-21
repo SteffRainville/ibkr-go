@@ -58,7 +58,7 @@ func TestError_ReleasesScannerSnapshotLine(t *testing.T) {
 	// IB error 354 = "requested market data is not subscribed" — no TickSnapshotEnd follows.
 	s.Error(snapID, 0, 354, "not subscribed", "")
 
-	if _, _, _, _, snap, _ := s.mdLines.CategoryCounts(); snap != 0 {
+	if _, _, snap, _ := s.mdLines.CategoryCounts(); snap != 0 {
 		t.Errorf("snapshot line count = %d after errored scanner snapshot, want 0 (leaked)", snap)
 	}
 	if used, _ := s.mdLines.Status(); used != 0 {
@@ -85,13 +85,13 @@ func TestError_ReleasesPositionSnapshotLine(t *testing.T) {
 	s.mktData.snapReqSymbol[reqID] = "AAPL"
 	s.mdLines.TrackSnapshot(reqID)
 
-	if _, _, _, _, snap, _ := s.mdLines.CategoryCounts(); snap != 1 {
+	if _, _, snap, _ := s.mdLines.CategoryCounts(); snap != 1 {
 		t.Fatalf("precondition: snapshot count = %d, want 1", snap)
 	}
 
 	s.Error(reqID, 0, 354, "not subscribed", "")
 
-	if _, _, _, _, snap, _ := s.mdLines.CategoryCounts(); snap != 0 {
+	if _, _, snap, _ := s.mdLines.CategoryCounts(); snap != 0 {
 		t.Errorf("snapshot line count = %d after errored position snapshot, want 0 (leaked)", snap)
 	}
 	if _, ok := s.mktData.snapReqSymbol[reqID]; ok {
@@ -107,13 +107,13 @@ func TestCancelAllSubscriptions_NotConnectedNoPanic(t *testing.T) {
 
 	s.mdLines.GrantGuaranteed(2001, mdlines.CategoryStock)
 	s.mdLines.GrantGuaranteed(10001, mdlines.CategoryPosition)
-	s.mdLines.GrantDiscretionaryNew(7001)
+	s.mdLines.GrantProbe(7001)
 	s.mdLines.TrackSnapshot(5001)
 	s.mdLines.GrantHist(1001)
 
 	// The sweep set must cover every market-data line and the hist stream.
 	if got := len(s.mdLines.AllReqIDs()); got != 4 {
-		t.Fatalf("allReqIDs len = %d, want 4 (stock+position+atm+snapshot)", got)
+		t.Fatalf("allReqIDs len = %d, want 4 (stock+position+probe+snapshot)", got)
 	}
 	if got := len(s.mdLines.AllHistReqIDs()); got != 1 {
 		t.Fatalf("allHistReqIDs len = %d, want 1", got)

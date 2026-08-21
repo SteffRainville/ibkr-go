@@ -59,7 +59,7 @@ func TestResolveEntryStrike_LaunchCooldownDoesNotBlockSharedRead(t *testing.T) {
 	s.book.SetOptionAsk(key, 6.60)
 
 	s.optChain.mu.Lock()
-	s.optChain.resolvedEntry[1] = resolvedEntryLeg{strike: 735, expiry: "20260731", delta: -0.65, at: time.Now()}
+	s.optChain.resolvedEntry[1] = resolvedEntryLeg{strike: 735, expiry: "20260731", delta: -0.65, bid: 6.50, ask: 6.60, at: time.Now()}
 	// A launch cooldown is simultaneously active for this exact key — proves
 	// it doesn't gate the shared-cache read, only becoming a fresh owner.
 	s.optChain.lastProbeLaunch[1] = time.Now()
@@ -100,7 +100,7 @@ func TestResolveEntryStrike_LaunchCooldownDoesNotBlockJoiningInFlightSibling(t *
 		s.book.SetOptionAsk(key, 6.60)
 		s.optChain.mu.Lock()
 		delete(s.optChain.deltaRes, 1)
-		s.optChain.resolvedEntry[1] = resolvedEntryLeg{strike: 735, expiry: "20260731", delta: -0.65, at: time.Now()}
+		s.optChain.resolvedEntry[1] = resolvedEntryLeg{strike: 735, expiry: "20260731", delta: -0.65, bid: 6.50, ask: 6.60, at: time.Now()}
 		s.optChain.mu.Unlock()
 	}()
 

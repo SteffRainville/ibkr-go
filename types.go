@@ -120,6 +120,11 @@ type OptionQuote struct {
 	Ask    float64
 	Last   float64
 	Delta  float64
+	// IV is the implied volatility IB reported alongside Delta on the same
+	// greeks tick. Carried on the quote because the entry probe is now the ONLY
+	// place an option IV is observed — there is no background leg accumulating
+	// one per watchlist row any more — and the trade log records it per entry.
+	IV float64
 	// BidTime/AskTime record when each side last actually ticked (not when this
 	// struct was built) — the freshness signal callers use to tell a genuinely
 	// live quote from a stale one that just hasn't been overwritten yet on a thin
@@ -128,12 +133,15 @@ type OptionQuote struct {
 	AskTime time.Time
 }
 
-// Valid reports whether this quote carries a usable two-sided price for a
-// real strike — the precondition for adopting a resolved quote over an
-// estimate. A quote with a strike but no bid/ask (e.g. a delta-only probe
+// Valid reports whether this quote fully identifies a real contract AND
+// carries a usable two-sided price for it — the precondition for trading
+// against it. A quote with a strike but no bid/ask (e.g. a delta-only probe
 // match) is NOT valid.
+//
+// The expiry counts as identity: strike alone does not name a contract, and a
+// caller that pins a position on an incomplete identity cannot close it later.
 func (q OptionQuote) Valid() bool {
-	return q.Strike > 0 && q.Bid > 0 && q.Ask > 0
+	return q.Strike > 0 && q.Expiry != "" && q.Bid > 0 && q.Ask > 0
 }
 
 // AccountSummary holds cash and margin info for one IB account, populated
@@ -208,20 +216,30 @@ type ConnectionsStatus struct {
 	Used, Max         int
 	HistUsed, HistMax int
 
-	StockLines              int
-	PositionLines           int
-	DiscretionaryNewLines   int
-	DiscretionaryChurnLines int
-	SnapshotLines           int
-	ProbeLines              int
-	BufferLines             int
+	// The two PERSISTENT line kinds, then the two TRANSIENT ones. There were
+	// formerly two more persistent tiers between them (DiscretionaryNew and
+	// DiscretionaryChurn) holding one streaming line per watchlist option row;
+	// they are gone, which is why a healthy account now sits far below Max.
+	StockLines    int
+	PositionLines int
+	SnapshotLines int
+	ProbeLines    int
+	BufferLines   int
 
 	ConfiguredStockRows  int
 	ConfiguredOptionRows int
 	UniqueUnderlyings    int
-	OptionGroups         int
 
-	RotationIntervalSeconds int
+	// OptionSelectors is how many distinct (symbol, right, delay, target_delta)
+	// configurations exist, and CachedChains how many option chains are held in
+	// the snapshot cache. Neither costs a market-data line — that is the point.
+	// A selector is now purely a strike-selection RECIPE consulted at entry
+	// time; ConfiguredOptionRows greatly exceeding PositionLines is the normal,
+	// healthy state rather than the shortfall it used to signal.
+	OptionSelectors int
+	CachedChains    int
+
+	ChainRefreshIntervalSeconds int
 }
 
 // ErrorEvent is a session-level error notification — connection drops,
@@ -254,23 +272,22 @@ type Options struct {
 	TradingAccount string
 
 	ConnectTimeout          time.Duration // default 10s
-	OptionRotationInterval  time.Duration // default 5s
 	PositionRefreshInterval time.Duration // default 5m
 	BarStallTimeout         time.Duration // default 120s (RTH); widened automatically outside RTH
 	MaxMarketDataLines      int           // default 100
 	MaxHistoricalStreams    int           // default 50
 
-	// Discretionary market-data reserves, as a percentage of
-	// MaxMarketDataLines: the point below the cap at which background
-	// first-quote and background-refresh subscriptions stop being granted.
-	// Zero takes mdlines.ReserveNewPct / ReserveChurnPct (15 / 25).
+	// OptionChainRefreshInterval paces the background sweep that keeps each
+	// watched underlying's option-chain SNAPSHOT (expiries + strike ladder)
+	// inside chainSnapshotTTL. One chain per tick, round-robin.
 	//
-	// Lowering the churn reserve buys background strike refreshes with headroom
-	// otherwise held for position feeds and entry probes, so it is a risk
-	// decision rather than a way to fit a watchlist that is simply larger than
-	// the account's line entitlement.
-	MDLineReserveNewPct   int
-	MDLineReserveChurnPct int
+	// A chain lookup is conId + ReqSecDefOptParams — it costs no market-data
+	// line, which is why this sweep survived the removal of the background
+	// strike subscriptions it used to accompany. It is load-bearing:
+	// ResolveEntryStrike reads the cached snapshot and never fetches one
+	// itself, so a stalled sweep means entries fall back to an on-demand
+	// lookup. Default 5s.
+	OptionChainRefreshInterval time.Duration
 
 	Logger                         *log.Logger // default log.Default()
 	ScanLog, OptionLog, AccountLog io.Writer   // default io.Discard
