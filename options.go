@@ -374,7 +374,7 @@ const (
 	entryFailProbeCooldown = "option_probe_cooldown"
 	// entryFailDeltaTargetATM — target_delta sits in the refused ATM band.
 	entryFailDeltaTargetATM = "option_delta_target_atm"
-	// entryFailNoCandidates — selectITMCandidates found no strike to probe.
+	// entryFailNoCandidates — selectStrikeCandidates found no strike to probe.
 	entryFailNoCandidates = "option_no_candidates"
 	// entryFailNoMDLines — every GrantProbe was refused; the market-data line
 	// budget is exhausted and nothing was preemptible.
@@ -1166,36 +1166,103 @@ func (s *Session) SecurityDefinitionOptionParameterEnd(reqID int64) {
 // refuses delta-based selection and simply takes the nearest strike.
 func isATMDelta(td float64) bool { return td >= 0.48 && td <= 0.52 }
 
-// selectITMCandidates picks up to n strikes on the ITM side of the
-// underlying. For calls, ITM = strikes below undPrice. For puts, ITM =
-// strikes above undPrice. Returns strikes sorted from nearest-ATM to
-// deepest-ITM.
-func selectITMCandidates(sortedStrikes []float64, undPrice float64, right string, n int) []float64 {
+// How wide the entry delta probe reaches on each side of the underlying.
+//
+// A ~0.55 target sits AT or just OUTSIDE the money, so a probe that reaches
+// only inside it can never find the strike being asked for -- see
+// selectStrikeCandidates.
+const (
+	deltaProbeITMCandidates = 3 // strikes at or inside the money
+	deltaProbeOTMCandidates = 3 // strikes outside it -- where a ~0.55 target lives
+)
+
+// deltaMissWarnThreshold is how far a resolved delta may sit from its target
+// before the resolution is reported as an anomaly. Not an acceptance test --
+// the entry is taken regardless (see resolveDeltaCandidates).
+const deltaMissWarnThreshold = 0.15
+
+// selectStrikeCandidates picks up to itm strikes at-or-inside the money and up
+// to otm strikes outside it, returned NEAREST-THE-MONEY FIRST.
+//
+// This used to be selectITMCandidates, which took n strikes STRICTLY inside the
+// money (for a call, sorted[i] < undPrice) and nothing else. Delta is monotonic
+// in strike, so candidate #1 -- the rung nearest the money -- always carried the
+// LOWEST delta of the set, and every further candidate was one rung deeper ITM.
+// Widening that window moved strictly AWAY from a ~0.5 target; the count was
+// never the constraint, the direction was.
+//
+// The strikes carrying delta ~0.55 are at the money and just outside it, and
+// they were never subscribed. Over 2026-08-21..26 that put 82 entries above
+// delta 0.65 and 24 above 0.75, on the wrong side of a step the ladder offered
+// for free: AAPL at spot 309.80 resolved to strike 305 at delta 0.84 when 310,
+// one rung up, was ~0.52. Those deep entries are also nearly all intrinsic
+// value, so a percentage stop on the PREMIUM becomes a few cents of underlying
+// movement -- they stopped out 71% of the time at -$104 a leg.
+//
+// Four properties, each load-bearing:
+//
+//   - Both sides. For a call, at-or-inside is strike <= undPrice and outside is
+//     strike > undPrice; for a put, mirrored. This is the whole fix.
+//   - A strike exactly AT the underlying is included, on the at-or-inside side.
+//     The old strict < dropped the single rung most likely to carry delta 0.5.
+//   - Ordered by |strike - undPrice| ascending, because GrantProbe refusals skip
+//     candidates in loop order and the farthest-from-target ones must be last.
+//     Selection itself is a min over every ready candidate, so ordering never
+//     decides which one wins.
+//   - Backfilled from the other side when one runs short (the underlying sitting
+//     near the end of the ladder), so a thin chain still gets a full-width probe.
+func selectStrikeCandidates(sortedStrikes []float64, undPrice float64, right string, itm, otm int) []float64 {
+	if len(sortedStrikes) == 0 || undPrice <= 0 || itm+otm <= 0 {
+		return nil
+	}
 	sorted := make([]float64, len(sortedStrikes))
 	copy(sorted, sortedStrikes)
 	sort.Float64s(sorted)
 
-	var candidates []float64
-	if right == "call" {
-		for i := len(sorted) - 1; i >= 0; i-- {
-			if sorted[i] < undPrice {
-				candidates = append(candidates, sorted[i])
-				if len(candidates) >= n {
-					break
-				}
-			}
-		}
-	} else {
-		for _, st := range sorted {
-			if st > undPrice {
-				candidates = append(candidates, st)
-				if len(candidates) >= n {
-					break
-				}
-			}
+	// atOrBelow runs from the money downwards, above runs upwards. A strike
+	// exactly at undPrice belongs to atOrBelow.
+	var atOrBelow, above []float64
+	for i := len(sorted) - 1; i >= 0; i-- {
+		if sorted[i] <= undPrice {
+			atOrBelow = append(atOrBelow, sorted[i])
 		}
 	}
-	return candidates
+	for _, st := range sorted {
+		if st > undPrice {
+			above = append(above, st)
+		}
+	}
+
+	// A call is in the money below the underlying, a put above it.
+	inside, outside := atOrBelow, above
+	if right != "call" {
+		inside, outside = above, atOrBelow
+	}
+
+	take := func(src []float64, n int) []float64 {
+		if n > len(src) {
+			n = len(src)
+		}
+		return src[:n]
+	}
+	picked := append(take(inside, itm), take(outside, otm)...)
+
+	// Backfill: a side that came up short lends its budget to the other, so the
+	// probe keeps its full width against a chain that ends near the money.
+	if short := (itm + otm) - len(picked); short > 0 {
+		if extra := take(inside[min(itm, len(inside)):], short); len(extra) > 0 {
+			picked = append(picked, extra...)
+			short -= len(extra)
+		}
+		if short > 0 {
+			picked = append(picked, take(outside[min(otm, len(outside)):], short)...)
+		}
+	}
+
+	sort.SliceStable(picked, func(i, j int) bool {
+		return math.Abs(picked[i]-undPrice) < math.Abs(picked[j]-undPrice)
+	})
+	return picked
 }
 
 // ── Leg registry ──────────────────────────────────────────────────────────
@@ -1468,6 +1535,18 @@ func (s *Session) resolveDeltaCandidates(sel selector) (OptionQuote, EntryStrike
 	s.optionLog.Printf("Option delta resolved: %s %s (sel=%d) target=%.2f → strike=%.2f (actual delta=%.4f)",
 		symbol, right, sel.id, res.targetDelta, best.strike, best.delta)
 
+	// A miss this large means the ladder carried no strike near the target --
+	// a 0DTE chain near the close, where delta steps from ~0.2 to ~0.8 across
+	// one rung, or a coarse ladder on a low-priced underlying. The entry is
+	// still taken (closest match), so this is the only signal that it happened.
+	// It goes to s.logger, not optionLog: the resolution line above is one of
+	// millions in the chain log, which is why "many transactions at 0.77" was
+	// visible in a CSV weeks later and nowhere at the time.
+	if miss := math.Abs(math.Abs(best.delta) - res.targetDelta); miss > deltaMissWarnThreshold {
+		s.logger.Printf("Option: WARNING %s %s (sel=%d) target=%.2f resolved to strike=%.2f at delta=%.4f (miss %.2f) — no nearer strike on this ladder; entry taken",
+			symbol, right, sel.id, res.targetDelta, best.strike, best.delta, miss)
+	}
+
 	// best.bid/best.ask arrived during this synchronous, bounded probe (within
 	// entryDeltaProbeTimeout), so `now` is an accurate freshness stamp for them —
 	// there is no separate per-tick timestamp cached on deltaCandidate to read back.
@@ -1604,10 +1683,10 @@ func (s *Session) ResolveEntryStrike(sub Subscriber, symbol, right string, timeo
 	}
 
 	undPrice := s.getUnderlyingPrice(symbol)
-	candidates := selectITMCandidates(info.strikes, undPrice, right, 5)
+	candidates := selectStrikeCandidates(info.strikes, undPrice, right, deltaProbeITMCandidates, deltaProbeOTMCandidates)
 	if len(candidates) == 0 {
 		return OptionQuote{}, EntryStrikeResult{Reason: entryFailNoCandidates,
-			Detail: fmt.Sprintf("no ITM %s strike for %s near underlying %.2f in a %d-strike chain", right, symbol, undPrice, len(info.strikes))}
+			Detail: fmt.Sprintf("no %s strike for %s near underlying %.2f in a %d-strike chain", right, symbol, undPrice, len(info.strikes))}
 	}
 
 	s.optChain.mu.Lock()

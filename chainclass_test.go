@@ -2,6 +2,7 @@ package ibkr
 
 import (
 	"testing"
+	"time"
 )
 
 // TestSecDefOptParams_KeepsOneTradingClass is the regression for the 2026-08-17
@@ -25,15 +26,24 @@ func TestSecDefOptParams_KeepsOneTradingClass(t *testing.T) {
 	const reqID = int64(7)
 	s.optChain.chainReqs[reqID] = &optChainReq{chain: chainKey{symbol: "MSFT", optionDelay: 3}}
 
-	// The phantom class: a Thursday expiry and a coarse ladder.
+	// Expiries are relative to today, because the assertion at the bottom runs
+	// through nearestExpiry, which measures against the wall clock. Hardcoded
+	// dates made this test pass only until the calendar rolled past them.
+	//
+	// What matters is the ORDER: the phantom class's nearest expiry falls
+	// BEFORE the standard class's, so a merge would visibly win it.
+	day := func(n int) string { return time.Now().AddDate(0, 0, n).Format("20060102") }
+	phantomNearest, standardNearest := day(1), day(2)
+
+	// The phantom class: an earlier expiry and a coarse ladder.
 	s.SecurityDefinitionOptionParameter(reqID, "SMART", 1, "MSFT9", "100",
-		[]string{"20260820", "20260827", "20260903"}, []float64{300, 350, 400})
-	// The standard class: Friday expiries and the real $5 ladder.
+		[]string{phantomNearest, day(8), day(15)}, []float64{300, 350, 400})
+	// The standard class: its own expiries and the real $5 ladder.
 	s.SecurityDefinitionOptionParameter(reqID, "SMART", 1, "MSFT", "100",
-		[]string{"20260821", "20260828"}, []float64{480, 485, 490, 495})
+		[]string{standardNearest, day(9)}, []float64{480, 485, 490, 495})
 	// A non-SMART callback must still be ignored outright.
 	s.SecurityDefinitionOptionParameter(reqID, "CBOE", 1, "MSFT", "100",
-		[]string{"20260819"}, []float64{1})
+		[]string{day(-1)}, []float64{1})
 
 	req := s.optChain.chainReqs[reqID]
 	if got := len(req.classes); got != 2 {
@@ -55,9 +65,9 @@ func TestSecDefOptParams_KeepsOneTradingClass(t *testing.T) {
 	// The whole point: neither the phantom expiry nor the phantom strikes may
 	// leak into the selection the chosen class drives.
 	for _, e := range chosen.expirations {
-		if e == "20260820" {
-			t.Fatal("expiry 20260820 came from MSFT9 but survived into the chosen class — " +
-				"this is the cross-class pairing that produced 35 error-200s")
+		if e == phantomNearest {
+			t.Fatalf("expiry %s came from MSFT9 but survived into the chosen class — "+
+				"this is the cross-class pairing that produced 35 error-200s", phantomNearest)
 		}
 	}
 	for _, st := range chosen.strikes {
@@ -65,8 +75,8 @@ func TestSecDefOptParams_KeepsOneTradingClass(t *testing.T) {
 			t.Fatalf("strike %.0f came from MSFT9's ladder but survived into the chosen class", st)
 		}
 	}
-	if got := nearestExpiry(chosen.expirations, 0); got != "20260821" {
-		t.Fatalf("nearestExpiry = %q, want the standard class's own 20260821", got)
+	if got := nearestExpiry(chosen.expirations, 0); got != standardNearest {
+		t.Fatalf("nearestExpiry = %q, want the standard class's own %s", got, standardNearest)
 	}
 }
 
