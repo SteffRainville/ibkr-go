@@ -326,6 +326,12 @@ type deltaCandidate struct {
 	// belong to the probe currently in flight. There is no staleness to check.
 	errCode int64
 	errMsg  string
+
+	// dupTicker records that IB refused this candidate's request as a
+	// duplicate ticker id, i.e. the id is another live request's. It gates the
+	// cleanup in resolveDeltaCandidates: cancelling or releasing an id we were
+	// refused tears down whoever does own it. See dupticker.go.
+	dupTicker bool
 }
 
 // EntryStrikeResult reports the outcome of ResolveEntryStrike. It replaces a
@@ -489,10 +495,6 @@ type deltaResolution struct {
 // optionChainTracker holds all state for option chain lookup and market data.
 type optionChainTracker struct {
 	mu          sync.Mutex
-	nextConIDID int64
-	nextChainID int64
-	nextMktID   int64
-	nextPosID   int64
 	nextSelID   int
 	conIDReqs   map[int64]*optConIDReq
 	chainReqs   map[int64]*optChainReq
@@ -574,6 +576,11 @@ type optionChainTracker struct {
 	// lull from condemning every leg at once and triggering a re-subscribe
 	// storm against a broker that is not answering anyway.
 	lastAnyOptionTick time.Time
+
+	// dupRepairs counts per-contract repairs after a duplicate-ticker-id
+	// refusal, bounding handleDuplicateTickerID so an error path can never
+	// become a request loop. Cleared with the leg.
+	dupRepairs map[legKey]int
 
 	// forcedResub tracks per-contract forced re-subscribe attempts so a
 	// contract IB will never quote (delisted, bad expiry) cannot burn a
@@ -800,8 +807,7 @@ func (s *Session) refreshChainFor(sel selector) {
 		return
 	}
 
-	reqID := s.optChain.nextConIDID
-	s.optChain.nextConIDID++
+	reqID := s.nextReqID()
 	s.optChain.conIDReqs[reqID] = &optConIDReq{
 		chain: sel.chainKey(), currency: sel.currency,
 		waiters: []int{sel.id}, requestedAt: now,
@@ -1042,8 +1048,7 @@ func (s *Session) handleConIDContractDetailsEnd(reqID int64) bool {
 		return true
 	}
 
-	chainReqID := s.optChain.nextChainID
-	s.optChain.nextChainID++
+	chainReqID := s.nextReqID()
 	s.optChain.chainReqs[chainReqID] = &optChainReq{
 		chain: req.chain, waiters: req.waiters, requestedAt: time.Now(),
 	}
@@ -1282,6 +1287,7 @@ func (s *Session) releaseLegIfUnheldLocked(leg *optLeg) int64 {
 	delete(s.optChain.legs, leg.key())
 	delete(s.optChain.legByReqID, leg.reqID)
 	delete(s.optChain.forcedResub, leg.key())
+	delete(s.optChain.dupRepairs, leg.key())
 	s.mdLines.Release(leg.reqID)
 	return leg.reqID
 }
@@ -1419,8 +1425,7 @@ func (s *Session) forceResubscribeLeg(key legKey) {
 		return
 	}
 	oldReqID := old.reqID
-	reqID := s.optChain.nextMktID
-	s.optChain.nextMktID++
+	reqID := s.nextReqID()
 	s.optChain.mu.Unlock()
 
 	s.mdLines.GrantGuaranteed(reqID, mdlines.CategoryPosition)
@@ -1512,6 +1517,9 @@ func (s *Session) resolveDeltaCandidates(sel selector) (OptionQuote, EntryStrike
 		failure := classifyCandidateErrors(res.candidates)
 		for _, c := range res.candidates {
 			delete(s.optChain.deltaCands, c.reqID)
+			if c.dupTicker {
+				continue // the id is another live request's — see dupticker.go
+			}
 			s.mdLines.Release(c.reqID)
 			s.client.CancelMktData(c.reqID)
 		}
@@ -1526,6 +1534,9 @@ func (s *Session) resolveDeltaCandidates(sel selector) (OptionQuote, EntryStrike
 	var cancel []int64
 	for _, c := range res.candidates {
 		delete(s.optChain.deltaCands, c.reqID)
+		if c.dupTicker {
+			continue // the id is another live request's — see dupticker.go
+		}
 		s.mdLines.Release(c.reqID)
 		cancel = append(cancel, c.reqID)
 	}
@@ -1695,8 +1706,7 @@ func (s *Session) ResolveEntryStrike(sub Subscriber, symbol, right string, timeo
 		expiry: info.expiry, allStrikes: info.strikes, busIdxs: sel.busIdxs,
 	}
 	for _, cs := range candidates {
-		reqID := s.optChain.nextMktID
-		s.optChain.nextMktID++
+		reqID := s.nextReqID()
 		if !s.mdLines.GrantProbe(reqID) {
 			continue
 		}
@@ -1771,6 +1781,7 @@ func (s *Session) forgetLegLocked(leg *optLeg) {
 	delete(s.optChain.legs, key)
 	delete(s.optChain.legByReqID, leg.reqID)
 	delete(s.optChain.forcedResub, key)
+	delete(s.optChain.dupRepairs, key)
 }
 
 // sharedResolvedEntry returns a fresh, Book-priced quote for the contract
@@ -2032,8 +2043,7 @@ func (s *Session) SubscribePositionStrike(symbol, right string, strike float64, 
 			symbol, right, strike, expiry, leg.reqID, leg.pins)
 		return
 	}
-	reqID := s.optChain.nextPosID
-	s.optChain.nextPosID++
+	reqID := s.nextReqID()
 	leg := s.openLegLocked(key, reqID, "", time.Now())
 	leg.pins = 1
 	s.optChain.mu.Unlock()

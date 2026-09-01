@@ -43,8 +43,7 @@ func (s *Session) fetchHistoricalRange(ctx context.Context, symbol, endDateTime,
 	}
 
 	s.onDemand.mu.Lock()
-	reqID := s.onDemand.nextID
-	s.onDemand.nextID++
+	reqID := s.nextReqID()
 	ch := make(chan error, 1)
 	s.onDemand.reqSymbol[reqID] = storeKey
 	s.onDemand.done[reqID] = ch
@@ -118,8 +117,7 @@ func (s *Session) SubscribeOptionBars(symbol, right string, strike float64, expi
 	contract := makeOptionContract(sym, ibRight, strike, expiry)
 
 	s.onDemand.mu.Lock()
-	reqID := s.onDemand.nextID
-	s.onDemand.nextID++
+	reqID := s.nextReqID()
 	s.onDemand.reqSymbol[reqID] = storeKey
 	s.onDemand.mu.Unlock()
 

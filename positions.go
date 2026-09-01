@@ -205,10 +205,6 @@ func (s *Session) PositionEnd() {
 	s.logger.Printf("PositionEnd: %d positions received", len(snapshot))
 	s.client.ReqMarketDataType(int64(ibapi.DELAYED_FROZEN))
 
-	if len(s.mktData.snapReqSymbol) == 0 {
-		s.mktData.nextSnapID = reqIDSnapBase
-	}
-
 	positions := make([]PositionInfo, 0, len(snapshot))
 	seen := make(map[string]bool)
 	for _, p := range snapshot {
@@ -220,8 +216,7 @@ func (s *Session) PositionEnd() {
 		}
 		if !seen[p.Symbol] {
 			seen[p.Symbol] = true
-			reqID := s.mktData.nextSnapID
-			s.mktData.nextSnapID++
+			reqID := s.nextReqID()
 			s.mktData.snapReqSymbol[reqID] = p.Symbol
 			currency := p.Currency
 			if currency == "" {

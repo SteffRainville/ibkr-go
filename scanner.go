@@ -14,12 +14,9 @@ import (
 func (s *Session) RunScanner(ctx context.Context, params ScanParams) ([]ScanResult, error) {
 	done := make(chan []ScanResult, 1)
 
+	reqID := s.nextReqID()
+
 	s.scanner.mu.Lock()
-	if len(s.scanner.pending) == 0 && len(s.scanner.snapData) == 0 && len(s.scanner.cdData) == 0 {
-		s.scanner.nextID = reqIDScannerBase
-	}
-	reqID := s.scanner.nextID
-	s.scanner.nextID++
 	s.scanner.results[reqID] = nil
 	s.scanner.pending[reqID] = done
 	s.scanner.mu.Unlock()
@@ -190,8 +187,7 @@ func (s *Session) ScannerDataEnd(reqID int64) {
 
 	capped := 0
 	for i := range results {
-		snapID := s.scanner.nextID
-		s.scanner.nextID++
+		snapID := s.nextReqID()
 		if s.mdLines.GrantSnapshot(snapID) {
 			s.scanner.snapData[snapID] = &scanSnapEntry{parentReqID: reqID, resultIdx: i}
 			snapIDs[i] = snapID
@@ -200,8 +196,7 @@ func (s *Session) ScannerDataEnd(reqID int64) {
 			capped++
 		}
 
-		cdID := s.scanner.nextID
-		s.scanner.nextID++
+		cdID := s.nextReqID()
 		s.scanner.cdData[cdID] = &scanCDEntry{parentReqID: reqID, resultIdx: i}
 		cdIDs[i] = cdID
 	}

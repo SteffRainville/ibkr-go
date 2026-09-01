@@ -35,34 +35,11 @@ var ErrConnect = errors.New("could not connect to TWS / IB Gateway")
 // NextValidID ready signal within the timeout.
 var ErrReady = errors.New("connected but TWS did not become ready")
 
-// ReqID allocation per session (N = number of tracked symbols):
-//
-//	1001 … 1000+N  — historical data + live bar subscriptions (one per symbol)
-//	2001 … 2000+N  — streaming market data / bid-ask (one per symbol)
-//	3001 …         — market scanner subscription requests (one per scan run)
-//	4001 …         — on-demand historical data fetches
-//	5001 …         — on-demand market data snapshots (positions page prices)
-//	6001 …         — reqSecDefOptParams (option chain params)
-//	7001 …         — option market data subscriptions
-//	8001 …         — ReqContractDetails for option underlying conId lookup
-//	9001           — account summary request
-//	10001 …        — position-pinned option market data subscriptions
-//	11001 …        — ad-hoc option chain query: ReqContractDetails (conId lookup)
-//	12001 …        — ad-hoc option chain query: reqSecDefOptParams
-const (
-	reqIDHistBase          int64 = 1001
-	reqIDStreamBase        int64 = 2001
-	reqIDScannerBase       int64 = 3001
-	reqIDOnDemandHistBase  int64 = 4001
-	reqIDSnapBase          int64 = 5001
-	reqIDOptChainBase      int64 = 6001
-	reqIDOptMktBase        int64 = 7001
-	reqIDOptConIDBase      int64 = 8001
-	reqIDAcctSummary       int64 = 9001
-	reqIDPosMktBase        int64 = 10001
-	reqIDOptQueryConIDBase int64 = 11001
-	reqIDOptQueryChainBase int64 = 12001
-)
+// Every IB request id this session issues comes from one monotonic sequence,
+// s.nextReqID() — see reqids.go, which also records what the previous
+// 1000-wide per-purpose bands cost when the option paths outgrew them.
+// Nothing dispatches on an id's range; every callback resolves its request
+// through a map keyed by the exact id.
 
 const bidAskMaxAge = 30 * time.Second
 
@@ -76,7 +53,6 @@ type quote struct {
 // marketData tracks snapshot requests and live bid/ask streaming data.
 type marketData struct {
 	snapReqSymbol map[int64]string
-	nextSnapID    int64
 	mktDataSymbol map[int64]string
 
 	bidAskMu  sync.RWMutex
@@ -162,14 +138,12 @@ type scanCDEntry struct {
 
 type onDemandTracker struct {
 	mu        sync.Mutex
-	nextID    int64
 	reqSymbol map[int64]string
 	done      map[int64]chan error
 }
 
 type scanTracker struct {
 	mu         sync.Mutex
-	nextID     int64
 	results    map[int64][]ScanResult
 	enriched   map[int64][]ScanResult
 	pending    map[int64]chan []ScanResult
@@ -221,10 +195,15 @@ type Session struct {
 	subSymbols     [][]SymbolSpec   // per-subscriber symbol list, indexed like subs/buses
 	histReqID      map[string]int64 // base symbol → keepUpToDate bar-stream reqID
 	streamReqID    map[string]int64 // base symbol → streaming market-data reqID
-	nextHistID     int64            // next free reqID in the reqIDHistBase block
-	nextStreamID   int64            // next free reqID in the reqIDStreamBase block
 	tradingAccount string
 	accountsReady  chan []string
+
+	// reqIDs is the one allocator for every IB request id — see reqids.go.
+	// acctSummaryID is the id of the current connection's account-summary
+	// subscription, drawn from it at connect time; it used to be a fixed
+	// constant, which a single shared sequence would eventually walk into.
+	reqIDs        reqIDAllocator
+	acctSummaryID int64
 
 	mktData  marketData
 	orders   orderTracker
@@ -292,14 +271,12 @@ func NewSession(opts Options, book *quotes.Book, cs *candlestore.Store) *Session
 		reqSymbol:      make(map[int64]string),
 		histReqID:      make(map[string]int64),
 		streamReqID:    make(map[string]int64),
-		nextHistID:     reqIDHistBase,
-		nextStreamID:   reqIDStreamBase,
+		reqIDs:         reqIDAllocator{next: reqIDFirst},
 		tradingAccount: opts.TradingAccount,
 		accountsReady:  make(chan []string, 1),
 
 		mktData: marketData{
 			snapReqSymbol: make(map[int64]string),
-			nextSnapID:    reqIDSnapBase,
 			mktDataSymbol: make(map[int64]string),
 			bid:           make(map[string]quote),
 			ask:           make(map[string]quote),
@@ -320,7 +297,6 @@ func NewSession(opts Options, book *quotes.Book, cs *candlestore.Store) *Session
 			pendingClose: make(map[string]PositionInfo),
 		},
 		scanner: scanTracker{
-			nextID:     reqIDScannerBase,
 			results:    make(map[int64][]ScanResult),
 			enriched:   make(map[int64][]ScanResult),
 			pending:    make(map[int64]chan []ScanResult),
@@ -332,10 +308,6 @@ func NewSession(opts Options, book *quotes.Book, cs *candlestore.Store) *Session
 			cdReqIDs:   make(map[int64][]int64),
 		},
 		optChain: optionChainTracker{
-			nextConIDID:      reqIDOptConIDBase,
-			nextChainID:      reqIDOptChainBase,
-			nextMktID:        reqIDOptMktBase,
-			nextPosID:        reqIDPosMktBase,
 			conIDReqs:        make(map[int64]*optConIDReq),
 			chainReqs:        make(map[int64]*optChainReq),
 			legs:             make(map[legKey]*optLeg),
@@ -349,15 +321,13 @@ func NewSession(opts Options, book *quotes.Book, cs *candlestore.Store) *Session
 			lastProbeLaunch:  make(map[int]time.Time),
 			lastAttempt:      make(map[int]time.Time),
 			forcedResub:      make(map[legKey]resubState),
+			dupRepairs:       make(map[legKey]int),
 		},
 		onDemand: onDemandTracker{
-			nextID:    reqIDOnDemandHistBase,
 			reqSymbol: make(map[int64]string),
 			done:      make(map[int64]chan error),
 		},
 		optQuery: optionQueryTracker{
-			nextConID:   reqIDOptQueryConIDBase,
-			nextChainID: reqIDOptQueryChainBase,
 			conIDReqs:   make(map[int64]*optQueryReq),
 			chainReqs:   make(map[int64]*optQueryReq),
 		},
@@ -466,12 +436,10 @@ func (s *Session) Run(subs []Subscriber, stop time.Time) (bool, error) {
 	s.subSymbols = subSymbols
 	s.histReqID = make(map[string]int64, len(deduped))
 	s.streamReqID = make(map[string]int64, len(deduped))
-	s.nextHistID = reqIDHistBase
-	s.nextStreamID = reqIDStreamBase
 	s.mktData.mktDataSymbol = make(map[int64]string, len(deduped))
-	// reqIDs are assigned from a counter rather than the loop index because
-	// ResyncSymbols hands out more of them later, after the initial block has
-	// developed holes — see subscribeSymbolLocked.
+	// reqIDs are assigned from the session allocator rather than the loop index
+	// because ResyncSymbols hands out more of them later, after the initial
+	// block has developed holes — see subscribeSymbolLocked.
 	type sub struct {
 		spec          SymbolSpec
 		histID, mktID int64
@@ -504,7 +472,8 @@ func (s *Session) Run(subs []Subscriber, stop time.Time) (bool, error) {
 		client.ReqMktData(p.mktID, p.spec.Contract, "", false, false, nil)
 	}
 
-	client.ReqAccountSummary(reqIDAcctSummary, "All", "AccountType,TradingType,AccountCode,AccountAlias,NetLiquidation,TotalCashValue,AvailableFunds,BuyingPower,MaintExcessLiquidity,Leverage,AccountStatusLocked,AccountStatusPendingApproval,Cushion,FullInitMarginReq,FullMaintMarginReq,InitMarginReq,LookAheadAvailableFunds,LookAheadInitMarginReq,SMA")
+	s.acctSummaryID = s.nextReqID()
+	client.ReqAccountSummary(s.acctSummaryID, "All", "AccountType,TradingType,AccountCode,AccountAlias,NetLiquidation,TotalCashValue,AvailableFunds,BuyingPower,MaintExcessLiquidity,Leverage,AccountStatusLocked,AccountStatusPendingApproval,Cushion,FullInitMarginReq,FullMaintMarginReq,InitMarginReq,LookAheadAvailableFunds,LookAheadInitMarginReq,SMA")
 	client.ReqPositions()
 
 	go func() {
@@ -729,6 +698,16 @@ func (s *Session) Error(reqID int64, errTime int64, errCode int64, errString str
 	// vanish into the log line above and never reach the trading decision that
 	// they caused to fail.
 	s.noteCandidateError(reqID, errCode, errString)
+
+	// A duplicate ticker id means the request was REFUSED while our own maps
+	// already point at it — so until this runs, ticks belonging to whoever owns
+	// the id are being decoded as ours. Handled before anything else for that
+	// reason. See dupticker.go for what it cost on 2026-09-01.
+	if errCode == errCodeDuplicateTickerID {
+		if s.handleDuplicateTickerID(reqID) {
+			return
+		}
+	}
 
 	if errCode == 200 {
 		if s.handleOptionMktError(reqID, errString) {

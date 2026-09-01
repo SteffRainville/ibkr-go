@@ -104,7 +104,8 @@ func TestBarFeedStalled(t *testing.T) {
 // advanced by every live bar update, since that stamp is what the watchdog reads.
 func TestHistoricalDataUpdateStampsLastBar(t *testing.T) {
 	s := NewSession(Options{}, nil, nil)
-	s.reqSymbol = map[int64]string{reqIDHistBase: "TEST"}
+	const histID = reqIDFirst
+	s.reqSymbol = map[int64]string{histID: "TEST"}
 	// buses left nil — publish/updateBookPrice range over them safely.
 	if got := s.lastBarNano.Load(); got != 0 {
 		t.Fatalf("lastBarNano = %d before any bar, want 0", got)
@@ -112,7 +113,7 @@ func TestHistoricalDataUpdateStampsLastBar(t *testing.T) {
 
 	before := time.Now().UnixNano()
 	bar := &ibapi.Bar{Date: "20260714 11:00:00", Open: 1, High: 1, Low: 1, Close: 1}
-	s.HistoricalDataUpdate(reqIDHistBase, bar)
+	s.HistoricalDataUpdate(histID, bar)
 
 	if got := s.lastBarNano.Load(); got < before {
 		t.Errorf("lastBarNano = %d after HistoricalDataUpdate, want >= %d", got, before)

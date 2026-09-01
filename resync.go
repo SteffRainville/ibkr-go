@@ -39,18 +39,17 @@ func (d SymbolDelta) Changed() bool { return len(d.Added) > 0 || len(d.Removed) 
 // registers it in every symbol⇄reqID map. It does no I/O; the caller issues
 // the actual IB requests after releasing symMu.
 //
-// IDs come from a monotonic counter per block rather than the symbol's index
-// in the watchlist. Index-derived IDs are only unique while the watchlist is
-// immutable: remove the 3rd of 5 symbols and add another, and the newcomer
-// would reuse the departed symbol's ID while TWS may still have callbacks in
-// flight against it. A counter never reissues an ID for the life of a session.
+// IDs come from the session's monotonic allocator rather than the symbol's
+// index in the watchlist. Index-derived IDs are only unique while the
+// watchlist is immutable: remove the 3rd of 5 symbols and add another, and the
+// newcomer would reuse the departed symbol's ID while TWS may still have
+// callbacks in flight against it. The allocator never reissues an ID for the
+// life of a session.
 //
 // Must be called with s.symMu held for writing.
 func (s *Session) reserveSymbolIDsLocked(symbol string) (histID, mktID int64) {
-	histID = s.nextHistID
-	s.nextHistID++
-	mktID = s.nextStreamID
-	s.nextStreamID++
+	histID = s.nextReqID()
+	mktID = s.nextReqID()
 
 	s.reqSymbol[histID] = symbol
 	s.histReqID[symbol] = histID

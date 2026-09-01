@@ -52,8 +52,6 @@ type optQueryResult struct {
 // reqID like every other IB request in this package.
 type optionQueryTracker struct {
 	mu          sync.Mutex
-	nextConID   int64
-	nextChainID int64
 	conIDReqs   map[int64]*optQueryReq // keyed by conId-lookup reqID
 	chainReqs   map[int64]*optQueryReq // keyed by reqSecDefOptParams reqID
 }
@@ -73,17 +71,7 @@ func (s *Session) RequestOptionChain(ctx context.Context, symbol string) (Option
 	done := make(chan optQueryResult, 1)
 
 	s.optQuery.mu.Lock()
-	// Both counters walk forward one ID per call and never wrap on their own;
-	// after 1000 lookups nextConID would cross into the chain range and the
-	// two phases would collide. Rewind while fully idle — no request is in
-	// flight under either ID then — the same idiom RunScanner uses for its
-	// own range.
-	if len(s.optQuery.conIDReqs) == 0 && len(s.optQuery.chainReqs) == 0 {
-		s.optQuery.nextConID = reqIDOptQueryConIDBase
-		s.optQuery.nextChainID = reqIDOptQueryChainBase
-	}
-	reqID := s.optQuery.nextConID
-	s.optQuery.nextConID++
+	reqID := s.nextReqID()
 	s.optQuery.conIDReqs[reqID] = &optQueryReq{symbol: sym, done: done}
 	s.optQuery.mu.Unlock()
 
@@ -137,8 +125,7 @@ func (s *Session) handleOptionQueryContractDetailsEnd(reqID int64) bool {
 		return true
 	}
 
-	chainReqID := s.optQuery.nextChainID
-	s.optQuery.nextChainID++
+	chainReqID := s.nextReqID()
 	s.optQuery.chainReqs[chainReqID] = req
 	symbol, conID := req.symbol, req.conID
 	s.optQuery.mu.Unlock()
