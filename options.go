@@ -388,6 +388,13 @@ const (
 	// entryFailSiblingFailed — joined an in-flight sibling probe that failed
 	// without leaving a recorded cause behind.
 	entryFailSiblingFailed = "option_sibling_failed"
+	// entryFailProbeOwnershipLost — this call's own deltaResolution was no
+	// longer the selector's registered owner by the time it came to read it.
+	// Not an IB condition at all: reserveEntryProbe makes a second owner
+	// unrepresentable, so reaching this is an internal defect and is reported
+	// as one. It used to masquerade as entryFailQuoteTimeout, which is how a
+	// check-then-act race spent months being read as "IB was slow".
+	entryFailProbeOwnershipLost = "option_probe_ownership_lost"
 )
 
 // subscriptionErrorCodes are the IB error codes that mean "your account is not
@@ -1473,6 +1480,25 @@ func (s *Session) releaseOrphanedProbeCandidate(reqID int64) {
 	}
 }
 
+// releaseCandidatesLocked drops every candidate from the registry and returns
+// its market-data line to the ledger, returning the reqIDs that still need a
+// CancelMktData. A dupTicker candidate's id belongs to another live request
+// (see dupticker.go), so cancelling it would kill that one instead.
+//
+// Caller holds s.optChain.mu and cancels the returned ids after unlocking.
+func (s *Session) releaseCandidatesLocked(cands []*deltaCandidate) []int64 {
+	var cancel []int64
+	for _, c := range cands {
+		delete(s.optChain.deltaCands, c.reqID)
+		if c.dupTicker {
+			continue
+		}
+		s.mdLines.Release(c.reqID)
+		cancel = append(cancel, c.reqID)
+	}
+	return cancel
+}
+
 // resolveDeltaCandidates picks the candidate with delta closest to the
 // target, reads its quote, and cancels every candidate including the winner.
 // Only called from ResolveEntryStrike.
@@ -1484,17 +1510,29 @@ func (s *Session) releaseOrphanedProbeCandidate(reqID int64) {
 // entry that triggered this probe actually fills, SubscribePositionStrike
 // opens a guaranteed CategoryPosition line for the same contract — which is
 // the only reason to hold an option feed at all.
-func (s *Session) resolveDeltaCandidates(sel selector) (OptionQuote, EntryStrikeResult) {
+func (s *Session) resolveDeltaCandidates(sel selector, mine *deltaResolution) (OptionQuote, EntryStrikeResult) {
 	symbol, right := sel.symbol, sel.right
 
 	s.optChain.mu.Lock()
-	res, ok := s.optChain.deltaRes[sel.id]
-	if !ok {
+	cur, owned := s.optChain.deltaRes[sel.id]
+	if !owned || cur != mine {
+		// An internal defect, not a broker one — see
+		// entryFailProbeOwnershipLost. Release THIS call's own candidates,
+		// because nothing else ever will (their owning resolution is gone, so
+		// only mdlines' 30s ReapProbes backstop would notice), and leave
+		// whatever holds the map entry now strictly alone: resolving a
+		// stranger's candidate set is what turned this defect into a
+		// confidently wrong strike instead of a visible failure.
+		cancel := s.releaseCandidatesLocked(mine.candidates)
 		s.optChain.mu.Unlock()
-		return OptionQuote{}, EntryStrikeResult{Reason: entryFailQuoteTimeout,
-			Detail: fmt.Sprintf("delta resolution for %s %s vanished before it could be read", symbol, right)}
+		s.cancelLines(cancel)
+		s.logger.Printf("Option: BUG %s %s (sel=%d) — this call's delta resolution was replaced before it could be read; released its own %d candidates and refused the entry",
+			symbol, right, sel.id, len(mine.candidates))
+		return OptionQuote{}, EntryStrikeResult{Reason: entryFailProbeOwnershipLost,
+			Detail: fmt.Sprintf("internal: delta resolution for %s %s was no longer this call's own when read", symbol, right)}
 	}
 	delete(s.optChain.deltaRes, sel.id)
+	res := mine
 
 	var best *deltaCandidate
 	bestDist := math.MaxFloat64
@@ -1515,15 +1553,9 @@ func (s *Session) resolveDeltaCandidates(sel selector) (OptionQuote, EntryStrike
 		// "this account is not entitled to option data" from "IB never
 		// answered", and both look identical from here otherwise.
 		failure := classifyCandidateErrors(res.candidates)
-		for _, c := range res.candidates {
-			delete(s.optChain.deltaCands, c.reqID)
-			if c.dupTicker {
-				continue // the id is another live request's — see dupticker.go
-			}
-			s.mdLines.Release(c.reqID)
-			s.client.CancelMktData(c.reqID)
-		}
+		cancel := s.releaseCandidatesLocked(res.candidates)
 		s.optChain.mu.Unlock()
+		s.cancelLines(cancel)
 
 		s.optionLog.Printf("Option delta resolve: %s %s (sel=%d) — %s (%s)",
 			symbol, right, sel.id, failure.Reason, failure.Detail)
@@ -1531,15 +1563,7 @@ func (s *Session) resolveDeltaCandidates(sel selector) (OptionQuote, EntryStrike
 	}
 
 	now := time.Now()
-	var cancel []int64
-	for _, c := range res.candidates {
-		delete(s.optChain.deltaCands, c.reqID)
-		if c.dupTicker {
-			continue // the id is another live request's — see dupticker.go
-		}
-		s.mdLines.Release(c.reqID)
-		cancel = append(cancel, c.reqID)
-	}
+	cancel := s.releaseCandidatesLocked(res.candidates)
 	s.optChain.mu.Unlock()
 
 	s.cancelLines(cancel)
@@ -1637,7 +1661,6 @@ func (s *Session) ResolveEntryStrike(sub Subscriber, symbol, right string, timeo
 	s.optChain.mu.Lock()
 	sel, hasSel := s.selectorForLocked(symbol, right, busIdx)
 	info, hasInfo := s.optChain.lastChainInfo[sel.chainKey()]
-	_, inFlight := s.optChain.deltaRes[sel.id]
 	s.optChain.mu.Unlock()
 	if !hasSel {
 		return OptionQuote{}, EntryStrikeResult{Reason: entryFailNoChain,
@@ -1652,65 +1675,46 @@ func (s *Session) ResolveEntryStrike(sub Subscriber, symbol, right string, timeo
 		return q, EntryStrikeResult{OK: true}
 	}
 
-	// A sibling subscriber configured identically (same symbol, right,
-	// option_delay, target_delta — the selector key) is already probing this
-	// exact contract. Don't duplicate the ReqMktData candidate probes and race
-	// it for scarce mdlines probe-tier slots; wait for its result and share it
-	// instead. This is what makes two robots that get the same crossover on the
-	// same underlying converge on the identical strike (or identical failure)
-	// rather than one silently losing the race and skipping the entry — see the
-	// 2026-07-27 SPY put incident where VWmacdOptionDataRobot's larger symbol
-	// universe made it more likely to lose exactly this race.
-	if inFlight {
+	// Everything from "is a sibling already probing?" through publishing this
+	// call's own resolution happens inside reserveEntryProbe's single critical
+	// section. Splitting those two decisions is the bug this function used to
+	// have — see that function.
+	res, join, fail := s.reserveEntryProbe(sel)
+	switch {
+	case join:
+		// A sibling subscriber configured identically (same symbol, right,
+		// option_delay, target_delta — the selector key) is already probing
+		// this exact contract. Don't duplicate the ReqMktData candidate probes
+		// and race it for scarce mdlines probe-tier slots; wait for its result
+		// and share it instead. This is what makes two robots that get the
+		// same crossover on the same underlying converge on the identical
+		// strike (or identical failure) rather than one silently losing the
+		// race and skipping the entry — see the 2026-07-27 SPY put incident
+		// where VWmacdOptionDataRobot's larger symbol universe made it more
+		// likely to lose exactly this race.
 		return s.waitForEntryResolution(sel, timeout)
+	case res == nil:
+		return OptionQuote{}, fail
 	}
 
-	// No sibling to share with or join — becoming the owner means launching a
-	// fresh batch of ReqMktData candidate probes, a real IB round trip. Throttle
-	// that specifically (not the free reads/joins above) so a symbol sitting in
-	// a zone with no obtainable quote can't spin the caller's event loop on
-	// back-to-back probes, and so two robots sharing a selector can't each
-	// independently re-launch within the other's cooldown window.
-	s.optChain.mu.Lock()
-	sinceLaunch := time.Since(s.optChain.lastProbeLaunch[sel.id])
-	lastFail, hadFail := s.optChain.lastEntryFailure[sel.id]
-	s.optChain.mu.Unlock()
-	if sinceLaunch < entryProbeLaunchCooldown {
-		// The previous launch's cause is the real explanation for this call
-		// too — the cooldown is only why we are not re-asking IB right now.
-		// Reporting the cooldown itself would bury an entitlement failure
-		// behind an implementation detail for 15 of every 16 seconds.
-		if hadFail {
-			return OptionQuote{}, lastFail
-		}
-		return OptionQuote{}, EntryStrikeResult{Reason: entryFailProbeCooldown,
-			Detail: fmt.Sprintf("last delta probe for %s %s was %.0fs ago; cooldown is %s", symbol, right, sinceLaunch.Seconds(), entryProbeLaunchCooldown)}
-	}
-
-	targetDelta := sel.targetDelta
-	if isATMDelta(targetDelta) {
-		return OptionQuote{}, EntryStrikeResult{Reason: entryFailDeltaTargetATM,
-			Detail: fmt.Sprintf("target_delta %.2f for %s %s is inside the refused ATM band [0.48, 0.52]", targetDelta, symbol, right)}
-	}
-
+	// From here this call owns the selector's resolution, so every exit must
+	// either hand it to resolveDeltaCandidates or abandonEntryProbe it —
+	// leaving it published with no launch behind it would park every later
+	// caller in waitForEntryResolution until its own timeout, forever.
 	undPrice := s.getUnderlyingPrice(symbol)
-	candidates := selectStrikeCandidates(info.strikes, undPrice, right, deltaProbeITMCandidates, deltaProbeOTMCandidates)
+	candidates := selectStrikeCandidates(res.allStrikes, undPrice, right, deltaProbeITMCandidates, deltaProbeOTMCandidates)
 	if len(candidates) == 0 {
-		return OptionQuote{}, EntryStrikeResult{Reason: entryFailNoCandidates,
-			Detail: fmt.Sprintf("no %s strike for %s near underlying %.2f in a %d-strike chain", right, symbol, undPrice, len(info.strikes))}
+		return s.abandonEntryProbe(sel, res, EntryStrikeResult{Reason: entryFailNoCandidates,
+			Detail: fmt.Sprintf("no %s strike for %s near underlying %.2f in a %d-strike chain", right, symbol, undPrice, len(res.allStrikes))})
 	}
 
 	s.optChain.mu.Lock()
-	res := &deltaResolution{
-		selectorID: sel.id, symbol: symbol, right: right, targetDelta: targetDelta,
-		expiry: info.expiry, allStrikes: info.strikes, busIdxs: sel.busIdxs,
-	}
 	for _, cs := range candidates {
 		reqID := s.nextReqID()
 		if !s.mdLines.GrantProbe(reqID) {
 			continue
 		}
-		cand := &deltaCandidate{selectorID: sel.id, symbol: symbol, right: right, strike: cs, expiry: info.expiry, reqID: reqID, busIdxs: sel.busIdxs}
+		cand := &deltaCandidate{selectorID: sel.id, symbol: symbol, right: right, strike: cs, expiry: res.expiry, reqID: reqID, busIdxs: sel.busIdxs}
 		s.optChain.deltaCands[reqID] = cand
 		res.candidates = append(res.candidates, cand)
 
@@ -1718,31 +1722,29 @@ func (s *Session) ResolveEntryStrike(sub Subscriber, symbol, right string, timeo
 		if right == "put" {
 			ibRight = "P"
 		}
-		contract := makeOptionContract(symbol, ibRight, cs, info.expiry)
-		s.optionLog.Printf("Option: entry delta candidate %s %s strike=%.2f expiry=%s (reqID=%d)", symbol, right, cs, info.expiry, reqID)
+		contract := makeOptionContract(symbol, ibRight, cs, res.expiry)
+		s.optionLog.Printf("Option: entry delta candidate %s %s strike=%.2f expiry=%s (reqID=%d)", symbol, right, cs, res.expiry, reqID)
 		s.client.ReqMktData(reqID, contract, "", false, false, nil)
 	}
-	if len(res.candidates) == 0 {
-		s.optChain.mu.Unlock()
-		return OptionQuote{}, EntryStrikeResult{Reason: entryFailNoMDLines,
-			Detail: fmt.Sprintf("market-data line budget refused all %d probe candidates for %s %s", len(candidates), symbol, right)}
-	}
-	s.optChain.deltaRes[sel.id] = res
-	s.optChain.lastProbeLaunch[sel.id] = time.Now()
+	launched := len(res.candidates)
 	s.optChain.mu.Unlock()
+	if launched == 0 {
+		return s.abandonEntryProbe(sel, res, EntryStrikeResult{Reason: entryFailNoMDLines,
+			Detail: fmt.Sprintf("market-data line budget refused all %d probe candidates for %s %s", len(candidates), symbol, right)})
+	}
 
 	const pollInterval = 100 * time.Millisecond
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		s.optChain.mu.Lock()
-		settled := deltaCandidatesSettled(res.candidates, targetDelta)
+		settled := deltaCandidatesSettled(res.candidates, res.targetDelta)
 		s.optChain.mu.Unlock()
 		if settled {
 			break
 		}
 		time.Sleep(pollInterval)
 	}
-	q, res2 := s.resolveDeltaCandidates(sel)
+	q, res2 := s.resolveDeltaCandidates(sel, res)
 	s.optChain.mu.Lock()
 	if res2.OK {
 		if s.optChain.resolvedEntry == nil {
@@ -1764,6 +1766,100 @@ func (s *Session) ResolveEntryStrike(sub Subscriber, symbol, right string, timeo
 			symbol, right, sel.id, res2.Reason, res2.Detail)
 	}
 	return q, res2
+}
+
+// reserveEntryProbe decides, inside ONE critical section, whether this caller
+// becomes the owner of a fresh delta-probe launch for sel. Exactly one of the
+// three results is set: res != nil (this call owns the launch), join == true (a
+// sibling already owns it — wait for its answer), or fail.
+//
+// Publishing the reservation before releasing the lock is the whole point.
+// Its predecessor read "is a sibling already probing?" at the top of
+// ResolveEntryStrike and wrote deltaRes ninety lines and three lock cycles
+// later, so every robot sharing a selector read false and every one of them
+// became the owner: the last write silently replaced the others, the survivor
+// then resolved a candidate set it had never polled (2026-09-02, ORCL sel=54 —
+// the surviving batch carried a different expiry than the caller had chosen),
+// and the displaced callers reported IB quote timeouts IB had no part in.
+// Three robots share MU|call at option_delay=3/target_delta=0.55 and all react
+// to the same bar, which is why this fired 15-38 times a day.
+//
+// lastProbeLaunch is stamped here too — at reservation rather than after the
+// ReqMktData round trip — so the launch cooldown closes that window rather
+// than merely narrowing it.
+//
+// The candidate selection this reservation precedes is deliberately left
+// OUTSIDE the lock: getUnderlyingPrice takes mktData.bidAskMu and the quote
+// Book, and holding optChain.mu across it would introduce a lock-ordering edge
+// this package does not otherwise have.
+func (s *Session) reserveEntryProbe(sel selector) (*deltaResolution, bool, EntryStrikeResult) {
+	s.optChain.mu.Lock()
+	defer s.optChain.mu.Unlock()
+
+	if _, inFlight := s.optChain.deltaRes[sel.id]; inFlight {
+		return nil, true, EntryStrikeResult{}
+	}
+
+	// Becoming the owner means a real IB round trip. Throttle that
+	// specifically (never the free shared-cache read or the join above) so a
+	// symbol sitting in a zone with no obtainable quote can't spin the
+	// caller's event loop on back-to-back probes.
+	if sinceLaunch := time.Since(s.optChain.lastProbeLaunch[sel.id]); sinceLaunch < entryProbeLaunchCooldown {
+		// The previous launch's cause is the real explanation for this call
+		// too — the cooldown is only why we are not re-asking IB right now.
+		// Reporting the cooldown itself would bury an entitlement failure
+		// behind an implementation detail for 15 of every 16 seconds.
+		if lastFail, hadFail := s.optChain.lastEntryFailure[sel.id]; hadFail {
+			return nil, false, lastFail
+		}
+		return nil, false, EntryStrikeResult{Reason: entryFailProbeCooldown,
+			Detail: fmt.Sprintf("last delta probe for %s %s was %.0fs ago; cooldown is %s", sel.symbol, sel.right, sinceLaunch.Seconds(), entryProbeLaunchCooldown)}
+	}
+
+	if isATMDelta(sel.targetDelta) {
+		return nil, false, EntryStrikeResult{Reason: entryFailDeltaTargetATM,
+			Detail: fmt.Sprintf("target_delta %.2f for %s %s is inside the refused ATM band [0.48, 0.52]", sel.targetDelta, sel.symbol, sel.right)}
+	}
+
+	// Read the chain HERE rather than trusting the caller's earlier copy. The
+	// snapshot rolls to the next expiry as 0DTE passes, and a resolution built
+	// from a stale one prices the entry against a contract nobody selected.
+	info, hasInfo := s.optChain.lastChainInfo[sel.chainKey()]
+	if !hasInfo || len(info.strikes) == 0 {
+		return nil, false, EntryStrikeResult{Reason: entryFailNoChain,
+			Detail: fmt.Sprintf("no cached option chain for %s yet (conId/chain-params lookup has not returned)", sel.symbol)}
+	}
+
+	res := &deltaResolution{
+		selectorID: sel.id, symbol: sel.symbol, right: sel.right, targetDelta: sel.targetDelta,
+		expiry: info.expiry, allStrikes: info.strikes, busIdxs: sel.busIdxs,
+	}
+	s.optChain.deltaRes[sel.id] = res
+	s.optChain.lastProbeLaunch[sel.id] = time.Now()
+	return res, false, EntryStrikeResult{}
+}
+
+// abandonEntryProbe hands back a reservation whose launch never happened and
+// publishes the cause. Both halves are load-bearing: without the release the
+// selector stays permanently "in flight" and every later caller joins a probe
+// that will never answer, and without the published cause a sibling already
+// parked in waitForEntryResolution waits out its full timeout to learn nothing.
+//
+// The reservation is deleted only if it is still this call's own, for the same
+// reason resolveDeltaCandidates checks — a caller never disturbs another's.
+func (s *Session) abandonEntryProbe(sel selector, res *deltaResolution, fail EntryStrikeResult) (OptionQuote, EntryStrikeResult) {
+	s.optChain.mu.Lock()
+	if cur, ok := s.optChain.deltaRes[sel.id]; ok && cur == res {
+		delete(s.optChain.deltaRes, sel.id)
+	}
+	if s.optChain.lastEntryFailure == nil {
+		s.optChain.lastEntryFailure = make(map[int]EntryStrikeResult)
+	}
+	s.optChain.lastEntryFailure[sel.id] = fail
+	s.optChain.mu.Unlock()
+	s.optionLog.Printf("Option entry probe FAILED: %s %s (sel=%d) — %s: %s",
+		sel.symbol, sel.right, sel.id, fail.Reason, fail.Detail)
+	return OptionQuote{}, fail
 }
 
 // forgetLegLocked drops a leg from the registry without touching the ledger —
