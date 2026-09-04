@@ -258,6 +258,24 @@ type optLeg struct {
 	ask    float64
 	delta  float64
 
+	// prevClose is IB tick type 9 (CLOSE): the PRIOR session's closing price,
+	// never a live quote. It is recorded here for diagnostics only, and is
+	// deliberately never published on the bus nor written to the quotes.Book,
+	// because every consumer of a leg's price treats it as current and
+	// realizable. Folding it into price is what let a TSLA 355 call entered at
+	// 5.48 record a 23.23 watermark on 2026-09-04 — yesterday's close, struck
+	// when TSLA was 20 points higher — which put the trailing-stop trigger at
+	// 22.07 and closed the position 41 seconds after it opened. The stock path
+	// has always kept the two apart (mktData.prevClose, ticks.go); this is the
+	// option equivalent.
+	prevClose float64
+
+	// quoteSeq counts genuine PRICE changes on this leg — bumped only when bid,
+	// ask or price actually moves, never on a re-emission. It rides out on
+	// every OptionData so a consumer can tell one observation republished from
+	// two observations agreeing; see eventbus.OptionData.QuoteSeq.
+	quoteSeq uint64
+
 	// deltaSource is "matched" (a deliberate ATM target, or a genuine live
 	// IB delta match) or "atm_fallback" (no usable delta, strike picked
 	// without one).
@@ -1394,6 +1412,7 @@ func optionDataFor(leg *optLeg, buses []int) optionDataPublish {
 	return optionDataPublish{buses: buses, data: eventbus.OptionData{
 		Symbol: leg.symbol, Right: leg.right, Strike: leg.strike, Expiry: leg.expiry,
 		Price: leg.price, Bid: leg.bid, Ask: leg.ask, Delta: leg.delta, DeltaSource: leg.deltaSource,
+		QuoteSeq: leg.quoteSeq,
 	}}
 }
 
@@ -2031,11 +2050,35 @@ func (s *Session) handleOptionTick(reqID int64, tickType int64, price float64) b
 	if leg, ok := s.legByReqIDLocked(reqID); ok {
 		switch tickType {
 		case ibapi.BID, ibapi.DELAYED_BID:
-			leg.bid = price
+			if price != leg.bid {
+				leg.bid = price
+				leg.quoteSeq++
+			}
 		case ibapi.ASK, ibapi.DELAYED_ASK:
-			leg.ask = price
-		case ibapi.LAST, ibapi.DELAYED_LAST, ibapi.CLOSE, ibapi.DELAYED_CLOSE:
-			leg.price = price
+			if price != leg.ask {
+				leg.ask = price
+				leg.quoteSeq++
+			}
+		case ibapi.LAST, ibapi.DELAYED_LAST:
+			if price != leg.price {
+				leg.price = price
+				leg.quoteSeq++
+			}
+		case ibapi.CLOSE, ibapi.DELAYED_CLOSE:
+			// The prior session's close, not a price anything may trade or
+			// value against. Park it and publish NOTHING — returning here is
+			// load-bearing twice over. It keeps yesterday's number out of
+			// leg.price (which optSellPrice falls back to whenever bid and ask
+			// are both still zero, exactly the state a freshly pinned leg is in
+			// when IB's opening burst delivers this tick), and it suppresses
+			// the od publish below, which would republish the unchanged
+			// leg.price a second time and hand ConfirmedWatermarkPrice the
+			// corroborating "second tick" its guard asks for. Liveness was
+			// already stamped by touchOptionLegLocked above, so the leg is
+			// still visibly being served.
+			leg.prevClose = price
+			s.optChain.mu.Unlock()
+			return true
 		default:
 			s.optChain.mu.Unlock()
 			return true
@@ -2043,6 +2086,7 @@ func (s *Session) handleOptionTick(reqID int64, tickType int64, price float64) b
 		od := eventbus.OptionData{
 			Symbol: leg.symbol, Right: leg.right, Strike: leg.strike, Expiry: leg.expiry,
 			Price: leg.price, Bid: leg.bid, Ask: leg.ask, Delta: leg.delta, DeltaSource: leg.deltaSource,
+			QuoteSeq: leg.quoteSeq,
 		}
 		pinned := leg.pins > 0
 		s.optChain.mu.Unlock()

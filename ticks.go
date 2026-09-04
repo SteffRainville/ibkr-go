@@ -21,7 +21,13 @@ func (s *Session) TickPrice(reqID int64, tickType int64, price float64, attrib i
 
 	if sym, ok := s.mktData.snapReqSymbol[reqID]; ok {
 		switch tickType {
-		case ibapi.LAST, ibapi.DELAYED_LAST, ibapi.CLOSE, ibapi.DELAYED_CLOSE:
+		// CLOSE/DELAYED_CLOSE are deliberately absent: they carry the PRIOR
+		// session's close, and OnPositionPriceUpdate marks a position with
+		// whatever it is handed. The streaming branch below has always routed
+		// them to mktData.prevClose instead; this branch used to mark a
+		// position at yesterday's price whenever a snapshot answered before any
+		// live trade did.
+		case ibapi.LAST, ibapi.DELAYED_LAST:
 			s.logger.Printf("TickPrice snapshot: symbol=%s tickType=%d price=%.2f", sym, tickType, price)
 			if s.opts.OnPositionPriceUpdate != nil {
 				s.opts.OnPositionPriceUpdate(sym, price)
@@ -225,6 +231,10 @@ func (s *Session) TickOptionComputation(reqID int64, tickType int64, tickAttrib 
 		od := eventbus.OptionData{
 			Symbol: leg.symbol, Right: leg.right, Strike: leg.strike, Expiry: leg.expiry,
 			Price: leg.price, Bid: leg.bid, Ask: leg.ask, Delta: leg.delta, IV: impliedVol, DeltaSource: leg.deltaSource,
+			// The greeks changed; the PRICE did not. Carrying the leg's
+			// unchanged quoteSeq is what stops this re-emission being counted
+			// as a second price observation by whoever is watching for one.
+			QuoteSeq: leg.quoteSeq,
 		}
 		pinned := leg.pins > 0
 		s.optChain.mu.Unlock()

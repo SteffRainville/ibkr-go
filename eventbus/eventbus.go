@@ -144,6 +144,20 @@ type OptionData struct {
 	Delta  float64
 	IV     float64
 
+	// QuoteSeq counts how many times this contract's PRICE actually changed.
+	// It is the publisher's answer to "is this a new observation, or the same
+	// one reaching you again?" — a question no consumer can answer for itself,
+	// because a republished snapshot is byte-identical to a genuine repeat.
+	//
+	// Every price-carrying publish re-emits the leg's whole cached quote, and
+	// several fire per real tick (a price tick, then the greeks tick behind it
+	// in the same burst). A consumer that treats each as independent evidence
+	// lets one price corroborate itself — which is how a watermark guard
+	// requiring "two ticks agreeing" was satisfied by a single one on
+	// 2026-09-04. Seq is unchanged across those re-emissions and advances only
+	// when bid, ask or last genuinely moved.
+	QuoteSeq uint64
+
 	// DeltaSource is "matched" when Strike was chosen from a genuine live
 	// delta probe, or "atm_fallback" when no usable delta was available and
 	// the strike was picked without one. Empty until the first tick arrives.
