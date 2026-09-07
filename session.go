@@ -458,6 +458,11 @@ func (s *Session) Run(subs []Subscriber, stop time.Time) (bool, error) {
 
 	s.liveStart = time.Now()
 
+	// Shared across both loops below: IB counts a ReqHistoricalData and a
+	// ReqMktData call toward the same outbound-message budget, so pacing them
+	// independently would still let the two bursts stack. See pacing.go.
+	pacer := &reqPacer{}
+
 	for _, p := range pending {
 		if !s.mdLines.GrantHist(p.histID) {
 			_, _, _, histMax, _, _ := s.mdLines.StatusAll()
@@ -465,11 +470,13 @@ func (s *Session) Run(subs []Subscriber, stop time.Time) (bool, error) {
 			continue
 		}
 		client.ReqHistoricalData(p.histID, p.spec.Contract, "", "1 D", "30 secs", "TRADES", false, 1, true, nil)
+		pacer.pace()
 	}
 
 	for _, p := range pending {
 		s.mdLines.GrantGuaranteed(p.mktID, mdlines.CategoryStock)
 		client.ReqMktData(p.mktID, p.spec.Contract, "", false, false, nil)
+		pacer.pace()
 	}
 
 	s.acctSummaryID = s.nextReqID()
@@ -706,6 +713,28 @@ func (s *Session) Error(reqID int64, errTime int64, errCode int64, errString str
 	if errCode == errCodeDuplicateTickerID {
 		if s.handleDuplicateTickerID(reqID) {
 			return
+		}
+	}
+
+	// Code 162 ("Historical Market Data Service error message") is a grab-bag
+	// — it also covers a cancelled scanner subscription and "no data for the
+	// range", neither of which is a pacing rejection — so a bare code check
+	// is not enough. Requiring both the "pacing" substring AND that reqID
+	// resolves to a symbol we're tracking bars for (histSymbol) rules those
+	// other 162s out. Historical-data pacing violations previously had ZERO
+	// handling anywhere in this library: they fell into the generic log line
+	// below like any other notice, and the affected symbol silently got no
+	// further bars for the rest of the session with no retry and nothing
+	// visible on the dashboard. Session.Run/ResyncSymbols pace their request
+	// bursts specifically to keep this from firing in the first place (see
+	// pacing.go) — this is the alarm for if it does anyway.
+	if errCode == errCodeHistoricalDataPacing && strings.Contains(strings.ToLower(errString), "pacing") {
+		if pacedSym := s.histSymbol(reqID); pacedSym != "" {
+			msg := fmt.Sprintf("IB historical-data pacing violation on %s (reqID=%d): %s — this symbol will get no further bars until the next reconnect or resync.", pacedSym, reqID, errString)
+			s.logger.Printf("PACING VIOLATION: %s", msg)
+			if s.opts.OnError != nil {
+				s.opts.OnError(ErrorEvent{Type: "market_data", Message: msg})
+			}
 		}
 	}
 

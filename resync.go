@@ -195,14 +195,21 @@ func (s *Session) ResyncSymbols() SymbolDelta {
 
 	delta := SymbolDelta{}
 
+	// Shared across removals and additions below: every Cancel/Req call is an
+	// outbound API message counted toward IB's one combined per-second limit.
+	// See pacing.go.
+	pacer := &reqPacer{}
+
 	// Removals first: they hand market-data lines and bar streams back to the
 	// ledger, so an add/remove pair in the same resync stays flat against the
 	// account's caps instead of transiently exceeding them.
 	for _, r := range removals {
 		s.client.CancelHistoricalData(r.histID)
 		s.mdLines.ReleaseHist(r.histID)
+		pacer.pace()
 		s.client.CancelMktData(r.mktID)
 		s.mdLines.Release(r.mktID)
+		pacer.pace()
 		s.dropSymbolOptionState(r.symbol)
 		delta.Removed = append(delta.Removed, r.symbol)
 		s.logger.Printf("Resync: unsubscribed %s (bars reqID=%d, quotes reqID=%d)", r.symbol, r.histID, r.mktID)
@@ -211,6 +218,7 @@ func (s *Session) ResyncSymbols() SymbolDelta {
 	for _, a := range additions {
 		if s.mdLines.GrantHist(a.histID) {
 			s.client.ReqHistoricalData(a.histID, a.spec.Contract, "", "1 D", "30 secs", "TRADES", false, 1, true, nil)
+			pacer.pace()
 		} else {
 			_, _, _, histMax, _, _ := s.mdLines.StatusAll()
 			s.logger.Printf("Resync: live bars for %s SKIPPED — over the %d concurrent keepUpToDate stream limit; this symbol will get NO live bars. Trim the watchlist or raise MaxHistoricalStreams.", a.spec.Symbol, histMax)
@@ -218,6 +226,7 @@ func (s *Session) ResyncSymbols() SymbolDelta {
 		}
 		s.mdLines.GrantGuaranteed(a.mktID, mdlines.CategoryStock)
 		s.client.ReqMktData(a.mktID, a.spec.Contract, "", false, false, nil)
+		pacer.pace()
 		delta.Added = append(delta.Added, a.spec.Symbol)
 		s.logger.Printf("Resync: subscribed %s (bars reqID=%d, quotes reqID=%d)", a.spec.Symbol, a.histID, a.mktID)
 	}
