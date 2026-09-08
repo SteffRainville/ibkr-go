@@ -168,7 +168,7 @@ func TestSelectStrikeCandidates_BackfillsFromTheOtherSide(t *testing.T) {
 // A chain thinner than the window, and the degenerate inputs that feed
 // entryFailNoCandidates, must return what exists without panicking.
 func TestSelectStrikeCandidates_ThinLadder(t *testing.T) {
-	// LNSR at 8.13 after wholeDollarStrikes: only 5 and 10 survive.
+	// LNSR at 8.13 on a thin real chain — only 5 and 10 listed near spot.
 	got := selectStrikeCandidates([]float64{5, 10}, 8.13, "call", 3, 3)
 	if len(got) != 2 {
 		t.Errorf("got %v, want both strikes", got)

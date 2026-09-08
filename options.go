@@ -1155,12 +1155,6 @@ func (s *Session) SecurityDefinitionOptionParameterEnd(reqID int64) {
 			symbol, standardMultiplier, chosen.tradingClass, chosen.multiplier)
 	}
 
-	if filtered := wholeDollarStrikes(strikes); len(filtered) < len(strikes) {
-		s.optionLog.Printf("Option chain: %s — filtered %d fractional strikes, %d whole-dollar strikes remain",
-			symbol, len(strikes)-len(filtered), len(filtered))
-		strikes = filtered
-	}
-
 	expiry := nearestExpiry(expirations, chain.optionDelay)
 	if expiry == "" {
 		s.optionLog.Printf("Option chain: %s — no current or future expirations found", symbol)
@@ -2118,22 +2112,6 @@ func (s *Session) handleOptionTick(reqID int64, tickType int64, price float64) b
 }
 
 // ── Helper functions ──────────────────────────────────────────────────────
-
-// wholeDollarStrikes returns only the strikes with no fractional dollar
-// part (75, 76 — never 75.50). If the underlying lists no whole-dollar
-// strikes at all, the original slice is returned unchanged.
-func wholeDollarStrikes(strikes []float64) []float64 {
-	whole := make([]float64, 0, len(strikes))
-	for _, st := range strikes {
-		if st == math.Trunc(st) {
-			whole = append(whole, st)
-		}
-	}
-	if len(whole) == 0 {
-		return strikes
-	}
-	return whole
-}
 
 func nearestExpiry(expirations []string, delayDays int) string {
 	target := time.Now().AddDate(0, 0, delayDays).Format("20060102")
