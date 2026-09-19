@@ -119,6 +119,7 @@ func (s *Session) SubscribeOptionBars(symbol, right string, strike float64, expi
 	s.onDemand.mu.Lock()
 	reqID := s.nextReqID()
 	s.onDemand.reqSymbol[reqID] = storeKey
+	s.onDemand.streams[reqID] = &OptionBarsStatus{}
 	s.onDemand.mu.Unlock()
 
 	s.logger.Printf("OnDemand option bars: reqID=%d symbol=%s right=%s strike=%.2f expiry=%s storeKey=%s",
@@ -142,5 +143,43 @@ func (s *Session) UnsubscribeOptionBars(reqID int64) {
 	s.onDemand.mu.Lock()
 	delete(s.onDemand.reqSymbol, reqID)
 	delete(s.onDemand.done, reqID)
+	delete(s.onDemand.streams, reqID)
 	s.onDemand.mu.Unlock()
+}
+
+// OptionBarsStatus is what IB has said so far about one SubscribeOptionBars
+// stream. The zero value means "asked, no answer yet".
+type OptionBarsStatus struct {
+	// Backfilled is true once IB delivered the historical part of the
+	// request. With no bars in the store, that means IB has no bars for the
+	// contract in the requested window.
+	Backfilled bool `json:"backfilled"`
+	// ErrCode/ErrMsg carry the IB error that killed the stream, if any.
+	// IB does not retry a refused historical request, so a non-zero code is
+	// final for this reqID.
+	ErrCode int64  `json:"err_code,omitempty"`
+	ErrMsg  string `json:"err_msg,omitempty"`
+}
+
+// OptionBarsStatus reports the state of a stream opened by
+// SubscribeOptionBars. ok is false for an unknown (or already
+// unsubscribed) reqID.
+func (s *Session) OptionBarsStatus(reqID int64) (st OptionBarsStatus, ok bool) {
+	s.onDemand.mu.Lock()
+	defer s.onDemand.mu.Unlock()
+	p, ok := s.onDemand.streams[reqID]
+	if !ok {
+		return OptionBarsStatus{}, false
+	}
+	return *p, true
+}
+
+// noteOptionBarsError records an IB error against an option chart stream.
+// A no-op for any reqID that is not one.
+func (s *Session) noteOptionBarsError(reqID, code int64, msg string) {
+	s.onDemand.mu.Lock()
+	defer s.onDemand.mu.Unlock()
+	if p, ok := s.onDemand.streams[reqID]; ok {
+		p.ErrCode, p.ErrMsg = code, msg
+	}
 }

@@ -63,6 +63,11 @@ func (s *Session) HistoricalData(reqId int64, bar *ibapi.Bar) {
 func (s *Session) HistoricalDataEnd(reqID int64, startDateStr string, endDateStr string) {
 	s.onDemand.mu.Lock()
 	ch, ok := s.onDemand.done[reqID]
+	if st, isStream := s.onDemand.streams[reqID]; isStream {
+		// keepUpToDate streams also get an end marker once the backfill is
+		// delivered — the point after which "no bars" means IB has none.
+		st.Backfilled = true
+	}
 	s.onDemand.mu.Unlock()
 	if !ok {
 		return

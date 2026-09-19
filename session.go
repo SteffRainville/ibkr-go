@@ -140,6 +140,10 @@ type onDemandTracker struct {
 	mu        sync.Mutex
 	reqSymbol map[int64]string
 	done      map[int64]chan error
+	// streams holds the state of each SubscribeOptionBars stream, so a caller
+	// polling an empty candle key can learn WHY it is empty (see
+	// OptionBarsStatus). A one-shot fetch reports through done instead.
+	streams map[int64]*OptionBarsStatus
 }
 
 type scanTracker struct {
@@ -326,6 +330,7 @@ func NewSession(opts Options, book *quotes.Book, cs *candlestore.Store) *Session
 		onDemand: onDemandTracker{
 			reqSymbol: make(map[int64]string),
 			done:      make(map[int64]chan error),
+			streams:   make(map[int64]*OptionBarsStatus),
 		},
 		optQuery: optionQueryTracker{
 			conIDReqs:   make(map[int64]*optQueryReq),
@@ -696,6 +701,14 @@ func (s *Session) Error(reqID int64, errTime int64, errCode int64, errString str
 		label = "IB Error"
 	}
 	s.logger.Printf("%s: reqID=%d symbol=%s code=%d msg=%s", label, reqID, sym, errCode, errString)
+
+	// An on-demand option chart stream IB refused (expired contract, no
+	// data permissions, no bars in range, …). IB does not retry it, so
+	// without this the chart page would poll an empty key forever with
+	// nothing to say about why.
+	if label == "IB Error" {
+		s.noteOptionBarsError(reqID, errCode, errString)
+	}
 
 	// Attribute the error to an in-flight entry delta probe, if this reqID is
 	// one. Purely observational — see noteCandidateError. Only code 200 gets
