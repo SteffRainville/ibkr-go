@@ -1566,6 +1566,7 @@ func (s *Session) resolveDeltaCandidates(sel selector, mine *deltaResolution) (O
 		// "this account is not entitled to option data" from "IB never
 		// answered", and both look identical from here otherwise.
 		failure := classifyCandidateErrors(res.candidates)
+		s.publishEntryOutcomeLocked(sel.id, OptionQuote{}, failure)
 		cancel := s.releaseCandidatesLocked(res.candidates)
 		s.optChain.mu.Unlock()
 		s.cancelLines(cancel)
@@ -1575,7 +1576,25 @@ func (s *Session) resolveDeltaCandidates(sel selector, mine *deltaResolution) (O
 		return OptionQuote{}, failure
 	}
 
+	// best.bid/best.ask arrived during this synchronous, bounded probe (within
+	// entryDeltaProbeTimeout), so `now` is an accurate freshness stamp for them —
+	// there is no separate per-tick timestamp cached on deltaCandidate to read back.
 	now := time.Now()
+	q := OptionQuote{Strike: best.strike, Expiry: best.expiry, Bid: best.bid, Ask: best.ask, Delta: best.delta, IV: best.iv, BidTime: now, AskTime: now}
+	outcome := EntryStrikeResult{OK: true}
+	if !q.Valid() {
+		// A winner on delta with no two-sided price. Callers already refused to
+		// trade this (Valid() is the entry precondition); reporting it as its
+		// own reason stops it hiding inside the generic "no quote" bucket, and
+		// it is a genuinely different situation — the contract IS quoting
+		// Greeks, so entitlement is fine and the price is merely late.
+		outcome = EntryStrikeResult{Reason: entryFailDeltaNoPrice,
+			Detail: fmt.Sprintf("%s %s strike %.2f matched on delta %.4f but IB sent no two-sided price (bid=%.2f ask=%.2f)",
+				symbol, right, best.strike, best.delta, best.bid, best.ask)}
+	}
+	// Published BEFORE the unlock that makes deltaRes's deletion visible — see
+	// publishEntryOutcomeLocked.
+	s.publishEntryOutcomeLocked(sel.id, q, outcome)
 	cancel := s.releaseCandidatesLocked(res.candidates)
 	s.optChain.mu.Unlock()
 
@@ -1595,21 +1614,37 @@ func (s *Session) resolveDeltaCandidates(sel selector, mine *deltaResolution) (O
 			symbol, right, sel.id, res.targetDelta, best.strike, best.delta, miss)
 	}
 
-	// best.bid/best.ask arrived during this synchronous, bounded probe (within
-	// entryDeltaProbeTimeout), so `now` is an accurate freshness stamp for them —
-	// there is no separate per-tick timestamp cached on deltaCandidate to read back.
-	q := OptionQuote{Strike: best.strike, Expiry: best.expiry, Bid: best.bid, Ask: best.ask, Delta: best.delta, IV: best.iv, BidTime: now, AskTime: now}
-	if !q.Valid() {
-		// A winner on delta with no two-sided price. Callers already refused to
-		// trade this (Valid() is the entry precondition); reporting it as its
-		// own reason stops it hiding inside the generic "no quote" bucket, and
-		// it is a genuinely different situation — the contract IS quoting
-		// Greeks, so entitlement is fine and the price is merely late.
-		return q, EntryStrikeResult{Reason: entryFailDeltaNoPrice,
-			Detail: fmt.Sprintf("%s %s strike %.2f matched on delta %.4f but IB sent no two-sided price (bid=%.2f ask=%.2f)",
-				symbol, right, best.strike, best.delta, best.bid, best.ask)}
+	return q, outcome
+}
+
+// publishEntryOutcomeLocked records a finished entry probe's outcome where a
+// joined sibling (waitForEntryResolution) and this selector's next caller will
+// read it: the quote in resolvedEntry on success, the cause in
+// lastEntryFailure otherwise. Caller holds s.optChain.mu.
+//
+// It must run in the SAME critical section that deletes deltaRes[selID]. A
+// waiter treats "no longer owned" as "the answer is in", so any gap between
+// the two is a window in which a successful probe reads as a failed one. That
+// gap existed until 2026-09-22: the owner published only after unlocking,
+// logging and cancelling its candidate lines, and OrbOptionFiltered was told
+// "option_sibling_failed" twice for an AMD call its sibling resolved and
+// traded in the same second.
+//
+// Success also clears any earlier failure, for the same reason — a waiter
+// must never read a previous probe's diagnosis as this one's.
+func (s *Session) publishEntryOutcomeLocked(selID int, q OptionQuote, r EntryStrikeResult) {
+	if r.OK {
+		if s.optChain.resolvedEntry == nil {
+			s.optChain.resolvedEntry = make(map[int]resolvedEntryLeg)
+		}
+		s.optChain.resolvedEntry[selID] = resolvedEntryLeg{strike: q.Strike, expiry: q.Expiry, delta: q.Delta, iv: q.IV, bid: q.Bid, ask: q.Ask, bidTime: q.BidTime, askTime: q.AskTime, at: time.Now()}
+		delete(s.optChain.lastEntryFailure, selID)
+		return
 	}
-	return q, EntryStrikeResult{OK: true}
+	if s.optChain.lastEntryFailure == nil {
+		s.optChain.lastEntryFailure = make(map[int]EntryStrikeResult)
+	}
+	s.optChain.lastEntryFailure[selID] = r
 }
 
 // selectorForLocked returns the selector for (symbol, right) that busIdx
@@ -1757,23 +1792,9 @@ func (s *Session) ResolveEntryStrike(sub Subscriber, symbol, right string, timeo
 		}
 		time.Sleep(pollInterval)
 	}
+	// resolveDeltaCandidates has already published the outcome for siblings —
+	// atomically with ending this call's ownership (publishEntryOutcomeLocked).
 	q, res2 := s.resolveDeltaCandidates(sel, res)
-	s.optChain.mu.Lock()
-	if res2.OK {
-		if s.optChain.resolvedEntry == nil {
-			s.optChain.resolvedEntry = make(map[int]resolvedEntryLeg)
-		}
-		s.optChain.resolvedEntry[sel.id] = resolvedEntryLeg{strike: q.Strike, expiry: q.Expiry, delta: q.Delta, iv: q.IV, bid: q.Bid, ask: q.Ask, bidTime: q.BidTime, askTime: q.AskTime, at: time.Now()}
-		delete(s.optChain.lastEntryFailure, sel.id)
-	} else {
-		// Publish the cause for siblings still polling waitForEntryResolution,
-		// and for our own next call inside the launch cooldown.
-		if s.optChain.lastEntryFailure == nil {
-			s.optChain.lastEntryFailure = make(map[int]EntryStrikeResult)
-		}
-		s.optChain.lastEntryFailure[sel.id] = res2
-	}
-	s.optChain.mu.Unlock()
 	if !res2.OK {
 		s.optionLog.Printf("Option entry probe FAILED: %s %s (sel=%d) — %s: %s",
 			symbol, right, sel.id, res2.Reason, res2.Detail)
@@ -1865,10 +1886,7 @@ func (s *Session) abandonEntryProbe(sel selector, res *deltaResolution, fail Ent
 	if cur, ok := s.optChain.deltaRes[sel.id]; ok && cur == res {
 		delete(s.optChain.deltaRes, sel.id)
 	}
-	if s.optChain.lastEntryFailure == nil {
-		s.optChain.lastEntryFailure = make(map[int]EntryStrikeResult)
-	}
-	s.optChain.lastEntryFailure[sel.id] = fail
+	s.publishEntryOutcomeLocked(sel.id, OptionQuote{}, fail)
 	s.optChain.mu.Unlock()
 	s.optionLog.Printf("Option entry probe FAILED: %s %s (sel=%d) — %s: %s",
 		sel.symbol, sel.right, sel.id, fail.Reason, fail.Detail)
@@ -1947,8 +1965,13 @@ func (s *Session) waitForEntryResolution(sel selector, timeout time.Duration) (O
 	if ok {
 		return OptionQuote{}, fail
 	}
+	// The owner publishes its outcome atomically with releasing ownership
+	// (publishEntryOutcomeLocked), so arriving here means this call's own wait
+	// expired while the owner was still probing — not that the owner failed.
+	// The reason string is unchanged so archived Failed Buy rows keep their
+	// meaning; the detail says what actually happened.
 	return OptionQuote{}, EntryStrikeResult{Reason: entryFailSiblingFailed,
-		Detail: fmt.Sprintf("another robot's delta probe for %s %s finished without a usable quote", sel.symbol, sel.right)}
+		Detail: fmt.Sprintf("another robot's delta probe for %s %s was still running when this call's %s wait expired", sel.symbol, sel.right, timeout)}
 }
 
 // handleOptionMktError handles error 200 for an option market data
