@@ -346,3 +346,66 @@ func TestLedger_AllReqIDs(t *testing.T) {
 // override now: the categories they rationed have no members, and a pool that
 // holds only underlyings, held positions and in-flight probes has nothing to
 // ration between.
+
+// Recording lines live only below the Buffer, and give way — oldest first —
+// the moment any other category needs the room.
+func TestRecording_GrantedOnlyBelowBufferAndEvictedFirst(t *testing.T) {
+	l := NewLedger(20, 0)
+	evicted := make(chan []int64, 4)
+	l.SetOnEvict(func(ids []int64) { evicted <- ids })
+
+	var id int64
+	for ; id < 8; id++ {
+		l.GrantGuaranteed(id, CategoryStock)
+	}
+	if !l.GrantRecording(100) || !l.GrantRecording(101) {
+		t.Fatal("recording refused with free headroom")
+	}
+	if l.GrantRecording(102) {
+		t.Fatal("recording granted into the buffer (10/20 in use)")
+	}
+
+	// A position line lands: usage would enter the buffer, so the OLDEST
+	// recording line is evicted to make room.
+	l.GrantGuaranteed(200, CategoryPosition)
+	if got := <-evicted; len(got) != 1 || got[0] != 100 {
+		t.Fatalf("evicted %v, want [100] (oldest first)", got)
+	}
+	if l.RecordingCount() != 1 {
+		t.Errorf("recording lines = %d, want 1", l.RecordingCount())
+	}
+	used, _ := l.Status()
+	if used != 10 {
+		t.Errorf("used = %d, want 10 (8 stock + 1 position + 1 recording)", used)
+	}
+
+	// A probe needing the room evicts the last one rather than dipping into the buffer.
+	if !l.GrantProbe(300) {
+		t.Fatal("probe refused")
+	}
+	if got := <-evicted; len(got) != 1 || got[0] != 101 {
+		t.Fatalf("evicted %v, want [101]", got)
+	}
+	stock, pos, snap, probe := l.CategoryCounts()
+	if stock != 8 || pos != 1 || snap != 0 || probe != 1 || l.RecordingCount() != 0 {
+		t.Errorf("counts = %d/%d/%d/%d rec=%d", stock, pos, snap, probe, l.RecordingCount())
+	}
+}
+
+// A position line demoted to recording (its last position closed) is evicted
+// at once if it now sits in the buffer.
+func TestRecording_ReclassifyIntoBufferEvicts(t *testing.T) {
+	l := NewLedger(20, 0)
+	evicted := make(chan []int64, 1)
+	l.SetOnEvict(func(ids []int64) { evicted <- ids })
+	for id := int64(0); id < 11; id++ {
+		l.GrantGuaranteed(id, CategoryPosition)
+	}
+	l.Reclassify(5, CategoryRecording)
+	if got := <-evicted; len(got) != 1 || got[0] != 5 {
+		t.Fatalf("evicted %v, want [5]", got)
+	}
+	if used, _ := l.Status(); used != 10 {
+		t.Errorf("used = %d, want 10", used)
+	}
+}

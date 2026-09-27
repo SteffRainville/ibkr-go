@@ -267,7 +267,7 @@ func NewSession(opts Options, book *quotes.Book, cs *candlestore.Store) *Session
 	if cs == nil {
 		cs = candlestore.New()
 	}
-	return &Session{
+	s := &Session{
 		opts:           opts,
 		ready:          make(chan struct{}, 1),
 		book:           book,
@@ -345,6 +345,8 @@ func NewSession(opts Options, book *quotes.Book, cs *candlestore.Store) *Session
 		optionLog: writerLogger(opts.OptionLog),
 		acctLog:   writerLogger(opts.AccountLog),
 	}
+	s.mdLines.SetOnEvict(s.evictRecordingLines)
+	return s
 }
 
 // Done returns a channel that is closed when this session's connection ends

@@ -252,6 +252,12 @@ func (s *Session) planDeadLegRepairsLocked(now time.Time) (repair, silent []dead
 	lastAny := s.optChain.lastAnyOptionTick
 
 	for key, leg := range s.optChain.legs {
+		// A leg kept only for quote recording is not worth a repair line: its
+		// position is gone, and a contract going quiet after its own close (a
+		// 0DTE past 16:00) is the expected end of its day.
+		if leg.pins == 0 && leg.tails > 0 {
+			continue
+		}
 		health := legHealthAt(leg.subscribedAt, leg.lastTickAt, lastAny, now)
 		if health != legStale && health != legSilent {
 			continue

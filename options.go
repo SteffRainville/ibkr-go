@@ -281,8 +281,8 @@ type optLeg struct {
 	// without one).
 	deltaSource string
 
-	// pins counts open-position holders, and is now the ONLY holder kind: a
-	// leg exists because some position needs its contract priced.
+	// pins counts open-position holders — the holder kind that matters for
+	// trading: a leg exists because some position needs its contract priced.
 	//
 	// The refcount stays essential even so. It is what stopped one robot's exit
 	// cancelling a contract a sibling's still-open IWM 298 PUT was pricing its
@@ -292,6 +292,13 @@ type optLeg struct {
 	// A `selectors map[int]struct{}` sat beside this, counting watchlist rows
 	// displaying the contract. Those rows no longer hold subscriptions.
 	pins int
+
+	// tails counts recording holds (HoldForRecording): a caller recording this
+	// contract's quotes wants it kept streaming after the last position closes,
+	// so a replay can price a wider exit than the one actually taken. A leg
+	// held only by tails sits in mdlines.CategoryRecording — the lowest tier,
+	// evicted whenever anything else needs the line.
+	tails int
 
 	// subscribedAt is when ReqMktData was issued for this reqID, and
 	// lastTickAt when IB last delivered ANY message for it (zero = never).
@@ -311,7 +318,7 @@ func (l *optLeg) key() legKey {
 }
 
 // held reports whether anything still wants this contract.
-func (l *optLeg) held() bool { return l.pins > 0 }
+func (l *optLeg) held() bool { return l.pins > 0 || l.tails > 0 }
 
 // deltaCandidate tracks one strike subscription used during delta-based
 // strike selection. Multiple candidates are subscribed simultaneously; the one
@@ -1311,12 +1318,15 @@ func (s *Session) releaseLegIfUnheldLocked(leg *optLeg) int64 {
 	return leg.reqID
 }
 
-// legCategory is a leg's market-data priority. Every leg is held by at least
-// one open position — that is the only thing that opens one — so this is
-// always guaranteed. It survives as a function because openLegLocked and the
-// resubscribe path both classify through it, and a future non-position holder
-// would need exactly one place to change.
-func legCategory(*optLeg) mdlines.Category { return mdlines.CategoryPosition }
+// legCategory is a leg's market-data priority: guaranteed while any open
+// position holds it, the lowest (evictable) recording tier once only
+// recording holds remain.
+func legCategory(l *optLeg) mdlines.Category {
+	if l.pins > 0 {
+		return mdlines.CategoryPosition
+	}
+	return mdlines.CategoryRecording
+}
 
 // legAgeString renders a leg's last-tick age for logs, distinguishing "never
 // ticked" from "ticked a while ago" — they call for different repairs.
@@ -2241,6 +2251,94 @@ func (s *Session) UnsubscribePositionStrike(symbol, right string, strike float64
 	}
 	s.optionLog.Printf("Option: unsubscribing POSITION-PINNED %s %s strike=%.2f expiry=%s (reqID=%d)", symbol, right, strike, expiry, reqID)
 	s.cancelLines([]int64{cancel})
+}
+
+// HoldForRecording keeps an option contract streaming for quote recording,
+// independent of positions: while a position holds the contract this only adds
+// a reference, and when the last position releases it the line drops to
+// mdlines.CategoryRecording instead of being cancelled. A contract nothing
+// holds (after a reconnect, say) is subscribed afresh — but only from free
+// headroom; with none, it goes unrecorded. Pair every call with
+// ReleaseRecording.
+func (s *Session) HoldForRecording(symbol, right string, strike float64, expiry string) {
+	key := legKey{symbol, right, strike, expiry}
+
+	s.optChain.mu.Lock()
+	if leg, exists := s.optChain.legs[key]; exists {
+		leg.tails++
+		s.optChain.mu.Unlock()
+		return
+	}
+	reqID := s.nextReqID()
+	s.optChain.mu.Unlock()
+
+	if !s.mdLines.GrantRecording(reqID) {
+		s.optionLog.Printf("Option: no headroom to RECORD %s %s strike=%.2f expiry=%s — left unrecorded", symbol, right, strike, expiry)
+		return
+	}
+	s.optChain.mu.Lock()
+	if leg, exists := s.optChain.legs[key]; exists {
+		// A position subscribed it while the grant was in flight.
+		leg.tails++
+		s.optChain.mu.Unlock()
+		s.mdLines.Release(reqID)
+		return
+	}
+	leg := s.openLegLocked(key, reqID, "", time.Now())
+	leg.tails = 1
+	s.optChain.mu.Unlock()
+
+	ibRight := "C"
+	if right == "put" {
+		ibRight = "P"
+	}
+	s.optionLog.Printf("Option: subscribing for RECORDING %s %s strike=%.2f expiry=%s (reqID=%d)", symbol, right, strike, expiry, reqID)
+	s.client.ReqMktData(reqID, makeOptionContract(symbol, ibRight, strike, expiry), "", false, false, nil)
+}
+
+// ReleaseRecording drops one recording hold, cancelling the feed once nothing
+// — no position, no other recording hold — still wants the contract.
+func (s *Session) ReleaseRecording(symbol, right string, strike float64, expiry string) {
+	key := legKey{symbol, right, strike, expiry}
+
+	s.optChain.mu.Lock()
+	leg, ok := s.optChain.legs[key]
+	if !ok || leg.tails == 0 {
+		s.optChain.mu.Unlock()
+		return
+	}
+	leg.tails--
+	cancel := s.releaseLegIfUnheldLocked(leg)
+	s.optChain.mu.Unlock()
+	if cancel != 0 {
+		s.optionLog.Printf("Option: unsubscribing RECORDING %s %s strike=%.2f expiry=%s (reqID=%d)", symbol, right, strike, expiry, cancel)
+		s.cancelLines([]int64{cancel})
+	}
+}
+
+// evictRecordingLines is the mdlines eviction handler: the ledger took these
+// recording lines back to make room for a higher-priority one. A leg that a
+// position re-pinned in the meantime keeps its feed — its line is re-granted
+// as a position line; any other is dropped and cancelled.
+func (s *Session) evictRecordingLines(reqIDs []int64) {
+	var cancel []int64
+	s.optChain.mu.Lock()
+	for _, id := range reqIDs {
+		leg, ok := s.legByReqIDLocked(id)
+		if !ok {
+			continue
+		}
+		if leg.pins > 0 {
+			s.mdLines.GrantGuaranteed(id, mdlines.CategoryPosition)
+			continue
+		}
+		s.optionLog.Printf("Option: EVICTED recording line %s %s strike=%.2f expiry=%s (reqID=%d) — a higher-priority line needed it",
+			leg.symbol, leg.right, leg.strike, leg.expiry, id)
+		s.forgetLegLocked(leg)
+		cancel = append(cancel, id)
+	}
+	s.optChain.mu.Unlock()
+	s.cancelLines(cancel)
 }
 
 // getUnderlyingPrice returns the current price for a symbol using bid/ask

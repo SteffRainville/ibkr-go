@@ -47,8 +47,15 @@ const (
 	// (e.g. a buy). Transient: granted in batches of a few candidates,
 	// released the moment the resolution picks a winner.
 	CategoryProbe
+	// CategoryRecording — an option contract kept streaming only so its quotes
+	// can be recorded (for exit backtesting) after the last position holding
+	// it closed. Persistent but LOWEST priority: granted only below the
+	// Buffer, and evicted — oldest first — the moment any other category
+	// needs the room (see evictRecordingLocked). Recording must never cost a
+	// trade a line.
+	CategoryRecording
 
-	numCategories = 4
+	numCategories = 5
 )
 
 // Buffer is the default headroom cushion kept below the hard line cap so
@@ -92,6 +99,14 @@ type Ledger struct {
 	// can free one whose owning resolution never released it.
 	probeAt map[int64]time.Time
 
+	// recAt records when each line entered CategoryRecording (granted or
+	// reclassified), so eviction takes the oldest first. onEvict receives the
+	// evicted reqIDs, on its own goroutine: the caller may hold its own locks
+	// across the Grant that triggered the eviction (this is a leaf lock), so
+	// the cancel must not run under them.
+	recAt   map[int64]time.Time
+	onEvict func(reqIDs []int64)
+
 	// histLines tracks keep-up-to-date historical bar subscriptions, which
 	// IB-style brokers govern under a SEPARATE hard ceiling independent of
 	// the line cap above (a streaming line and a keep-up-to-date request for
@@ -117,6 +132,7 @@ func NewLedger(max, histMax int) *Ledger {
 		lines:     make(map[int64]Category),
 		snapAt:    make(map[int64]time.Time),
 		probeAt:   make(map[int64]time.Time),
+		recAt:     make(map[int64]time.Time),
 		histLines: make(map[int64]struct{}),
 		histMax:   histMax,
 	}
@@ -128,6 +144,77 @@ func (l *Ledger) SetOnChange(fn func(used, max int)) {
 	l.mu.Lock()
 	l.onChange = fn
 	l.mu.Unlock()
+}
+
+// SetOnEvict registers the handler for recording lines evicted to make room
+// for a higher-priority line. It runs on its own goroutine; it must cancel the
+// IB subscription and forget the reqID's owner — the ledger has already
+// released the slot.
+func (l *Ledger) SetOnEvict(fn func(reqIDs []int64)) {
+	l.mu.Lock()
+	l.onEvict = fn
+	l.mu.Unlock()
+}
+
+// evictRecordingLocked evicts recording lines, oldest first, until usage is
+// at most limit or none are left. Caller holds l.mu; the returned reqIDs go
+// to afterEvict once the lock is released.
+func (l *Ledger) evictRecordingLocked(limit int) []int64 {
+	var evicted []int64
+	for len(l.lines) > limit && len(l.recAt) > 0 {
+		var oldest int64
+		var oldestAt time.Time
+		first := true
+		for id, at := range l.recAt {
+			if first || at.Before(oldestAt) || (at.Equal(oldestAt) && id < oldest) {
+				oldest, oldestAt, first = id, at, false
+			}
+		}
+		delete(l.recAt, oldest)
+		if cat, ok := l.lines[oldest]; ok {
+			delete(l.lines, oldest)
+			l.byCat[cat]--
+		}
+		evicted = append(evicted, oldest)
+	}
+	return evicted
+}
+
+// afterEvict hands evicted reqIDs to the eviction handler. Called without
+// l.mu held.
+func (l *Ledger) afterEvict(evicted []int64) {
+	if len(evicted) == 0 {
+		return
+	}
+	l.mu.Lock()
+	fn := l.onEvict
+	l.mu.Unlock()
+	log.Printf("mdlines: evicted %d recording line(s) to make room for a higher-priority line", len(evicted))
+	if fn != nil {
+		go fn(evicted)
+	}
+}
+
+// GrantRecording records a CategoryRecording line, granted only while usage
+// stays below the Buffer — the headroom every other category may still need.
+// Returns false when there is no such room; the contract simply goes
+// unrecorded.
+func (l *Ledger) GrantRecording(reqID int64) bool {
+	l.mu.Lock()
+	if _, exists := l.lines[reqID]; exists {
+		l.mu.Unlock()
+		return true
+	}
+	if len(l.lines) >= l.max-Buffer {
+		l.mu.Unlock()
+		return false
+	}
+	l.lines[reqID] = CategoryRecording
+	l.byCat[CategoryRecording]++
+	l.recAt[reqID] = time.Now()
+	l.mu.Unlock()
+	l.notify()
+	return true
 }
 
 func (l *Ledger) notify() {
@@ -152,9 +239,17 @@ func (l *Ledger) GrantGuaranteed(reqID int64, cat Category) bool {
 	}
 	l.lines[reqID] = cat
 	l.byCat[cat]++
+	if cat == CategoryRecording {
+		l.recAt[reqID] = time.Now()
+	}
+	var evicted []int64
+	if cat != CategoryRecording {
+		evicted = l.evictRecordingLocked(l.max - Buffer)
+	}
 	over := len(l.lines) > l.max
 	used, max := len(l.lines), l.max
 	l.mu.Unlock()
+	l.afterEvict(evicted)
 	if over {
 		log.Printf("mdlines: WARNING over cap — %d/%d lines in use after guaranteed subscription", used, max)
 	}
@@ -172,14 +267,17 @@ func (l *Ledger) GrantSnapshot(reqID int64) bool {
 		l.mu.Unlock()
 		return true
 	}
+	evicted := l.evictRecordingLocked(l.max - Buffer - 1)
 	if len(l.lines) >= l.max {
 		l.mu.Unlock()
+		l.afterEvict(evicted)
 		return false
 	}
 	l.lines[reqID] = CategorySnapshot
 	l.byCat[CategorySnapshot]++
 	l.snapAt[reqID] = time.Now()
 	l.mu.Unlock()
+	l.afterEvict(evicted)
 	l.notify()
 	return true
 }
@@ -206,6 +304,9 @@ func (l *Ledger) GrantProbe(reqID int64) bool {
 		l.byCat[CategoryProbe]++
 		l.probeAt[reqID] = time.Now()
 	}
+	// Recording lines give way before a probe ever dips into the buffer.
+	evicted := l.evictRecordingLocked(l.max - Buffer - 1)
+	defer l.afterEvict(evicted)
 
 	if len(l.lines) < l.max-Buffer {
 		place()
@@ -238,7 +339,9 @@ func (l *Ledger) TrackSnapshot(reqID int64) {
 	l.lines[reqID] = CategorySnapshot
 	l.byCat[CategorySnapshot]++
 	l.snapAt[reqID] = time.Now()
+	evicted := l.evictRecordingLocked(l.max - Buffer)
 	l.mu.Unlock()
+	l.afterEvict(evicted)
 	l.notify()
 }
 
@@ -286,6 +389,7 @@ func (l *Ledger) Release(reqID int64) {
 	l.byCat[cat]--
 	delete(l.snapAt, reqID)  // no-op unless reqID was a snapshot
 	delete(l.probeAt, reqID) // no-op unless reqID was a probe
+	delete(l.recAt, reqID)   // no-op unless reqID was a recording line
 	l.mu.Unlock()
 	l.notify()
 }
@@ -305,7 +409,18 @@ func (l *Ledger) Reclassify(reqID int64, cat Category) {
 	if old == CategoryProbe {
 		delete(l.probeAt, reqID) // graduated to a tracked background line — no longer probe-aged
 	}
+	var evicted []int64
+	if old == CategoryRecording {
+		delete(l.recAt, reqID)
+	}
+	if cat == CategoryRecording {
+		// A line demoted to recording (its last position closed) is the first
+		// to go if it now sits in the headroom other categories need.
+		l.recAt[reqID] = time.Now()
+		evicted = l.evictRecordingLocked(l.max - Buffer)
+	}
 	l.mu.Unlock()
+	l.afterEvict(evicted)
 	l.notify()
 }
 
@@ -404,13 +519,13 @@ func (l *Ledger) Status() (int, int) {
 // StatusAll returns both pools plus a stock/option breakdown of the line
 // pool: (used, max, histUsed, histMax, stockUsed, optionUsed). stockUsed is
 // CategoryStock; optionUsed is every category that exists to serve an
-// option-style contract (Position + Probe). CategorySnapshot is excluded from
+// option-style contract (Position + Probe + Recording). CategorySnapshot is excluded from
 // both (it's transient and small) and folds only into the overall used total.
 func (l *Ledger) StatusAll() (used, max, histUsed, histMax, stockUsed, optionUsed int) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	stockUsed = l.byCat[CategoryStock]
-	optionUsed = l.byCat[CategoryPosition] + l.byCat[CategoryProbe]
+	optionUsed = l.byCat[CategoryPosition] + l.byCat[CategoryProbe] + l.byCat[CategoryRecording]
 	return len(l.lines), l.max, len(l.histLines), l.histMax, stockUsed, optionUsed
 }
 
@@ -421,4 +536,11 @@ func (l *Ledger) CategoryCounts() (stock, position, snapshot, probe int) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.byCat[CategoryStock], l.byCat[CategoryPosition], l.byCat[CategorySnapshot], l.byCat[CategoryProbe]
+}
+
+// RecordingCount is the number of CategoryRecording lines in use.
+func (l *Ledger) RecordingCount() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.byCat[CategoryRecording]
 }
