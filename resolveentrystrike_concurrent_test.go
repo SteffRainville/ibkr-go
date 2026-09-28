@@ -105,10 +105,66 @@ func TestResolveEntryStrike_SiblingInFlightNeverResolves(t *testing.T) {
 	if res.Reason != entryFailSiblingFailed {
 		t.Errorf("Reason = %q, want %q — a caller that waited on a sibling must say so", res.Reason, entryFailSiblingFailed)
 	}
-	if elapsed < timeout {
-		t.Fatalf("returned after %s, before its own timeout of %s", elapsed, timeout)
+	if elapsed < timeout+siblingResolveGrace {
+		t.Fatalf("returned after %s, before its own timeout of %s plus the %s resolve grace", elapsed, timeout, siblingResolveGrace)
 	}
-	if elapsed > timeout+500*time.Millisecond {
+	if elapsed > timeout+siblingResolveGrace+500*time.Millisecond {
 		t.Fatalf("took %s to give up — well past its %s timeout", elapsed, timeout)
+	}
+}
+
+// TestResolveEntryStrike_SiblingWaitsOnOwnersDeadline is the 2026-09-28 AGQ
+// incident: four robots shared one AGQ call probe; the owner ran its full 10s
+// window (no candidate within tolerance) and published at 09:46:09, and both
+// joiners had already given up on their own 10s clocks — which started before
+// the owner's did — reporting option_sibling_failed for a probe that resolved.
+// A joiner must wait on the owner's deadline, plus the resolve step after it.
+func TestResolveEntryStrike_SiblingWaitsOnOwnersDeadline(t *testing.T) {
+	sub := newTestSubscriber()
+	s := newResolveEntryTestSession(sub)
+
+	const joinerTimeout = 200 * time.Millisecond
+	ownerDeadline := time.Now().Add(400 * time.Millisecond)
+	s.optChain.mu.Lock()
+	s.optChain.deltaRes[1] = &deltaResolution{selectorID: 1, symbol: "SPY", right: "put", targetDelta: 0.65, deadline: ownerDeadline}
+	s.optChain.mu.Unlock()
+
+	// The owner publishes just AFTER its own deadline — the resolve step —
+	// and well after the joiner's own timeout.
+	go func() {
+		time.Sleep(time.Until(ownerDeadline) + 50*time.Millisecond)
+		key := quotes.ContractKey{Symbol: "SPY", Right: "put", Strike: 735, Expiry: "20260731"}
+		s.book.SetOptionBid(key, 6.50)
+		s.book.SetOptionAsk(key, 6.60)
+		s.optChain.mu.Lock()
+		delete(s.optChain.deltaRes, 1)
+		s.publishEntryOutcomeLocked(1, OptionQuote{Strike: 735, Expiry: "20260731", Delta: -0.65, Bid: 6.50, Ask: 6.60, BidTime: time.Now(), AskTime: time.Now()}, EntryStrikeResult{OK: true})
+		s.optChain.mu.Unlock()
+	}()
+
+	q, res := s.ResolveEntryStrike(sub, "SPY", "put", joinerTimeout)
+	if !res.OK {
+		t.Fatalf("joiner gave up on a probe that resolved within the owner's window: %+v", res)
+	}
+	if q.Strike != 735 {
+		t.Fatalf("strike = %.0f, want the owner's 735", q.Strike)
+	}
+}
+
+// A candidate IB rejected outright (error 200) will never report, so it must
+// not hold the probe open: with every other candidate reported, the probe is
+// settled even though none landed within tolerance of the target.
+func TestDeltaCandidatesSettled_RejectedCountsAsReported(t *testing.T) {
+	cands := []*deltaCandidate{
+		{ready: true, delta: 0.44},
+		{ready: true, delta: 0.31},
+		{rejected: true},
+	}
+	if !deltaCandidatesSettled(cands, 0.40) {
+		t.Fatal("a rejected candidate kept the probe waiting out its full timeout")
+	}
+	cands = append(cands, &deltaCandidate{})
+	if deltaCandidatesSettled(cands, 0.40) {
+		t.Fatal("settled while a live candidate had not yet reported")
 	}
 }

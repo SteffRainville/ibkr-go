@@ -323,6 +323,7 @@ func NewSession(opts Options, book *quotes.Book, cs *candlestore.Store) *Session
 			resolvedEntry:    make(map[int]resolvedEntryLeg),
 			lastEntryFailure: make(map[int]EntryStrikeResult),
 			lastProbeLaunch:  make(map[int]time.Time),
+			unlisted:         make(map[legKey]struct{}),
 			lastAttempt:      make(map[int]time.Time),
 			forcedResub:      make(map[legKey]resubState),
 			dupRepairs:       make(map[legKey]int),

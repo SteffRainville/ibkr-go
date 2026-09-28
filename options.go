@@ -357,6 +357,15 @@ type deltaCandidate struct {
 	// cleanup in resolveDeltaCandidates: cancelling or releasing an id we were
 	// refused tears down whoever does own it. See dupticker.go.
 	dupTicker bool
+
+	// rejected records that IB refused this candidate's contract outright
+	// (error 200, "no security definition" — e.g. a strike listed in the chain
+	// but not at SMART for this expiry). Unlike errCode it DOES count toward
+	// deltaCandidatesSettled: the request is gone and its line released, so the
+	// candidate can never report, and treating it as "still pending" forced
+	// every probe with one dead strike to run its full timeout (2026-09-28
+	// AGQ, strike 71.50).
+	rejected bool
 }
 
 // EntryStrikeResult reports the outcome of ResolveEntryStrike. It replaces a
@@ -522,6 +531,15 @@ type deltaResolution struct {
 	candidates  []*deltaCandidate
 	allStrikes  []float64
 	busIdxs     []int
+
+	// deadline is when the owning call stops polling its candidates, set under
+	// optChain.mu once they are launched (zero until then). Joined siblings
+	// wait against THIS clock, not one of their own: a joiner's own timeout
+	// started earlier than the owner's (which begins only after the launch)
+	// and did not cover the owner's resolve step, so every probe that ran its
+	// full window left all its joiners reporting option_sibling_failed a
+	// moment before the answer was published (2026-09-28 AGQ, twice).
+	deadline time.Time
 }
 
 // optionChainTracker holds all state for option chain lookup and market data.
@@ -589,6 +607,16 @@ type optionChainTracker struct {
 	// independently probing the same contract are the same failure mode from
 	// IB's perspective.
 	lastProbeLaunch map[int]time.Time
+
+	// unlisted records contracts IB refused as a delta candidate with error
+	// 200 ("no security definition"), so later probes stop choosing them.
+	// reqSecDefOptParams returns the UNION of strikes across every expiry, so
+	// a half-dollar strike that exists only on later expiries (TQQQ 77.50,
+	// IWM 282.50, AGQ 71.50 on the 0DTE/weekly) looks probeable and was
+	// re-asked on every entry: 276 refusals on 2026-09-28, each costing the
+	// probe a slot. Keyed by the full contract, so the entry expires with
+	// its expiry (pruneUnlistedLocked).
+	unlisted map[legKey]struct{}
 
 	// lastAttempt records when the rotation last committed to resolving a
 	// selector — i.e. refreshChainFor got past the selectorResolvingLocked
@@ -682,6 +710,11 @@ const resolvedEntryTTL = 5 * time.Second
 // reads or joining an already-in-flight sibling probe, since neither of those
 // paths issues a new IB request.
 const entryProbeLaunchCooldown = 15 * time.Second
+
+// siblingResolveGrace is how long past the owning probe's deadline a joined
+// sibling keeps waiting — the owner's resolve-and-publish step after it stops
+// polling. Normally milliseconds; the margin absorbs lock contention.
+const siblingResolveGrace = time.Second
 
 // requestOptionChains resolves every selector across all subscribers once, at
 // connect. option_delay and target_delta are configured per SymbolSpec, so the
@@ -1680,12 +1713,16 @@ func (s *Session) selectorForLocked(symbol, right string, busIdx int) (selector,
 
 // deltaCandidatesSettled is ResolveEntryStrike's poll-loop exit condition:
 // true once EITHER every candidate has reported OR one already-ready
-// candidate is within deltaGoodEnoughTolerance of targetDelta. Caller must
-// hold s.optChain.mu.
+// candidate is within deltaGoodEnoughTolerance of targetDelta. A candidate IB
+// rejected outright counts as reported — it never will. Caller must hold
+// s.optChain.mu.
 func deltaCandidatesSettled(candidates []*deltaCandidate, targetDelta float64) bool {
 	const deltaGoodEnoughTolerance = 0.02
 	allReady := true
 	for _, c := range candidates {
+		if c.rejected {
+			continue
+		}
 		if !c.ready {
 			allReady = false
 			continue
@@ -1785,6 +1822,8 @@ func (s *Session) ResolveEntryStrike(sub Subscriber, symbol, right string, timeo
 		s.client.ReqMktData(reqID, contract, "", false, false, nil)
 	}
 	launched := len(res.candidates)
+	deadline := time.Now().Add(timeout)
+	res.deadline = deadline
 	s.optChain.mu.Unlock()
 	if launched == 0 {
 		return s.abandonEntryProbe(sel, res, EntryStrikeResult{Reason: entryFailNoMDLines,
@@ -1792,7 +1831,6 @@ func (s *Session) ResolveEntryStrike(sub Subscriber, symbol, right string, timeo
 	}
 
 	const pollInterval = 100 * time.Millisecond
-	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		s.optChain.mu.Lock()
 		settled := deltaCandidatesSettled(res.candidates, res.targetDelta)
@@ -1876,11 +1914,44 @@ func (s *Session) reserveEntryProbe(sel selector) (*deltaResolution, bool, Entry
 
 	res := &deltaResolution{
 		selectorID: sel.id, symbol: sel.symbol, right: sel.right, targetDelta: sel.targetDelta,
-		expiry: info.expiry, allStrikes: info.strikes, busIdxs: sel.busIdxs,
+		expiry: info.expiry, allStrikes: s.listedStrikesLocked(sel.symbol, sel.right, info.expiry, info.strikes), busIdxs: sel.busIdxs,
 	}
 	s.optChain.deltaRes[sel.id] = res
 	s.optChain.lastProbeLaunch[sel.id] = time.Now()
 	return res, false, EntryStrikeResult{}
+}
+
+// markUnlistedLocked records a contract IB refused with error 200, and drops
+// entries for expiries already past so the set cannot grow across days.
+// Caller holds s.optChain.mu.
+func (s *Session) markUnlistedLocked(k legKey) {
+	if s.optChain.unlisted == nil {
+		s.optChain.unlisted = make(map[legKey]struct{})
+	}
+	today := time.Now().Format("20060102")
+	for old := range s.optChain.unlisted {
+		if old.expiry < today {
+			delete(s.optChain.unlisted, old)
+		}
+	}
+	s.optChain.unlisted[k] = struct{}{}
+}
+
+// listedStrikesLocked returns strikes minus those IB has refused for this
+// symbol/right/expiry. It never mutates strikes — that slice is the shared
+// chain snapshot. Caller holds s.optChain.mu.
+func (s *Session) listedStrikesLocked(symbol, right, expiry string, strikes []float64) []float64 {
+	if len(s.optChain.unlisted) == 0 {
+		return strikes
+	}
+	out := make([]float64, 0, len(strikes))
+	for _, st := range strikes {
+		if _, dead := s.optChain.unlisted[legKey{symbol: symbol, right: right, strike: st, expiry: expiry}]; dead {
+			continue
+		}
+		out = append(out, st)
+	}
+	return out
 }
 
 // abandonEntryProbe hands back a reservation whose launch never happened and
@@ -1951,14 +2022,24 @@ func (s *Session) sharedResolvedEntry(selectorID int) (OptionQuote, bool) {
 // populates on success. If the owner's probe failed, resolvedEntry stays
 // empty and this returns the same (OptionQuote{}, false) the owner got,
 // rather than spending a second probe chasing the same answer.
+//
+// The wait follows the OWNER's deadline (deltaResolution.deadline) plus
+// siblingResolveGrace for its resolve-and-publish step, falling back to this
+// call's own timeout only while the owner has not launched yet. The owner
+// always releases ownership (resolveDeltaCandidates or abandonEntryProbe), so
+// the bound exists only to survive a defect, never to cut a live probe short.
 func (s *Session) waitForEntryResolution(sel selector, timeout time.Duration) (OptionQuote, EntryStrikeResult) {
 	const pollInterval = 100 * time.Millisecond
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
+	ownDeadline := time.Now().Add(timeout)
+	for {
 		s.optChain.mu.Lock()
-		_, stillOwned := s.optChain.deltaRes[sel.id]
+		cur, stillOwned := s.optChain.deltaRes[sel.id]
+		limit := ownDeadline
+		if stillOwned && !cur.deadline.IsZero() {
+			limit = cur.deadline
+		}
 		s.optChain.mu.Unlock()
-		if !stillOwned {
+		if !stillOwned || time.Now().After(limit.Add(siblingResolveGrace)) {
 			break
 		}
 		time.Sleep(pollInterval)
@@ -2015,10 +2096,12 @@ func (s *Session) handleOptionMktError(reqID int64, errStr string) bool {
 		// reqID.
 		cand.errCode = 200
 		cand.errMsg = errStr
+		cand.rejected = true
+		s.markUnlistedLocked(legKey{symbol: cand.symbol, right: cand.right, strike: cand.strike, expiry: cand.expiry})
 		delete(s.optChain.deltaCands, cand.reqID)
 		s.mdLines.Release(cand.reqID)
 		s.optChain.mu.Unlock()
-		s.optionLog.Printf("Option delta candidate FAILED: %s %s strike=%.2f — %s", cand.symbol, cand.right, cand.strike, errStr)
+		s.optionLog.Printf("Option delta candidate FAILED: %s %s strike=%.2f — %s (skipping it for expiry %s)", cand.symbol, cand.right, cand.strike, errStr, cand.expiry)
 		return true
 	}
 
