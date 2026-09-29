@@ -85,14 +85,172 @@ type Book struct {
 	mu     sync.RWMutex
 	stocks map[string]StockQuote
 	opts   map[ContractKey]OptionQuote
+
+	// Window extremes (TrackExtremes). extEvery 0 = not tracked.
+	extEvery time.Duration
+	stockExt map[string]*extPair
+	optExt   map[ContractKey]*extPair
 }
 
 // NewBook returns an empty Book ready for concurrent use.
 func NewBook() *Book {
 	return &Book{
-		stocks: make(map[string]StockQuote),
-		opts:   make(map[ContractKey]OptionQuote),
+		stocks:   make(map[string]StockQuote),
+		opts:     make(map[ContractKey]OptionQuote),
+		stockExt: make(map[string]*extPair),
+		optExt:   make(map[ContractKey]*extPair),
 	}
+}
+
+// ── Window extremes ───────────────────────────────────────────────────────────
+
+// Extremes is the range each side of one instrument's quote covered during one
+// wall-clock window [Start, Start+every): the lowest and highest bid, ask and
+// last it held at any moment — the value prevailing when the window opened
+// included, so a side that never ticked reads its standing price. 0 = that
+// side had no price in the window.
+//
+// A consumer that samples the Book every few seconds (the quote recorder) sees
+// only the instant it samples; these are everything in between — the spike
+// that armed a live trailing stop, the dip that touched a stop loss.
+type Extremes struct {
+	Start             time.Time
+	BidLow, BidHigh   float64
+	AskLow, AskHigh   float64
+	LastLow, LastHigh float64
+	// Open* is what prevailed when the window opened — the whole window's
+	// value for a side with no tick in it.
+	OpenBid, OpenAsk, OpenLast float64
+}
+
+// extPair keeps the window in progress and the one before it: a reader that
+// asks for the window just ended must still find it after a tick has already
+// opened the next.
+type extPair struct{ cur, prev Extremes }
+
+const (
+	sideBid = iota
+	sideAsk
+	sideLast
+)
+
+// TrackExtremes turns on window-extreme tracking with windows aligned to
+// multiples of every (the quote recorder's interval, so its windows are the
+// recorder's samples). Call once, before quotes arrive; 0 turns it off.
+func (b *Book) TrackExtremes(every time.Duration) {
+	b.mu.Lock()
+	b.extEvery = every
+	b.mu.Unlock()
+}
+
+// noteExt folds one price update into a pair's current window. was is the
+// quote (bid, ask, last) prevailing BEFORE this update. Caller holds b.mu.
+func (b *Book) noteExt(e *extPair, now time.Time, side int, price float64, was [3]float64) {
+	start := now.Truncate(b.extEvery)
+	if !e.cur.Start.Equal(start) {
+		if e.cur.Start.Equal(start.Add(-b.extEvery)) {
+			e.prev = e.cur
+		} else {
+			e.prev = Extremes{} // the window just ended saw no tick
+		}
+		e.cur = Extremes{Start: start, OpenBid: was[sideBid], OpenAsk: was[sideAsk], OpenLast: was[sideLast]}
+		for i, v := range was {
+			e.cur.include(i, v)
+		}
+	}
+	e.cur.include(side, price)
+}
+
+func (x *Extremes) include(side int, v float64) {
+	if v <= 0 {
+		return
+	}
+	lo, hi := &x.BidLow, &x.BidHigh
+	switch side {
+	case sideAsk:
+		lo, hi = &x.AskLow, &x.AskHigh
+	case sideLast:
+		lo, hi = &x.LastLow, &x.LastHigh
+	}
+	if *lo == 0 || v < *lo {
+		*lo = v
+	}
+	if v > *hi {
+		*hi = v
+	}
+}
+
+// extremesAt answers for the window starting at start. cur is the quote now.
+func extremesAt(e *extPair, start time.Time, cur [3]float64) Extremes {
+	switch {
+	case e != nil && e.cur.Start.Equal(start):
+		return e.cur
+	case e != nil && e.prev.Start.Equal(start):
+		return e.prev
+	case e != nil && e.cur.Start.After(start) && e.prev.Start.IsZero():
+		// No tick in the asked window, one since: it held the next window's opening quote.
+		return constant(start, [3]float64{e.cur.OpenBid, e.cur.OpenAsk, e.cur.OpenLast})
+	default:
+		// No tick since the window opened: the quote now held throughout.
+		return constant(start, cur)
+	}
+}
+
+func constant(start time.Time, v [3]float64) Extremes {
+	x := Extremes{Start: start, OpenBid: v[sideBid], OpenAsk: v[sideAsk], OpenLast: v[sideLast]}
+	for i, p := range v {
+		x.include(i, p)
+	}
+	return x
+}
+
+// StockExtremes returns symbol's extremes over the window starting at start.
+// ok is false when tracking is off or the symbol has never been quoted.
+func (b *Book) StockExtremes(symbol string, start time.Time) (Extremes, bool) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	q, ok := b.stocks[symbol]
+	if b.extEvery <= 0 || !ok {
+		return Extremes{}, false
+	}
+	return extremesAt(b.stockExt[symbol], start, [3]float64{q.Bid, q.Ask, q.Last}), true
+}
+
+// OptionExtremes is StockExtremes for one exact contract.
+func (b *Book) OptionExtremes(key ContractKey, start time.Time) (Extremes, bool) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	q, ok := b.opts[key]
+	if b.extEvery <= 0 || !ok {
+		return Extremes{}, false
+	}
+	return extremesAt(b.optExt[key], start, [3]float64{q.Bid, q.Ask, q.Last}), true
+}
+
+// stockExtFor / optExtFor return (creating) an instrument's pair, or nil when
+// tracking is off. Caller holds b.mu.
+func (b *Book) stockExtFor(symbol string) *extPair {
+	if b.extEvery <= 0 {
+		return nil
+	}
+	e := b.stockExt[symbol]
+	if e == nil {
+		e = &extPair{}
+		b.stockExt[symbol] = e
+	}
+	return e
+}
+
+func (b *Book) optExtFor(key ContractKey) *extPair {
+	if b.extEvery <= 0 {
+		return nil
+	}
+	e := b.optExt[key]
+	if e == nil {
+		e = &extPair{}
+		b.optExt[key] = e
+	}
+	return e
 }
 
 // ── Stock write path (ibclient) ───────────────────────────────────────────────
@@ -104,6 +262,9 @@ func (b *Book) SetStockBar(symbol string, last float64, barDate string) {
 	}
 	b.mu.Lock()
 	q := b.stocks[symbol]
+	if e := b.stockExtFor(symbol); e != nil {
+		b.noteExt(e, time.Now(), sideLast, last, [3]float64{q.Bid, q.Ask, q.Last})
+	}
 	q.Last = last
 	q.BarTime = time.Now()
 	q.LastTickTime = q.BarTime
@@ -123,6 +284,9 @@ func (b *Book) SetStockBid(symbol string, bid float64) {
 	b.mu.Lock()
 	q := b.stocks[symbol]
 	now := time.Now()
+	if e := b.stockExtFor(symbol); e != nil {
+		b.noteExt(e, now, sideBid, bid, [3]float64{q.Bid, q.Ask, q.Last})
+	}
 	if bid != q.Bid {
 		q.BidTime = now
 	}
@@ -140,6 +304,9 @@ func (b *Book) SetStockAsk(symbol string, ask float64) {
 	b.mu.Lock()
 	q := b.stocks[symbol]
 	now := time.Now()
+	if e := b.stockExtFor(symbol); e != nil {
+		b.noteExt(e, now, sideAsk, ask, [3]float64{q.Bid, q.Ask, q.Last})
+	}
 	if ask != q.Ask {
 		q.AskTime = now
 	}
@@ -159,6 +326,9 @@ func (b *Book) SetOptionBid(key ContractKey, bid float64) {
 	b.mu.Lock()
 	q := b.opts[key]
 	now := time.Now()
+	if e := b.optExtFor(key); e != nil {
+		b.noteExt(e, now, sideBid, bid, [3]float64{q.Bid, q.Ask, q.Last})
+	}
 	if bid != q.Bid {
 		q.BidTime = now
 	}
@@ -176,6 +346,9 @@ func (b *Book) SetOptionAsk(key ContractKey, ask float64) {
 	b.mu.Lock()
 	q := b.opts[key]
 	now := time.Now()
+	if e := b.optExtFor(key); e != nil {
+		b.noteExt(e, now, sideAsk, ask, [3]float64{q.Bid, q.Ask, q.Last})
+	}
 	if ask != q.Ask {
 		q.AskTime = now
 	}
@@ -192,6 +365,9 @@ func (b *Book) SetOptionLast(key ContractKey, last float64) {
 	}
 	b.mu.Lock()
 	q := b.opts[key]
+	if e := b.optExtFor(key); e != nil {
+		b.noteExt(e, time.Now(), sideLast, last, [3]float64{q.Bid, q.Ask, q.Last})
+	}
 	q.Last = last
 	q.LastTickTime = time.Now()
 	b.opts[key] = q
