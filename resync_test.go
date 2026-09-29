@@ -3,13 +3,9 @@ package ibkr
 import "testing"
 
 // TestBuildSelectors_IDsSurviveRebuild is the invariant ResyncSymbols depends
-// on. Every watchlist edit rebuilds the rotation, and almost every edit leaves
-// most selectors untouched. If a rebuild renumbered them, each edit would
-// invalidate everything keyed by selector id — the resolvedEntry share cache,
-// lastAttempt rotation scores, the in-flight-resolution guard, the legs each
-// one holds — and silently provoke a fresh conId + chain round trip for
-// everything at once, which is exactly the connection-pool burst a delta
-// resync exists to avoid.
+// on. Every watchlist edit rebuilds the selector list, and almost every edit
+// leaves most selectors untouched. If a rebuild renumbered them, an in-flight
+// entry probe (keyed by selector id) would be handed to a different selector.
 func TestBuildSelectors_IDsSurviveRebuild(t *testing.T) {
 	s := newRotationTestSession([][]SymbolSpec{{
 		{Symbol: "QQQ", Tag: "call", TargetDelta: 0.50},
@@ -21,7 +17,7 @@ func TestBuildSelectors_IDsSurviveRebuild(t *testing.T) {
 		t.Fatalf("first build returned %d fresh selectors, want 2", len(first))
 	}
 	before := map[string]int{}
-	for _, sel := range s.optChain.rotation {
+	for _, sel := range s.optChain.selectors {
 		before[sel.symbol] = sel.id
 	}
 
@@ -36,7 +32,7 @@ func TestBuildSelectors_IDsSurviveRebuild(t *testing.T) {
 	if len(fresh) != 1 || fresh[0].symbol != "IWM" {
 		t.Fatalf("second build fresh selectors = %+v, want only IWM — an unchanged selector must not be re-resolved", fresh)
 	}
-	for _, sel := range s.optChain.rotation {
+	for _, sel := range s.optChain.selectors {
 		if was, existed := before[sel.symbol]; existed && was != sel.id {
 			t.Fatalf("%s selector id changed across rebuild: %d -> %d", sel.symbol, was, sel.id)
 		}
@@ -52,7 +48,7 @@ func TestBuildSelectors_ParameterChangeIsANewSelector(t *testing.T) {
 		{Symbol: "QQQ", Tag: "call", TargetDelta: 0.50},
 	}})
 	s.buildSelectors()
-	origID := s.optChain.rotation[0].id
+	origID := s.optChain.selectors[0].id
 
 	s.subSymbols = [][]SymbolSpec{{
 		{Symbol: "QQQ", Tag: "call", TargetDelta: 0.70},
@@ -65,8 +61,8 @@ func TestBuildSelectors_ParameterChangeIsANewSelector(t *testing.T) {
 	if fresh[0].id == origID {
 		t.Fatal("a re-parameterized selector reused the old id — it would inherit the previous target's cached strike")
 	}
-	if len(s.optChain.rotation) != 1 {
-		t.Fatalf("rotation holds %d selectors, want 1 — the superseded one must not linger", len(s.optChain.rotation))
+	if len(s.optChain.selectors) != 1 {
+		t.Fatalf("selectors holds %d entries, want 1 — the superseded one must not linger", len(s.optChain.selectors))
 	}
 }
 
@@ -76,7 +72,7 @@ func TestBuildSelectors_ParameterChangeIsANewSelector(t *testing.T) {
 // selectors that no longer existed — necessary when editing a row's target_delta
 // would otherwise strand its old leg's subscription for the session.
 //
-// A selector holds no market-data line now, so dropping it from the rotation IS
+// A selector holds no market-data line now, so dropping it from the list IS
 // releasing it and there is nothing left to walk. The half that still matters —
 // a watchlist edit must never cancel a contract an open position is pricing its
 // stops against — is unconditional rather than guarded: only a pin holds a leg,

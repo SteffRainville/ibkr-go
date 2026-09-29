@@ -10,7 +10,7 @@ import (
 // actually alive.
 //
 // This is the read-only counterpart to deadleg.go: that file DETECTS and
-// REPAIRS dead legs on the rotation ticker, this one simply reports what it
+// REPAIRS dead legs on the chain-loader ticker, this one simply reports what it
 // would see. They are kept apart because they answer different questions and
 // have different audiences — repair is internal policy, observation crosses
 // the module boundary.

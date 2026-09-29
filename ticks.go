@@ -210,21 +210,6 @@ func (s *Session) TickOptionComputation(reqID int64, tickType int64, tickAttrib 
 	// a leg would look dead to the reaper while IB is actively serving it.
 	s.touchOptionLegLocked(reqID, time.Now())
 
-	if impliedVol > 0 {
-		if s.optChain.lastIV == nil {
-			s.optChain.lastIV = make(map[string]float64)
-		}
-		symbolKey := ""
-		if leg, ok := s.legByReqIDLocked(reqID); ok {
-			symbolKey = leg.symbol
-		} else if cand, ok := s.optChain.deltaCands[reqID]; ok {
-			symbolKey = cand.symbol
-		}
-		if symbolKey != "" {
-			s.optChain.lastIV[symbolKey] = impliedVol
-		}
-	}
-
 	if leg, ok := s.legByReqIDLocked(reqID); ok {
 		leg.delta = delta
 		leg.deltaSource = "matched"

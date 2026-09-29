@@ -21,7 +21,7 @@ func isLowLiquidity(stockType string) bool {
 // matches a ReqContractDetails request. Routes to option conId lookups or
 // scanner enrichment.
 func (s *Session) ContractDetails(reqID int64, contractDetails *ibapi.ContractDetails) {
-	if s.handleConIDContractDetails(reqID, contractDetails) {
+	if s.handleChainContractDetails(reqID, contractDetails) {
 		return
 	}
 	if s.handleOptionQueryContractDetails(reqID, contractDetails) {
@@ -85,7 +85,7 @@ func (s *Session) ContractDetails(reqID int64, contractDetails *ibapi.ContractDe
 // ContractDetailsEnd is called when all ContractDetails responses for a
 // ReqContractDetails request have been delivered.
 func (s *Session) ContractDetailsEnd(reqID int64) {
-	if s.handleConIDContractDetailsEnd(reqID) {
+	if s.handleChainContractDetailsEnd(reqID) {
 		return
 	}
 	if s.handleOptionQueryContractDetailsEnd(reqID) {

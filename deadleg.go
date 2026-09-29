@@ -123,19 +123,6 @@ func legHealthAt(subscribedAt, lastTickAt, lastAnyTick, now time.Time) legHealth
 	return legStale
 }
 
-// legTrustedAt reports whether a leg's cached values (notably delta) may be
-// believed. Anything not currently ticking must not be trusted, because the
-// cached value is exactly as old as the silence — this is the predicate that
-// breaks the self-sustaining skip loop in shouldSkipReEstimateLocked.
-func legTrustedAt(subscribedAt, lastTickAt, lastAnyTick, now time.Time) bool {
-	switch legHealthAt(subscribedAt, lastTickAt, lastAnyTick, now) {
-	case legHealthy, legWarming:
-		return true
-	default:
-		return false
-	}
-}
-
 const (
 	// forcedResubBaseCooldown is the first backoff step after a forced
 	// re-subscribe; it doubles per consecutive attempt up to
@@ -178,7 +165,7 @@ func (a deadLegAction) right() string   { return a.key.right }
 func (a deadLegAction) strike() float64 { return a.key.strike }
 
 // reapDeadOptionLegs finds option legs IB has silently stopped serving and
-// repairs them. It runs on the rotation ticker but is deliberately NOT part
+// repairs them. It runs on the chain-loader ticker but is deliberately NOT part
 // of chain resolution: a dead leg already knows its own symbol/right/strike/
 // expiry, so the repair needs no conId or chain-params round trip. That makes
 // recovery independent of both the re-estimate guards and the rotation

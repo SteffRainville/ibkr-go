@@ -312,21 +312,15 @@ func NewSession(opts Options, book *quotes.Book, cs *candlestore.Store) *Session
 			cdReqIDs:   make(map[int64][]int64),
 		},
 		optChain: optionChainTracker{
-			conIDReqs:        make(map[int64]*optConIDReq),
-			chainReqs:        make(map[int64]*optChainReq),
-			legs:             make(map[legKey]*optLeg),
-			legByReqID:       make(map[int64]legKey),
-			deltaCands:       make(map[int64]*deltaCandidate),
-			deltaRes:         make(map[int]*deltaResolution),
-			lastIV:           make(map[string]float64),
-			lastChainInfo:    make(map[chainKey]chainSnapshot),
-			resolvedEntry:    make(map[int]resolvedEntryLeg),
-			lastEntryFailure: make(map[int]EntryStrikeResult),
-			lastProbeLaunch:  make(map[int]time.Time),
-			unlisted:         make(map[legKey]struct{}),
-			lastAttempt:      make(map[int]time.Time),
-			forcedResub:      make(map[legKey]resubState),
-			dupRepairs:       make(map[legKey]int),
+			chains:      make(map[chainKey]*chain),
+			chainByReq:  make(map[int64]chainKey),
+			conIDs:      make(map[string]int64),
+			legs:        make(map[legKey]*optLeg),
+			legByReqID:  make(map[int64]legKey),
+			deltaCands:  make(map[int64]*deltaCandidate),
+			probes:      make(map[int]*probeCall),
+			forcedResub: make(map[legKey]resubState),
+			dupRepairs:  make(map[legKey]int),
 		},
 		onDemand: onDemandTracker{
 			reqSymbol: make(map[int64]string),
@@ -334,8 +328,8 @@ func NewSession(opts Options, book *quotes.Book, cs *candlestore.Store) *Session
 			streams:   make(map[int64]*OptionBarsStatus),
 		},
 		optQuery: optionQueryTracker{
-			conIDReqs:   make(map[int64]*optQueryReq),
-			chainReqs:   make(map[int64]*optQueryReq),
+			conIDReqs: make(map[int64]*optQueryReq),
+			chainReqs: make(map[int64]*optQueryReq),
 		},
 		acct: acctTracker{accounts: make(map[string]AccountSummary)},
 
@@ -494,7 +488,9 @@ func (s *Session) Run(subs []Subscriber, stop time.Time) (bool, error) {
 	go func() {
 		select {
 		case <-time.After(3 * time.Second):
-			s.requestOptionChains()
+			s.buildSelectors()
+			s.resetChainFetches()
+			s.startChainFetches()
 		case <-ctx.Done():
 		}
 	}()
@@ -525,7 +521,8 @@ func (s *Session) Run(subs []Subscriber, stop time.Time) (bool, error) {
 		for {
 			select {
 			case <-ticker.C:
-				s.refreshOptionChains()
+				s.loadChains()
+				s.reapDeadOptionLegs()
 			case <-ctx.Done():
 				return
 			}
@@ -662,13 +659,8 @@ func (s *Session) resolveReqID(reqID int64) string {
 		s.optChain.mu.Unlock()
 		return r
 	}
-	if req, ok := s.optChain.chainReqs[reqID]; ok {
-		r := req.chain.symbol + " (opt-chain)"
-		s.optChain.mu.Unlock()
-		return r
-	}
-	if req, ok := s.optChain.conIDReqs[reqID]; ok {
-		r := req.chain.symbol + " (opt-conid)"
+	if key, c, ok := s.chainForReqLocked(reqID); ok {
+		r := fmt.Sprintf("%s (opt-chain %s)", key.symbol, c.stage)
 		s.optChain.mu.Unlock()
 		return r
 	}

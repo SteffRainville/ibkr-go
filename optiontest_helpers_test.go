@@ -4,6 +4,8 @@ import (
 	"time"
 
 	"github.com/scmhub/ibapi"
+
+	"github.com/SteffRainville/ibkr-go/eventbus"
 )
 
 // withOfflineClient installs a real-but-unconnected EClient, so paths that
@@ -61,21 +63,6 @@ func seedLeg(s *Session, key legKey, o legOpts) *optLeg {
 	return leg
 }
 
-// seedSelector adds one selector to the rotation.
-func seedSelector(s *Session, sel selector) selector {
-	s.optChain.mu.Lock()
-	defer s.optChain.mu.Unlock()
-	s.optChain.rotation = append(s.optChain.rotation, sel)
-	return sel
-}
-
-// legCount returns how many contracts are subscribed.
-func legCount(s *Session) int {
-	s.optChain.mu.Lock()
-	defer s.optChain.mu.Unlock()
-	return len(s.optChain.legs)
-}
-
 // legPins returns a leg's pin count.
 func legPins(s *Session, key legKey) (pins int, ok bool) {
 	s.optChain.mu.Lock()
@@ -85,4 +72,20 @@ func legPins(s *Session, key legKey) (pins int, ok bool) {
 		return 0, false
 	}
 	return leg.pins, true
+}
+
+// newResolveEntryTestSession builds a session with one SPY put selector (id 1,
+// busIdx 0, δ 0.65) and its chain loaded for today, so ResolveEntryStrike's
+// early guards pass without a real IB connection.
+func newResolveEntryTestSession(sub Subscriber) *Session {
+	s := NewSession(Options{}, nil, nil)
+	s.buses = []*eventbus.Bus{sub.Bus()}
+	s.optChain.selectors = []selector{
+		{id: 1, symbol: "SPY", right: "put", targetDelta: 0.65, busIdxs: []int{0}},
+	}
+	s.optChain.chains[chainKey{symbol: "SPY"}] = &chain{
+		day: tradingDay(time.Now()), expiry: "20260731",
+		strikes: map[string][]float64{"put": {725, 730, 735, 740, 745}},
+	}
+	return s
 }

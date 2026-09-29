@@ -277,16 +277,12 @@ type Options struct {
 	MaxMarketDataLines      int           // default 100
 	MaxHistoricalStreams    int           // default 50
 
-	// OptionChainRefreshInterval paces the background sweep that keeps each
-	// watched underlying's option-chain SNAPSHOT (expiries + strike ladder)
-	// inside chainSnapshotTTL. One chain per tick, round-robin.
-	//
-	// A chain lookup is conId + ReqSecDefOptParams — it costs no market-data
-	// line, which is why this sweep survived the removal of the background
-	// strike subscriptions it used to accompany. It is load-bearing:
-	// ResolveEntryStrike reads the cached snapshot and never fetches one
-	// itself, so a stalled sweep means entries fall back to an on-demand
-	// lookup. Default 5s.
+	// OptionChainRefreshInterval is the chain loader's tick (chains.go): each
+	// tick starts loading any watched (symbol, option_delay) chain that is not
+	// loaded for today, retries failed ones after a backoff, and times out
+	// requests IB never answered. A chain is loaded once per trading day; ticks
+	// in between cost a map scan. ResolveEntryStrike reads the loaded chain and
+	// never fetches one itself. Default 5s.
 	OptionChainRefreshInterval time.Duration
 
 	Logger                         *log.Logger // default log.Default()

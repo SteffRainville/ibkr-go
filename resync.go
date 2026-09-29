@@ -124,9 +124,9 @@ func (s *Session) subSymbolLists() [][]SymbolSpec {
 //     open positions, not to watchlist rows, and the caller is expected to
 //     refuse to drop a row it still holds a position in. A pinned leg whose
 //     row genuinely departed is released by the normal exit path.
-//   - It does not re-resolve existing option groups. Group IDs survive a
-//     rebuild (see buildOptionGroups), so only genuinely new groups pay for a
-//     conId + chain round trip; the rest stay in the rotation untouched.
+//   - It does not reload existing option chains. The chain loader only fetches
+//     a (symbol, option_delay) chain that is not loaded for today, so an
+//     unrelated edit costs no IB round trip.
 func (s *Session) ResyncSymbols() SymbolDelta {
 	if s.client == nil {
 		return SymbolDelta{}
@@ -231,21 +231,15 @@ func (s *Session) ResyncSymbols() SymbolDelta {
 		s.logger.Printf("Resync: subscribed %s (bars reqID=%d, quotes reqID=%d)", a.spec.Symbol, a.histID, a.mktID)
 	}
 
-	// Rebuild the option selectors from the new symbol lists and resolve only
-	// the ones that did not exist before. Existing selectors keep their stable
-	// id and their place in the rotation, so an unrelated edit cannot trigger a
-	// chain-resolution burst across the whole watchlist.
+	// Rebuild the option selectors from the new symbol lists and load any
+	// chain a new row needs. Existing selectors keep their stable id, and a
+	// chain already loaded for today is not fetched again.
 	//
 	// A departed selector (its row removed, or its target_delta edited) needs
-	// no teardown any more: a selector holds no market-data line, only a
-	// strike-selection recipe, so dropping it from the rotation IS releasing
-	// it. What used to live here — releaseDepartedSelectors, walking selCurrent
-	// and selPending to cancel orphaned background lines — has nothing left to
-	// walk.
-	fresh := s.buildSelectors()
-	for _, sel := range fresh {
-		s.refreshChainFor(sel)
-	}
+	// no teardown: a selector holds no market-data line, only a
+	// strike-selection recipe, so dropping it from the list IS releasing it.
+	s.buildSelectors()
+	s.startChainFetches()
 
 	return delta
 }
@@ -269,12 +263,7 @@ func (s *Session) dropSymbolOptionState(symbol string) {
 		delete(s.optChain.deltaCands, reqID)
 		s.mdLines.Release(reqID)
 	}
-	for key := range s.optChain.lastChainInfo {
-		if key.symbol == symbol {
-			delete(s.optChain.lastChainInfo, key)
-		}
-	}
-	delete(s.optChain.lastIV, symbol)
+	s.dropSymbolChainsLocked(symbol)
 	s.optChain.mu.Unlock()
 
 	s.cancelLines(cands)

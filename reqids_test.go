@@ -23,7 +23,7 @@ func TestReqIDAllocatorNeverRepeats(t *testing.T) {
 
 // TestReqIDAllocatorIsConcurrencySafe pins the mutex. Option probes allocate
 // from the ResolveEntryStrike caller's goroutine while the dead-leg reaper
-// allocates from the rotation ticker, so unsynchronised increments would tear
+// allocates from the chain-loader ticker, so unsynchronised increments would tear
 // under -race and hand out the same id twice.
 func TestReqIDAllocatorIsConcurrencySafe(t *testing.T) {
 	s := NewSession(Options{}, nil, nil)

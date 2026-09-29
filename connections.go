@@ -25,8 +25,8 @@ func (s *Session) ConnectionsSnapshot() ConnectionsStatus {
 	stockRows, optionRows, uniqueUnderlyings := s.configuredRowCounts()
 
 	s.optChain.mu.Lock()
-	selectors := len(s.optChain.rotation)
-	chains := len(s.optChain.lastChainInfo)
+	selectors := len(s.optChain.selectors)
+	chains := s.readyChainsLocked()
 	s.optChain.mu.Unlock()
 
 	return ConnectionsStatus{
