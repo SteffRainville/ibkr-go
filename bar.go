@@ -52,6 +52,7 @@ func (s *Session) HistoricalData(reqId int64, bar *ibapi.Bar) {
 	}
 
 	baseSym := s.histSymbol(reqId)
+	s.barStatus.noteBar(baseSym)
 	date := FormatBarDate(bar.Date)
 	s.logger.Printf("Historical Bar %-5s %s O:%.2f H:%.2f L:%.2f C:%.2f", baseSym, date, bar.Open, bar.High, bar.Low, bar.Close)
 	s.Candles.AddHistorical(baseSym, date, bar.Open, bar.High, bar.Low, bar.Close, bar.Volume.Float(), bar.Wap.Float(), bar.BarCount)
@@ -70,6 +71,9 @@ func (s *Session) HistoricalDataEnd(reqID int64, startDateStr string, endDateStr
 	}
 	s.onDemand.mu.Unlock()
 	if !ok {
+		if sym := s.histSymbol(reqID); sym != "" {
+			s.barStatus.update(sym, func(st *BarStreamStatus) { st.HistoryEnd = time.Now() })
+		}
 		return
 	}
 	s.logger.Printf("OnDemand hist end: reqID=%d start=%s end=%s", reqID, startDateStr, endDateStr)
@@ -102,6 +106,7 @@ func (s *Session) HistoricalDataUpdate(reqId int64, bar *ibapi.Bar) {
 	s.lastBarNano.Store(time.Now().UnixNano())
 
 	baseSym := s.histSymbol(reqId)
+	s.barStatus.noteBar(baseSym)
 	date := FormatBarDate(bar.Date)
 	s.logger.Printf(">>> LIVE      %-5s %s O:%.2f H:%.2f L:%.2f C:%.2f", baseSym, date, bar.Open, bar.High, bar.Low, bar.Close)
 

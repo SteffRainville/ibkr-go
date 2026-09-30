@@ -183,6 +183,9 @@ type Session struct {
 	liveStart   time.Time
 	lastBarNano atomic.Int64
 
+	// barStatus is each trading symbol's bar-stream status (barstatus.go).
+	barStatus barStatusTable
+
 	Candles *candlestore.Store
 
 	// symMu guards every field of the tracked-symbol registry below:
@@ -438,6 +441,7 @@ func (s *Session) Run(subs []Subscriber, stop time.Time) (bool, error) {
 	s.subSymbols = subSymbols
 	s.histReqID = make(map[string]int64, len(deduped))
 	s.streamReqID = make(map[string]int64, len(deduped))
+	s.barStatus.reset()
 	s.mktData.mktDataSymbol = make(map[int64]string, len(deduped))
 	// reqIDs are assigned from the session allocator rather than the loop index
 	// because ResyncSymbols hands out more of them later, after the initial
@@ -469,8 +473,10 @@ func (s *Session) Run(subs []Subscriber, stop time.Time) (bool, error) {
 		if !s.mdLines.GrantHist(p.histID) {
 			_, _, _, histMax, _, _ := s.mdLines.StatusAll()
 			s.logger.Printf("Live bars: %s SKIPPED — over the %d concurrent keepUpToDate stream limit; this symbol will get NO live bars. Trim the watchlist or raise MaxHistoricalStreams.", p.spec.Symbol, histMax)
+			s.barStatus.update(p.spec.Symbol, func(st *BarStreamStatus) { st.Skipped = true })
 			continue
 		}
+		s.barStatus.update(p.spec.Symbol, func(st *BarStreamStatus) { st.Requested = time.Now() })
 		client.ReqHistoricalData(p.histID, p.spec.Contract, "", "1 D", "30 secs", "TRADES", false, 1, true, nil)
 		pacer.pace()
 	}
@@ -696,6 +702,14 @@ func (s *Session) Error(reqID int64, errTime int64, errCode int64, errString str
 		label = "IB Error"
 	}
 	s.logger.Printf("%s: reqID=%d symbol=%s code=%d msg=%s", label, reqID, sym, errCode, errString)
+
+	// A trading symbol's bar stream: keep its latest error for the
+	// "why no bars?" status (barstatus.go).
+	if hs := s.histSymbol(reqID); hs != "" && label == "IB Error" {
+		s.barStatus.update(hs, func(st *BarStreamStatus) {
+			st.ErrCode, st.ErrMsg, st.ErrTime = errCode, errString, time.Now()
+		})
+	}
 
 	// An on-demand option chart stream IB refused (expired contract, no
 	// data permissions, no bars in range, …). IB does not retry it, so

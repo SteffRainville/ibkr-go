@@ -16,6 +16,8 @@
 package ibkr
 
 import (
+	"time"
+
 	"github.com/SteffRainville/ibkr-go/mdlines"
 )
 
@@ -217,12 +219,14 @@ func (s *Session) ResyncSymbols() SymbolDelta {
 
 	for _, a := range additions {
 		if s.mdLines.GrantHist(a.histID) {
+			s.barStatus.update(a.spec.Symbol, func(st *BarStreamStatus) { st.Requested, st.Skipped = time.Now(), false })
 			s.client.ReqHistoricalData(a.histID, a.spec.Contract, "", "1 D", "30 secs", "TRADES", false, 1, true, nil)
 			pacer.pace()
 		} else {
 			_, _, _, histMax, _, _ := s.mdLines.StatusAll()
 			s.logger.Printf("Resync: live bars for %s SKIPPED — over the %d concurrent keepUpToDate stream limit; this symbol will get NO live bars. Trim the watchlist or raise MaxHistoricalStreams.", a.spec.Symbol, histMax)
 			delta.Skipped = append(delta.Skipped, a.spec.Symbol)
+			s.barStatus.update(a.spec.Symbol, func(st *BarStreamStatus) { st.Skipped = true })
 		}
 		s.mdLines.GrantGuaranteed(a.mktID, mdlines.CategoryStock)
 		s.client.ReqMktData(a.mktID, a.spec.Contract, "", false, false, nil)
