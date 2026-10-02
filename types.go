@@ -277,6 +277,18 @@ type Options struct {
 	MaxMarketDataLines      int           // default 100
 	MaxHistoricalStreams    int           // default 50
 
+	// Level II depth sampler (depth.go). DepthSlots is how many depth books
+	// may be open at once — 0 (the default) turns depth off; IB allows about 3
+	// by default. DepthSampleDuration is how long each book is watched before
+	// it is copied out and cancelled (default 3s). DepthWindow, when set,
+	// limits sampling to the times it returns true for.
+	DepthSlots          int
+	DepthSampleDuration time.Duration
+	DepthWindow         func(time.Time) bool
+	// OnDepth is called after each completed sample, including one IB refused
+	// (Err set, no rows). It runs on the sampler goroutine, outside every lock.
+	OnDepth func(DepthSnapshot)
+
 	// OptionChainRefreshInterval is the chain loader's tick (chains.go): each
 	// tick starts loading any watched (symbol, option_delay) chain that is not
 	// loaded for today, retries failed ones after a backoff, and times out

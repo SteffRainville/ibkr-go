@@ -224,6 +224,9 @@ type Session struct {
 
 	mdLines *mdlines.Ledger
 
+	// depth is the Level II sampler's state (depth.go).
+	depth depthTracker
+
 	logger    *log.Logger
 	scanLog   *log.Logger
 	optionLog *log.Logger
@@ -487,6 +490,8 @@ func (s *Session) Run(subs []Subscriber, stop time.Time) (bool, error) {
 		pacer.pace()
 	}
 
+	s.startDepthSampler(ctx)
+
 	s.acctSummaryID = s.nextReqID()
 	client.ReqAccountSummary(s.acctSummaryID, "All", "AccountType,TradingType,AccountCode,AccountAlias,NetLiquidation,TotalCashValue,AvailableFunds,BuyingPower,MaintExcessLiquidity,Leverage,AccountStatusLocked,AccountStatusPendingApproval,Cushion,FullInitMarginReq,FullMaintMarginReq,InitMarginReq,LookAheadAvailableFunds,LookAheadInitMarginReq,SMA")
 	client.ReqPositions()
@@ -702,6 +707,11 @@ func (s *Session) Error(reqID int64, errTime int64, errCode int64, errString str
 		label = "IB Error"
 	}
 	s.logger.Printf("%s: reqID=%d symbol=%s code=%d msg=%s", label, reqID, sym, errCode, errString)
+
+	// A Level II depth sample IB refused: end the sample, nothing else to do.
+	if s.noteDepthError(reqID, errCode, errString) {
+		return
+	}
 
 	// A trading symbol's bar stream: keep its latest error for the
 	// "why no bars?" status (barstatus.go).
