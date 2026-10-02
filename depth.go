@@ -43,11 +43,12 @@ type DepthLevel struct {
 // DepthSnapshot is one completed sample of a symbol's book. Bids are best
 // (highest) first, Asks best (lowest) first.
 type DepthSnapshot struct {
-	Symbol string
-	At     time.Time // when the sample was taken
-	Bids   []DepthLevel
-	Asks   []DepthLevel
-	Err    string // set when IB refused the request (no subscription, limit, …)
+	Symbol  string
+	At      time.Time // when the sample was taken
+	Bids    []DepthLevel
+	Asks    []DepthLevel
+	Err     string // set when IB refused the request (no subscription, limit, …)
+	ErrCode int64  // IB's error code for Err (309 = too many depth books); 0 when Err is empty
 }
 
 // liveBook is a book being filled by UpdateMktDepth callbacks for one request.
@@ -57,6 +58,7 @@ type liveBook struct {
 	bids, asks []DepthLevel
 	gotRows    bool
 	err        string
+	errCode    int64
 	done       chan struct{} // closed on the first IB error so the worker stops waiting
 	doneOnce   sync.Once
 }
@@ -140,7 +142,7 @@ func (s *Session) noteDepthError(reqID int64, errCode int64, errString string) b
 	if errCode >= 2000 && errCode < 10000 {
 		return true
 	}
-	b.err = errString
+	b.err, b.errCode = errString, errCode
 	b.doneOnce.Do(func() { close(b.done) })
 	return true
 }
@@ -257,11 +259,12 @@ func (s *Session) sampleDepth(ctx context.Context, sp SymbolSpec, sample time.Du
 	s.depth.mu.Lock()
 	delete(s.depth.live, reqID)
 	snap := DepthSnapshot{
-		Symbol: sp.Symbol,
-		At:     time.Now(),
-		Bids:   append([]DepthLevel(nil), b.bids...),
-		Asks:   append([]DepthLevel(nil), b.asks...),
-		Err:    b.err,
+		Symbol:  sp.Symbol,
+		At:      time.Now(),
+		Bids:    append([]DepthLevel(nil), b.bids...),
+		Asks:    append([]DepthLevel(nil), b.asks...),
+		Err:     b.err,
+		ErrCode: b.errCode,
 	}
 	// A refused or empty sample must not overwrite a good older one; the
 	// reader sees the older reading's real age instead of a blank.
