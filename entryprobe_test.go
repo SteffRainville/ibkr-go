@@ -266,7 +266,7 @@ func TestResolveDeltaCandidates(t *testing.T) {
 // A candidate IB rejected outright (error 200) will never report, so it must
 // not hold the probe open.
 func TestDeltaCandidatesSettled_RejectedCountsAsReported(t *testing.T) {
-	cands := []*deltaCandidate{{ready: true, delta: 0.44}, {ready: true, delta: 0.31}, {rejected: true}}
+	cands := []*deltaCandidate{{ready: true, bid: 1, ask: 1.1, delta: 0.44}, {ready: true, bid: 1, ask: 1.1, delta: 0.31}, {rejected: true}}
 	if !deltaCandidatesSettled(cands, 0.40) {
 		t.Fatal("a rejected candidate kept the probe waiting out its full timeout")
 	}

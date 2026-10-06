@@ -935,11 +935,17 @@ func (s *Session) selectorForLocked(symbol, right string, busIdx int) (selector,
 	return selector{}, false
 }
 
+// quoted reports a two-sided price. The Greeks tick (which sets ready) and the
+// bid/ask ticks arrive independently and the Greeks routinely come first, so
+// "ready" alone must not end the probe: it used to, and the winner was then read
+// before its price landed (2026-10-05 META call, option_delta_no_price).
+func (c *deltaCandidate) quoted() bool { return c.bid > 0 && c.ask > 0 }
+
 // deltaCandidatesSettled is ResolveEntryStrike's poll-loop exit condition:
-// true once EITHER every candidate has reported OR one already-ready
-// candidate is within deltaGoodEnoughTolerance of targetDelta. A candidate IB
-// rejected outright counts as reported — it never will. Caller must hold
-// s.optChain.mu.
+// true once EITHER every candidate has reported (Greeks AND a two-sided price)
+// OR one already-reported candidate is within deltaGoodEnoughTolerance of
+// targetDelta. A candidate IB rejected outright counts as reported — it never
+// will. Caller must hold s.optChain.mu.
 func deltaCandidatesSettled(candidates []*deltaCandidate, targetDelta float64) bool {
 	const deltaGoodEnoughTolerance = 0.02
 	allReady := true
@@ -947,7 +953,7 @@ func deltaCandidatesSettled(candidates []*deltaCandidate, targetDelta float64) b
 		if c.rejected {
 			continue
 		}
-		if !c.ready {
+		if !c.ready || !c.quoted() {
 			allReady = false
 			continue
 		}

@@ -184,11 +184,16 @@ func (s *Session) resolveDeltaCandidates(sel selector, cands []*deltaCandidate) 
 	s.optChain.mu.Lock()
 	var best *deltaCandidate
 	bestDist := math.MaxFloat64
+	// A priced candidate beats a closer-on-delta one with no price: the entry
+	// needs a real quote, and the unpriced one can only fail. Delta decides
+	// within each class; an unpriced winner is still returned when nothing is
+	// priced, so the failure keeps its option_delta_no_price classification.
 	for _, c := range cands {
 		if !c.ready {
 			continue
 		}
-		if dist := math.Abs(math.Abs(c.delta) - sel.targetDelta); dist < bestDist {
+		dist := math.Abs(math.Abs(c.delta) - sel.targetDelta)
+		if best == nil || (c.quoted() && !best.quoted()) || (c.quoted() == best.quoted() && dist < bestDist) {
 			bestDist, best = dist, c
 		}
 	}

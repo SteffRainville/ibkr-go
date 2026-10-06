@@ -11,7 +11,7 @@ import "testing"
 
 func TestDeltaCandidatesSettled_GoodEnoughMatchShortCircuits(t *testing.T) {
 	candidates := []*deltaCandidate{
-		{strike: 480, ready: true, delta: 0.651}, // within tolerance of target 0.65
+		{strike: 480, ready: true, bid: 1, ask: 1.1, delta: 0.651}, // within tolerance of target 0.65
 		{strike: 475, ready: false},               // never answered
 		{strike: 470, ready: false},               // never answered
 	}
@@ -22,7 +22,7 @@ func TestDeltaCandidatesSettled_GoodEnoughMatchShortCircuits(t *testing.T) {
 
 func TestDeltaCandidatesSettled_NoGoodMatchWaitsForAll(t *testing.T) {
 	candidates := []*deltaCandidate{
-		{strike: 480, ready: true, delta: 0.80}, // far from target, not good enough
+		{strike: 480, ready: true, bid: 1, ask: 1.1, delta: 0.80}, // far from target, not good enough
 		{strike: 475, ready: false},
 	}
 	if deltaCandidatesSettled(candidates, 0.65) {
@@ -35,8 +35,8 @@ func TestDeltaCandidatesSettled_AllReadyNoneCloseStillSettles(t *testing.T) {
 	// timeout-free "everyone answered" path must still terminate the loop so
 	// resolveDeltaCandidates can pick the closest of what's available.
 	candidates := []*deltaCandidate{
-		{strike: 480, ready: true, delta: 0.80},
-		{strike: 475, ready: true, delta: 0.85},
+		{strike: 480, ready: true, bid: 1, ask: 1.1, delta: 0.80},
+		{strike: 475, ready: true, bid: 1, ask: 1.1, delta: 0.85},
 	}
 	if !deltaCandidatesSettled(candidates, 0.65) {
 		t.Error("expected settled=true — every candidate has reported, even though none is a good match")
@@ -54,10 +54,19 @@ func TestDeltaCandidatesSettled_ToleranceIsOnAbsoluteDelta(t *testing.T) {
 	// against targetDelta (which is always stored positive), matching
 	// resolveDeltaCandidates' own distance calculation.
 	candidates := []*deltaCandidate{
-		{strike: 480, ready: true, delta: -0.651},
+		{strike: 480, ready: true, bid: 1, ask: 1.1, delta: -0.651},
 		{strike: 475, ready: false},
 	}
 	if !deltaCandidatesSettled(candidates, 0.65) {
 		t.Error("expected settled=true — a negative (put) delta near -targetDelta must still count as a good match")
+	}
+}
+
+func TestDeltaCandidatesSettled_GreeksWithoutPriceKeepsWaiting(t *testing.T) {
+	// The Greeks tick lands before bid/ask; a perfect delta with no price yet
+	// must not end the probe (2026-10-05 META call).
+	candidates := []*deltaCandidate{{strike: 742.5, ready: true, delta: 0.65}}
+	if deltaCandidatesSettled(candidates, 0.65) {
+		t.Error("expected settled=false — the matched candidate has no two-sided price yet")
 	}
 }
