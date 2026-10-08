@@ -240,6 +240,19 @@ type ConnectionsStatus struct {
 	CachedChains    int
 
 	ChainRefreshIntervalSeconds int
+
+	// RecordingLines are the lowest-priority persistent lines (closed contracts
+	// kept streaming for the quote recorder); already inside Used.
+	RecordingLines int
+
+	// The IB requests the line ledger does not govern. DepthUsed is the Level II
+	// books open this instant (DepthMax = the worker count, depth_slots);
+	// AdHocStreams the chart pages' option-bar streams. EstTotal adds them to
+	// Used and HistUsed — an upper-bound estimate of what TWS's own "instruments
+	// requested" count shows, for comparing the two.
+	DepthUsed, DepthMax int
+	AdHocStreams        int
+	EstTotal            int
 }
 
 // ErrorEvent is a session-level error notification — connection drops,

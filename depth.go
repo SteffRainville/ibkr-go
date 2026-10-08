@@ -20,7 +20,8 @@ import (
 // symbol is what DepthSnapshot returns, stamped with its age — readers
 // decide when it is too old to trust. Depth never touches the quote Book or
 // the mdlines ledger: the cap is the worker count, and a worker always cancels
-// its own request, so the number of live books can never exceed it.
+// its own request, so the number of live books can never exceed it. Its usage
+// is reported separately by DepthStatus (ConnectionsStatus.DepthUsed).
 //
 // IB has no historical depth, so nothing can be backfilled: a reading exists
 // only for a sample taken while the process was running.
@@ -145,6 +146,15 @@ func (s *Session) noteDepthError(reqID int64, errCode int64, errString string) b
 	b.err, b.errCode = errString, errCode
 	b.doneOnce.Do(func() { close(b.done) })
 	return true
+}
+
+// DepthStatus reports the depth books open right now and the worker count that
+// caps them (Options.DepthSlots). Depth is outside the mdlines ledger, so this
+// is the only place its usage is visible.
+func (s *Session) DepthStatus() (open, slots int) {
+	s.depth.mu.Lock()
+	defer s.depth.mu.Unlock()
+	return len(s.depth.live), s.opts.DepthSlots
 }
 
 // DepthSnapshot returns the latest completed sample for symbol.

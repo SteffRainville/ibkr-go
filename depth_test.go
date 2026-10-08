@@ -38,3 +38,16 @@ func TestDepthApplyIgnoresCancelledRequest(t *testing.T) {
 		t.Fatalf("book: %+v", b)
 	}
 }
+
+func TestDepthStatusCountsOpenBooks(t *testing.T) {
+	s := &Session{}
+	s.opts.DepthSlots = 2
+	s.depth.init()
+	if open, slots := s.DepthStatus(); open != 0 || slots != 2 {
+		t.Fatalf("idle: open=%d slots=%d", open, slots)
+	}
+	s.depth.live[7] = &liveBook{symbol: "AAA"}
+	if open, _ := s.DepthStatus(); open != 1 {
+		t.Fatalf("one in flight: open=%d", open)
+	}
+}

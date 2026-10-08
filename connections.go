@@ -29,7 +29,18 @@ func (s *Session) ConnectionsSnapshot() ConnectionsStatus {
 	chains := s.readyChainsLocked()
 	s.optChain.mu.Unlock()
 
+	depthUsed, depthMax := s.DepthStatus()
+	s.onDemand.mu.Lock()
+	adHoc := len(s.onDemand.streams)
+	s.onDemand.mu.Unlock()
+
 	return ConnectionsStatus{
+		RecordingLines: s.mdLines.RecordingCount(),
+		DepthUsed:      depthUsed,
+		DepthMax:       depthMax,
+		AdHocStreams:   adHoc,
+		EstTotal:       used + depthUsed + adHoc, // bar streams share their stock's line (measured against TWS)
+
 		Used:     used,
 		Max:      max,
 		HistUsed: histUsed,
