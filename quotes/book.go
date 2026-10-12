@@ -318,6 +318,22 @@ func (b *Book) SetStockAsk(symbol string, ask float64) {
 
 // ── Option write path (ibclient) ──────────────────────────────────────────────
 
+// ForgetOption drops everything held for one option contract: its quote and its
+// window extremes. The writer calls it when the last line streaming the contract
+// ends. Without it the quote survives, frozen, for the life of the process —
+// and when the contract is next subscribed the Book briefly serves the OLD bid,
+// ask and last beside the first fresh tick. On 2026-10-12 a MU 990 call whose
+// recording line was evicted at 09:46 (bid 8.40) was re-pinned at 10:14 for a
+// position entered at 3.86: for a few ticks the position read +118%, the
+// dashboard's day peak latched +$12.9k, and the P&L-goal entry gate fired.
+// Idempotent; a contract that was never quoted is a no-op.
+func (b *Book) ForgetOption(key ContractKey) {
+	b.mu.Lock()
+	delete(b.opts, key)
+	delete(b.optExt, key)
+	b.mu.Unlock()
+}
+
 // SetOptionBid records a bid tick for one contract. BidTime advances only on change.
 func (b *Book) SetOptionBid(key ContractKey, bid float64) {
 	if bid <= 0 {

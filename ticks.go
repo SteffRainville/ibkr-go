@@ -222,8 +222,8 @@ func (s *Session) TickOptionComputation(reqID int64, tickType int64, tickAttrib 
 			QuoteSeq: leg.quoteSeq,
 		}
 		pinned := leg.pins > 0
+		s.bookOption(od) // under the lock: see handleOptionTick
 		s.optChain.mu.Unlock()
-		s.bookOption(od)
 		if pinned {
 			s.publish(eventbus.Event{Kind: eventbus.KindPositionOptionData, Payload: od})
 		}

@@ -732,7 +732,22 @@ func (s *Session) releaseLegIfUnheldLocked(leg *optLeg) int64 {
 	delete(s.optChain.forcedResub, leg.key())
 	delete(s.optChain.dupRepairs, leg.key())
 	s.mdLines.Release(leg.reqID)
+	s.forgetBookQuote(leg)
 	return leg.reqID
+}
+
+// forgetBookQuote clears the contract's quote from the shared Book once its
+// line is gone. A contract nobody streams has no live quote: leaving the last
+// one in the Book (the pre-2026-10-12 behaviour) re-serves it, arbitrarily old,
+// beside the first fresh tick of the next subscription. Book.mu is a leaf, so
+// this is safe under optChain.mu.
+func (s *Session) forgetBookQuote(leg *optLeg) {
+	if s.book == nil {
+		return
+	}
+	s.book.ForgetOption(quotes.ContractKey{
+		Symbol: leg.symbol, Right: leg.right, Strike: leg.strike, Expiry: leg.expiry,
+	})
 }
 
 // legCategory is a leg's market-data priority: guaranteed while any open
@@ -980,6 +995,8 @@ func (s *Session) forgetLegLocked(leg *optLeg) {
 	delete(s.optChain.legByReqID, leg.reqID)
 	delete(s.optChain.forcedResub, key)
 	delete(s.optChain.dupRepairs, key)
+	// A leg gone at IB has no live quote: see forgetBookQuote.
+	s.forgetBookQuote(leg)
 }
 
 // handleOptionMktError handles error 200 against a chain request, an entry
@@ -1101,9 +1118,13 @@ func (s *Session) handleOptionTick(reqID int64, tickType int64, price float64) b
 			QuoteSeq: leg.quoteSeq,
 		}
 		pinned := leg.pins > 0
+		// Booked BEFORE the registry lock is released: release/eviction clears
+		// the contract's Book quote under this same lock, so a tick that built
+		// its snapshot from a leg a moment before it was dropped can no longer
+		// write the dropped leg's quote back after the clear. Book.mu is a leaf.
+		s.bookOption(od)
 		s.optChain.mu.Unlock()
 
-		s.bookOption(od)
 		// Only KindPositionOptionData is published. Its sibling KindOptionData
 		// carried a watchlist row's display contract to the dashboard; there is
 		// no such contract any more, so a leg reaching here is always an open
@@ -1318,7 +1339,7 @@ func (s *Session) evictRecordingLines(reqIDs []int64) {
 		}
 		s.optionLog.Printf("Option: EVICTED recording line %s %s strike=%.2f expiry=%s (reqID=%d) — a higher-priority line needed it",
 			leg.symbol, leg.right, leg.strike, leg.expiry, id)
-		s.forgetLegLocked(leg)
+		s.forgetLegLocked(leg) // also clears the contract's Book quote
 		cancel = append(cancel, id)
 	}
 	s.optChain.mu.Unlock()

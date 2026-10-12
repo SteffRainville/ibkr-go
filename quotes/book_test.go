@@ -339,3 +339,39 @@ func TestConcurrentAccess(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestForgetOptionDropsQuoteAndExtremes(t *testing.T) {
+	b := NewBook()
+	b.TrackExtremes(5 * time.Second)
+	key := ContractKey{Symbol: "MU", Right: "call", Strike: 990, Expiry: "20261012"}
+	other := ContractKey{Symbol: "MU", Right: "call", Strike: 985, Expiry: "20261012"}
+	b.SetOptionBid(key, 8.40)
+	b.SetOptionAsk(key, 8.55)
+	b.SetOptionLast(key, 8.48)
+	b.SetOptionBid(other, 9.10)
+
+	b.ForgetOption(key)
+
+	if _, ok := b.Option(key); ok {
+		t.Fatal("quote survived ForgetOption")
+	}
+	if _, ok := b.Option(other); !ok {
+		t.Fatal("ForgetOption removed a different contract")
+	}
+	// the next subscription starts from nothing: a fresh bid must not appear
+	// beside the old ask/last, nor inherit the old window extremes
+	b.SetOptionBid(key, 3.75)
+	q, _ := b.Option(key)
+	if q.Ask != 0 || q.Last != 0 {
+		t.Errorf("fresh bid sits beside stale ask/last: %+v", q)
+	}
+	ex, ok := b.OptionExtremes(key, time.Now().Truncate(5*time.Second))
+	if !ok {
+		t.Fatal("no extremes after a fresh tick")
+	}
+	if ex.BidHigh != 3.75 || ex.AskHigh != 0 || ex.LastHigh != 0 {
+		t.Errorf("extremes carried the pre-forget quote: %+v", ex)
+	}
+
+	b.ForgetOption(ContractKey{Symbol: "NOPE"}) // never quoted: no-op, no panic
+}
