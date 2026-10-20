@@ -42,6 +42,13 @@ func (s *Session) RunScanner(ctx context.Context, params ScanParams) ([]ScanResu
 
 	select {
 	case results := <-done:
+		s.scanner.mu.Lock()
+		err := s.scanner.errs[reqID]
+		delete(s.scanner.errs, reqID)
+		s.scanner.mu.Unlock()
+		if err != nil {
+			return nil, err
+		}
 		s.scanLog.Printf("scan done reqID=%d results=%d", reqID, len(results))
 		return results, nil
 	case <-ctx.Done():
@@ -51,6 +58,11 @@ func (s *Session) RunScanner(ctx context.Context, params ScanParams) ([]ScanResu
 		s.scanner.mu.Lock()
 		snapIDs := s.scanner.snapReqIDs[reqID]
 		cdIDs := s.scanner.cdReqIDs[reqID]
+		// The scan found its rows but some enrichment never answered: keep what
+		// arrived rather than discard 30 rows for want of a few quotes.
+		partial := append([]ScanResult(nil), s.scanner.enriched[reqID]...)
+		s.scanLog.Printf("scan timed out reqID=%d rows=%d snapshotsOutstanding=%d detailsOutstanding=%d",
+			reqID, len(partial), s.scanner.snapCount[reqID], s.scanner.cdCount[reqID])
 		for _, snapID := range snapIDs {
 			delete(s.scanner.snapData, snapID)
 		}
@@ -69,6 +81,9 @@ func (s *Session) RunScanner(ctx context.Context, params ScanParams) ([]ScanResu
 		for _, snapID := range snapIDs {
 			s.mdLines.Release(snapID)
 			s.client.CancelMktData(snapID)
+		}
+		if len(partial) > 0 {
+			return partial, nil
 		}
 		return nil, ctx.Err()
 	}

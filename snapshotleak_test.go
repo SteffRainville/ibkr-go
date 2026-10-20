@@ -1,6 +1,7 @@
 package ibkr
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/scmhub/ibapi"
@@ -121,4 +122,51 @@ func TestCancelAllSubscriptions_NotConnectedNoPanic(t *testing.T) {
 
 	// Must not panic against a not-connected client.
 	s.cancelAllSubscriptions()
+}
+
+// An error on the scan request itself (no permission, unsupported scan code)
+// must end the scan with that error rather than leave RunScanner waiting out
+// its whole timeout.
+func TestError_ScanRefusedByIBResolvesWithError(t *testing.T) {
+	s := benignClientSession()
+
+	const reqID = int64(4001)
+	done := make(chan []ScanResult, 1)
+	s.scanner.pending[reqID] = done
+	s.scanner.results = map[int64][]ScanResult{reqID: nil}
+
+	s.Error(reqID, 0, 162, "Scanner type with code X is not supported", "")
+
+	select {
+	case <-done:
+	default:
+		t.Fatal("scan not resolved after IB refused it")
+	}
+	if err := s.scanner.errs[reqID]; err == nil || !strings.Contains(err.Error(), "162") {
+		t.Errorf("recorded error = %v, want one naming code 162", err)
+	}
+	if _, ok := s.scanner.pending[reqID]; ok {
+		t.Error("pending entry not cleaned up")
+	}
+}
+
+// IB echoes ScannerDataEnd's own cancel as code 162 while enrichment is still
+// running; that must not abort a scan whose rows have already arrived.
+func TestError_ScanCancelEchoAfterDataEndIsIgnored(t *testing.T) {
+	s := benignClientSession()
+
+	const reqID = int64(4101)
+	done := make(chan []ScanResult, 1)
+	s.scanner.pending[reqID] = done // results[reqID] is gone: ScannerDataEnd ran
+
+	s.Error(reqID, 0, 162, "API scanner subscription cancelled: 4101", "")
+
+	select {
+	case <-done:
+		t.Error("the cancel echo ended a scan that is still enriching")
+	default:
+	}
+	if _, ok := s.scanner.pending[reqID]; !ok {
+		t.Error("pending entry removed by the cancel echo")
+	}
 }

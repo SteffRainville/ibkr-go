@@ -151,6 +151,7 @@ type scanTracker struct {
 	results    map[int64][]ScanResult
 	enriched   map[int64][]ScanResult
 	pending    map[int64]chan []ScanResult
+	errs       map[int64]error // IB refused the scan itself; read by RunScanner after pending fires
 	snapData   map[int64]*scanSnapEntry
 	snapCount  map[int64]int
 	snapReqIDs map[int64][]int64
@@ -310,6 +311,7 @@ func NewSession(opts Options, book *quotes.Book, cs *candlestore.Store) *Session
 			results:    make(map[int64][]ScanResult),
 			enriched:   make(map[int64][]ScanResult),
 			pending:    make(map[int64]chan []ScanResult),
+			errs:       make(map[int64]error),
 			snapData:   make(map[int64]*scanSnapEntry),
 			snapCount:  make(map[int64]int),
 			snapReqIDs: make(map[int64][]int64),
@@ -831,6 +833,29 @@ func (s *Session) Error(reqID int64, errTime int64, errCode int64, errString str
 	}
 
 	s.scanner.mu.Lock()
+	// IB refused the scan request itself (no permission, unsupported scan code,
+	// …). Without this the caller waited out its whole timeout and the page
+	// could say nothing about why. Only before the rows arrive: ScannerDataEnd
+	// cancels the subscription, and IB echoes that as code 162 "API scanner
+	// subscription cancelled" while the enrichment is still running — that
+	// echo is not a refusal (Crackwooderror.log, 2026-10-19).
+	_, awaitingRows := s.scanner.results[reqID]
+	if ch, ok := s.scanner.pending[reqID]; ok && awaitingRows && (errCode < 2000 || errCode >= 10000) {
+		if s.scanner.errs == nil {
+			s.scanner.errs = make(map[int64]error)
+		}
+		s.scanner.errs[reqID] = fmt.Errorf("IB scanner error %d: %s", errCode, errString)
+		delete(s.scanner.pending, reqID)
+		delete(s.scanner.results, reqID)
+		s.scanner.mu.Unlock()
+		s.scanLog.Printf("scan refused reqID=%d code=%d msg=%s", reqID, errCode, errString)
+		s.client.CancelScannerSubscription(reqID)
+		select {
+		case ch <- nil:
+		default:
+		}
+		return
+	}
 	if snap, ok := s.scanner.snapData[reqID]; ok {
 		parentReqID := snap.parentReqID
 		s.mdLines.Release(reqID)
