@@ -242,3 +242,82 @@ func TestChainLoader_DropsUnneededAndResetsOnReconnect(t *testing.T) {
 		t.Fatal("chain kept after its last selector left")
 	}
 }
+
+func TestChainHealth_StallDeclaredOnlyAfterTimeoutsAndSilence(t *testing.T) {
+	var h chainHealth
+	t0 := time.Date(2026, 10, 21, 8, 30, 0, 0, time.Local)
+
+	h.progress(t0, false)
+	if ev := h.timedOut(t0.Add(30 * time.Second)); ev != nil {
+		t.Fatalf("1 timeout raised %q", ev.Message)
+	}
+	h.timedOut(t0.Add(60 * time.Second))
+	if ev := h.timedOut(t0.Add(90 * time.Second)); ev != nil {
+		t.Fatalf("3 timeouts inside %s of silence raised %q", chainStallAfter, ev.Message)
+	}
+	ev := h.timedOut(t0.Add(150 * time.Second))
+	if ev == nil || ev.Type != errTypeOptionData {
+		t.Fatalf("stall not declared after %d timeouts and %s silence: %+v", h.timeouts, chainStallAfter, ev)
+	}
+	if h.stalledSince != t0 {
+		t.Errorf("stalledSince = %v, want last answered stage %v", h.stalledSince, t0)
+	}
+	if again := h.timedOut(t0.Add(160 * time.Second)); again != nil {
+		t.Errorf("re-raised inside %s: %q", chainStallRealert, again.Message)
+	}
+	if again := h.timedOut(t0.Add(150*time.Second + chainStallRealert)); again == nil {
+		t.Error("no re-alert after chainStallRealert")
+	}
+}
+
+func TestChainHealth_ProgressResetsAndAllClearNeedsReadyChain(t *testing.T) {
+	var h chainHealth
+	t0 := time.Date(2026, 10, 21, 8, 30, 0, 0, time.Local)
+	h.progress(t0, false)
+	for i := 1; i <= 6; i++ {
+		h.timedOut(t0.Add(time.Duration(i) * 30 * time.Second))
+	}
+	if h.stalledSince.IsZero() {
+		t.Fatal("stall not declared")
+	}
+
+	if ev := h.progress(t0.Add(4*time.Minute), false); ev != nil {
+		t.Errorf("an answered intermediate stage cleared the stall: %q", ev.Message)
+	}
+	if h.timeouts != 0 {
+		t.Errorf("timeouts = %d after progress, want 0", h.timeouts)
+	}
+	if ev := h.progress(t0.Add(5*time.Minute), true); ev == nil || ev.Type != errTypeOptionDataOK {
+		t.Fatalf("no all-clear when a chain became ready: %+v", ev)
+	}
+	if !h.stalledSince.IsZero() {
+		t.Error("stall still declared after all-clear")
+	}
+}
+
+func TestChainHealth_NeverAnsweredSinceConnectStillDeclares(t *testing.T) {
+	var h chainHealth
+	t0 := time.Date(2026, 10, 21, 8, 30, 0, 0, time.Local)
+	var ev *ErrorEvent
+	for i := 0; i < 8 && ev == nil; i++ {
+		ev = h.timedOut(t0.Add(time.Duration(i) * 30 * time.Second))
+	}
+	if ev == nil {
+		t.Fatal("a loader that has never been answered never raised a stall")
+	}
+}
+
+func TestChainHealth_BackoffWidensAndCapsFetches(t *testing.T) {
+	var h chainHealth
+	if h.backoff() != chainRetryBackoff || h.fetchCap() != maxChainFetches {
+		t.Fatalf("healthy: backoff %s cap %d", h.backoff(), h.fetchCap())
+	}
+	h.timeouts = 4
+	if h.backoff() != 2*chainRetryBackoff || h.fetchCap() != chainStallFetches {
+		t.Errorf("4 timeouts: backoff %s cap %d", h.backoff(), h.fetchCap())
+	}
+	h.timeouts = 8
+	if h.backoff() != 4*chainRetryBackoff {
+		t.Errorf("8 timeouts: backoff %s", h.backoff())
+	}
+}

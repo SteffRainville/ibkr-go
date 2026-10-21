@@ -88,7 +88,101 @@ const (
 	// maxChainFetches caps concurrent chain fetches, so connecting with a long
 	// watchlist does not fire every lookup in the same instant.
 	maxChainFetches = 4
+
+	// A loader that gets nothing back is not a slow loader: IB answers
+	// secdef requests one at a time per connection, and an abandoned request
+	// cannot be cancelled, so every retry queues behind the ones before it.
+	// chainStallTimeouts consecutive timeouts with no answered stage for
+	// chainStallAfter declare the loader stalled (see chainHealth).
+	chainStallTimeouts = 3
+	chainStallAfter    = 2 * time.Minute
+	// chainStallRealert spaces the repeats of the stall warning.
+	chainStallRealert = 5 * time.Minute
+	// chainStallFetches caps concurrent fetches once any have timed out, so
+	// retries stop deepening IB's queue.
+	chainStallFetches = 2
 )
+
+// errTypeOptionData is the ErrorEvent.Type of the option-data stall warning
+// (and of the all-clear that follows it).
+const errTypeOptionData = "option_data"
+
+// errTypeOptionDataOK is the all-clear that ends a declared stall.
+const errTypeOptionDataOK = "option_data_ok"
+
+// chainHealth tracks whether IB is answering the chain loader at all — the
+// difference between "this symbol has no chain" and "no option data is coming".
+// Guarded by optionChainTracker.mu.
+//
+// Born of 2026-10-21: a Gateway session stopped answering ReqSecDefOptParams
+// at 08:29 and 1,905 requests went unanswered over the next three hours. Every
+// option entry failed as option_no_chain, which on the Failed Buy Attempts page
+// looked like a per-row problem rather than a dead feed. Restarting Gateway
+// fixed it.
+type chainHealth struct {
+	lastOK       time.Time // last answered stage this connection
+	timeouts     int       // consecutive stage timeouts since lastOK
+	stalledSince time.Time // zero = healthy
+	lastAlert    time.Time
+}
+
+// backoff is the retry spacing for a failed chain: widening while IB is silent.
+func (h *chainHealth) backoff() time.Duration {
+	switch {
+	case h.timeouts >= 8:
+		return 4 * chainRetryBackoff
+	case h.timeouts >= 4:
+		return 2 * chainRetryBackoff
+	}
+	return chainRetryBackoff
+}
+
+// fetchCap is how many fetches may be in flight.
+func (h *chainHealth) fetchCap() int {
+	if h.timeouts > 0 {
+		return chainStallFetches
+	}
+	return maxChainFetches
+}
+
+// progress records an answered stage. If a stall had been declared and a chain
+// just became ready, it returns the all-clear event.
+func (h *chainHealth) progress(now time.Time, ready bool) *ErrorEvent {
+	h.lastOK, h.timeouts = now, 0
+	if ready && !h.stalledSince.IsZero() {
+		down := now.Sub(h.stalledSince).Round(time.Second)
+		h.stalledSince, h.lastAlert = time.Time{}, time.Time{}
+		return &ErrorEvent{Type: errTypeOptionDataOK, Message: fmt.Sprintf(
+			"Option data is flowing again after %s — option chains are loading.", down)}
+	}
+	return nil
+}
+
+// timedOut records one unanswered stage and returns the stall warning when it
+// is due: on declaration, then every chainStallRealert.
+func (h *chainHealth) timedOut(now time.Time) *ErrorEvent {
+	if h.lastOK.IsZero() {
+		h.lastOK = now.Add(-chainStageTimeout) // the stage that just expired began then
+	}
+	h.timeouts++
+	if h.timeouts < chainStallTimeouts || now.Sub(h.lastOK) < chainStallAfter {
+		return nil
+	}
+	if h.stalledSince.IsZero() {
+		h.stalledSince = h.lastOK
+	} else if now.Sub(h.lastAlert) < chainStallRealert {
+		return nil
+	}
+	h.lastAlert = now
+	return &ErrorEvent{Type: errTypeOptionData, Message: h.describe()}
+}
+
+// describe is the stall warning's text; also the Detail of option_no_chain.
+func (h *chainHealth) describe() string {
+	return fmt.Sprintf("NO OPTION DATA FROM IB since %s — %d chain requests unanswered. "+
+		"Option entries are BLOCKED (option_no_chain). Restart IB Gateway/TWS, then ORBtrader.",
+		h.stalledSince.Format("15:04"), h.timeouts)
+}
 
 func tradingDay(t time.Time) string { return t.Format("20060102") }
 
@@ -141,7 +235,7 @@ func (s *Session) startChainFetches() {
 		case c.stage != stageIdle:
 			inFlight++
 		case c.readyOn(today):
-		case !c.failedAt.IsZero() && now.Sub(c.failedAt) < chainRetryBackoff:
+		case !c.failedAt.IsZero() && now.Sub(c.failedAt) < s.optChain.health.backoff():
 		default:
 			keys = append(keys, key)
 		}
@@ -153,7 +247,7 @@ func (s *Session) startChainFetches() {
 		return keys[i].optionDelay < keys[j].optionDelay
 	})
 	for _, key := range keys {
-		if inFlight >= maxChainFetches {
+		if inFlight >= s.optChain.health.fetchCap() {
 			break
 		}
 		inFlight++
@@ -219,6 +313,7 @@ func (s *Session) chainForReqLocked(reqID int64) (chainKey, *chain, bool) {
 func (s *Session) expireChainFetches() {
 	now := time.Now()
 	var stuck []string
+	var alert *ErrorEvent
 	s.optChain.mu.Lock()
 	for key, c := range s.optChain.chains {
 		if c.stage == stageIdle || now.Sub(c.startedAt) < chainStageTimeout {
@@ -226,11 +321,16 @@ func (s *Session) expireChainFetches() {
 		}
 		stuck = append(stuck, fmt.Sprintf("%s delay=%d (%s, reqID=%d)", key.symbol, key.optionDelay, c.stage, c.reqID))
 		s.failChainLocked(c)
+		if ev := s.optChain.health.timedOut(now); ev != nil {
+			alert = ev
+		}
 	}
+	retry := s.optChain.health.backoff()
 	s.optChain.mu.Unlock()
 	for _, d := range stuck {
-		s.optionLog.Printf("Option chain: WARNING %s — IB never answered within %s; retrying in %s", d, chainStageTimeout, chainRetryBackoff)
+		s.optionLog.Printf("Option chain: WARNING %s — IB never answered within %s; retrying in %s", d, chainStageTimeout, retry)
 	}
+	s.emitChainHealth(alert)
 }
 
 // resetChainFetches forgets every in-flight fetch without penalty — for a new
@@ -239,6 +339,9 @@ func (s *Session) expireChainFetches() {
 func (s *Session) resetChainFetches() {
 	s.optChain.mu.Lock()
 	defer s.optChain.mu.Unlock()
+	// The new connection's silence is judged afresh; a declared stall stays
+	// declared until a chain actually loads.
+	s.optChain.health.lastOK, s.optChain.health.timeouts = time.Time{}, 0
 	for _, c := range s.optChain.chains {
 		if c.stage != stageIdle {
 			delete(s.optChain.chainByReq, c.reqID)
@@ -308,6 +411,7 @@ func (s *Session) handleChainContractDetailsEnd(reqID int64) bool {
 			s.optionLog.Printf("Option chain: %s — IB returned no conId; retrying in %s", key.symbol, chainRetryBackoff)
 			return true
 		}
+		s.optChain.health.progress(time.Now(), false)
 		paramsID := s.beginChainStageLocked(key, c, stageParams, time.Now())
 		s.optChain.mu.Unlock()
 		s.optionLog.Printf("Option chain: %s delay=%d — conId=%d, requesting chain params (reqID=%d)", key.symbol, key.optionDelay, conID, paramsID)
@@ -336,7 +440,9 @@ func (s *Session) handleChainContractDetailsEnd(reqID int64) bool {
 		c.stage, c.reqID, c.failedAt = stageIdle, 0, time.Time{}
 		c.classes, c.class, c.listed = nil, nil, nil
 		expiry := c.expiry
+		allClear := s.optChain.health.progress(time.Now(), true)
 		s.optChain.mu.Unlock()
+		s.emitChainHealth(allClear)
 		s.optionLog.Printf("Option chain listed: %s delay=%d expiry=%s — calls=%d puts=%d strikes",
 			key.symbol, key.optionDelay, expiry, len(strikes["call"]), len(strikes["put"]))
 		s.startChainFetches()
@@ -401,6 +507,7 @@ func (s *Session) SecurityDefinitionOptionParameterEnd(reqID int64) {
 		return
 	}
 	c.expiry, c.class, c.classes, c.listed = expiry, chosen, nil, nil
+	s.optChain.health.progress(time.Now(), false)
 	listID := s.beginChainStageLocked(key, c, stageListing, time.Now())
 	currency := c.currency
 	s.optChain.mu.Unlock()
@@ -476,4 +583,26 @@ func (s *Session) chainStrikesLocked(sel selector) (expiry string, strikes []flo
 	}
 	strikes = c.strikes[sel.right]
 	return c.expiry, slices.Clone(strikes), len(strikes) > 0
+}
+
+// emitChainHealth hands a stall warning or all-clear to the host. ev may be
+// nil. Call without s.optChain.mu held.
+func (s *Session) emitChainHealth(ev *ErrorEvent) {
+	if ev == nil {
+		return
+	}
+	s.logger.Printf("Option chain loader: %s", ev.Message)
+	s.optionLog.Printf("Option chain: %s", ev.Message)
+	if s.opts.OnError != nil {
+		s.opts.OnError(*ev)
+	}
+}
+
+// chainStallDetailLocked is the stall warning for option_no_chain's Detail, or
+// "" when the loader is healthy. Caller holds s.optChain.mu.
+func (s *Session) chainStallDetailLocked() string {
+	if s.optChain.health.stalledSince.IsZero() {
+		return ""
+	}
+	return s.optChain.health.describe()
 }

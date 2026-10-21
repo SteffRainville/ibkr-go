@@ -467,6 +467,7 @@ type optionChainTracker struct {
 	chains     map[chainKey]*chain
 	chainByReq map[int64]chainKey
 	conIDs     map[string]int64
+	health     chainHealth
 
 	// legs is the one registry of subscribed option contracts, background and
 	// position-pinned alike, keyed by contract and refcounted across holders.

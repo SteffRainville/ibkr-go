@@ -91,9 +91,12 @@ func (s *Session) ResolveEntryStrike(sub Subscriber, symbol, right string, timeo
 	}
 	expiry, strikes, ready := s.chainStrikesLocked(sel)
 	if !ready {
+		detail := fmt.Sprintf("option chain for %s (delay %d) is not loaded for today yet", symbol, sel.optionDelay)
+		if stall := s.chainStallDetailLocked(); stall != "" {
+			detail = stall
+		}
 		s.optChain.mu.Unlock()
-		return OptionQuote{}, EntryStrikeResult{Reason: entryFailNoChain,
-			Detail: fmt.Sprintf("option chain for %s (delay %d) is not loaded for today yet", symbol, sel.optionDelay)}
+		return OptionQuote{}, EntryStrikeResult{Reason: entryFailNoChain, Detail: detail}
 	}
 
 	call := &probeCall{done: make(chan struct{}), deadline: now.Add(timeout)}
