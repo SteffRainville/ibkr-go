@@ -3,6 +3,7 @@ package ibkr
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/scmhub/ibapi"
 )
@@ -130,28 +131,57 @@ func (s *Session) Position(account string, contract *ibapi.Contract, position ib
 
 	if !done {
 		if posQty == 0 {
+			// A held leg closing mid-replay: the replay may already have listed
+			// it, so drop it from the staged snapshot and let PositionEnd confirm
+			// the close against what IB reports (otherwise the swap keeps it).
+			s.pos.posMapMu.Lock()
+			prev, held := s.pos.posMap[key]
+			if s.pos.accum != nil {
+				if p, ok := s.pos.accum[key]; ok {
+					prev, held = p, held || p.Position != 0
+					delete(s.pos.accum, key)
+				}
+			}
+			if held && prev.Position != 0 {
+				s.pos.pendingClose[legIdentity(info)] = info
+			}
+			s.pos.posMapMu.Unlock()
 			return
 		}
+		// A refresh replay is staged in accum and swapped into posMap at
+		// PositionEnd, so Positions() — the naked-short gate's only truth — is
+		// never a half-rebuilt map. A non-zero push still lands in posMap at
+		// once: a fill during the replay window must be sellable immediately.
 		s.pos.posMapMu.Lock()
+		if s.pos.accum != nil {
+			s.pos.accum[key] = info
+		}
 		s.pos.posMap[key] = info
 		s.pos.posMapMu.Unlock()
 		return
 	}
 
 	if posQty == 0 {
-		// A real-time qty=0 is NOT acted on immediately: IB can send a
-		// transient or erroneous zero for a position that is still
+		// IB keeps echoing every contract flat today as pos=0. A zero for a leg
+		// this session does not hold is that echo — nothing to confirm. Acting
+		// on it re-requested positions, whose replay carried the same echo: a
+		// loop that ran twice a second from 09:50 to the close on 2026-10-23.
+		s.pos.posMapMu.Lock()
+		prev, held := s.pos.posMap[key]
+		s.pos.posMapMu.Unlock()
+		if !held || prev.Position == 0 {
+			return
+		}
+		// A real-time qty=0 for a held leg is NOT acted on immediately: IB can
+		// send a transient or erroneous zero for a position that is still
 		// genuinely held. Record the leg and confirm it against a fresh
 		// COMPLETE snapshot in PositionEnd.
 		legKey := legIdentity(info)
 		s.pos.posMapMu.Lock()
 		s.pos.pendingClose[legKey] = info
-		accumulating := !s.pos.initialDone
 		s.pos.posMapMu.Unlock()
 		s.logger.Printf("Position: qty=0 for %s — deferring close pending snapshot confirmation", legKey)
-		if !accumulating {
-			s.refreshPositions()
-		}
+		s.refreshPositions()
 		return
 	}
 
@@ -192,15 +222,28 @@ func partitionPendingCloses(pending map[string]PositionInfo, snapshot []Position
 	return confirmed, stillHeld
 }
 
-// PositionEnd is called when the initial batch of Position() callbacks is complete.
-func (s *Session) PositionEnd() {
+// commitPositionSnapshot ends a replay: the staged snapshot (if a refresh
+// staged one) becomes posMap, and the result is returned as the complete
+// snapshot.
+func (s *Session) commitPositionSnapshot() map[string]PositionInfo {
 	s.pos.posMapMu.Lock()
+	defer s.pos.posMapMu.Unlock()
+	if s.pos.accum != nil {
+		s.pos.posMap = s.pos.accum
+		s.pos.accum = nil
+	}
 	snapshot := make(map[string]PositionInfo, len(s.pos.posMap))
 	for k, v := range s.pos.posMap {
 		snapshot[k] = v
 	}
 	s.pos.initialDone = true
-	s.pos.posMapMu.Unlock()
+	s.pos.refreshing = false
+	return snapshot
+}
+
+// PositionEnd is called when the initial batch of Position() callbacks is complete.
+func (s *Session) PositionEnd() {
+	snapshot := s.commitPositionSnapshot()
 
 	s.logger.Printf("PositionEnd: %d positions received", len(snapshot))
 	s.client.ReqMarketDataType(int64(ibapi.DELAYED_FROZEN))
@@ -214,7 +257,7 @@ func (s *Session) PositionEnd() {
 			s.logger.Printf("Skipping snapshot for %s (SecType=%q)", p.Symbol, p.SecType)
 			continue
 		}
-		if !seen[p.Symbol] {
+		if !seen[p.Symbol] && s.stockSnapshotDue(p.Symbol) {
 			seen[p.Symbol] = true
 			reqID := s.nextReqID()
 			s.mktData.snapReqSymbol[reqID] = p.Symbol
@@ -261,17 +304,77 @@ func (s *Session) PositionEnd() {
 			}
 		}
 	}
+
+	s.pos.posMapMu.Lock()
+	again := s.pos.refreshAgain
+	s.pos.refreshAgain = false
+	s.pos.posMapMu.Unlock()
+	if again {
+		s.refreshPositions()
+	}
 }
 
-// refreshPositions resets the position accumulator and re-subscribes to IB
-// positions. Used as a safety-net periodic sync and on-demand refresh.
-func (s *Session) refreshPositions() {
-	s.logger.Println("Refreshing positions from IB")
+// posRefreshStaleAfter is how long a refresh may wait for its PositionEnd
+// before another is allowed; it only guards against a lost PositionEnd.
+const posRefreshStaleAfter = 10 * time.Second
+
+// stockSnapshotMinInterval spaces the price snapshot a PositionEnd requests for
+// each held stock. Every snapshot occupies a market-data line until it ends.
+const stockSnapshotMinInterval = time.Minute
+
+// stockSnapshotDue reports whether symbol may be snapshotted now, and records
+// the request if so.
+func (s *Session) stockSnapshotDue(symbol string) bool {
 	s.pos.posMapMu.Lock()
-	s.pos.posMap = make(map[string]PositionInfo)
+	defer s.pos.posMapMu.Unlock()
+	if s.pos.snapAt == nil {
+		s.pos.snapAt = make(map[string]time.Time)
+	}
+	if at, ok := s.pos.snapAt[symbol]; ok && time.Since(at) < stockSnapshotMinInterval {
+		return false
+	}
+	s.pos.snapAt[symbol] = time.Now()
+	return true
+}
+
+// refreshPositions re-requests IB's positions. The replay is staged
+// (posMap keeps serving the naked-short gate until PositionEnd swaps the
+// complete snapshot in) and single-flight: a refresh already waiting for its
+// PositionEnd is not stacked with another. The previous subscription is
+// cancelled first so replays never multiply. Used as a safety-net periodic
+// sync, to confirm a deferred close and on demand.
+func (s *Session) refreshPositions() {
+	s.pos.posMapMu.Lock()
+	if s.pos.refreshing && time.Since(s.pos.refreshStart) < posRefreshStaleAfter {
+		// The replay in flight may predate what triggered this call; run once
+		// more when it ends so a deferred close is still confirmed.
+		s.pos.refreshAgain = true
+		s.pos.posMapMu.Unlock()
+		return
+	}
+	s.pos.refreshing = true
+	s.pos.refreshStart = time.Now()
+	s.pos.accum = make(map[string]PositionInfo)
 	s.pos.initialDone = false
 	s.pos.posMapMu.Unlock()
+
+	s.logger.Println("Refreshing positions from IB")
+	if s.client == nil {
+		return
+	}
+	s.client.CancelPositions()
 	s.client.ReqPositions()
+}
+
+// requestPositionsAfterConnect starts the position subscription on a fresh
+// connection, discarding any replay staged on the previous one.
+func (s *Session) requestPositionsAfterConnect() {
+	s.pos.posMapMu.Lock()
+	s.pos.refreshing = false
+	s.pos.refreshAgain = false
+	s.pos.accum = nil
+	s.pos.posMapMu.Unlock()
+	s.refreshPositions()
 }
 
 // RefreshPositions triggers an on-demand IB position re-sync (e.g. from a

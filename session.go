@@ -110,6 +110,15 @@ type posTracker struct {
 	posMap       map[string]PositionInfo
 	initialDone  bool
 	pendingClose map[string]PositionInfo
+
+	// accum stages a refresh replay until PositionEnd swaps it into posMap;
+	// refreshing/refreshStart make a refresh single-flight; snapAt spaces the
+	// per-stock price snapshots a PositionEnd requests.
+	accum        map[string]PositionInfo
+	refreshing   bool
+	refreshAgain bool
+	refreshStart time.Time
+	snapAt       map[string]time.Time
 }
 
 // errTracker debounces error notifications so the caller sees each error
@@ -496,7 +505,7 @@ func (s *Session) Run(subs []Subscriber, stop time.Time) (bool, error) {
 
 	s.acctSummaryID = s.nextReqID()
 	client.ReqAccountSummary(s.acctSummaryID, "All", "AccountType,TradingType,AccountCode,AccountAlias,NetLiquidation,TotalCashValue,AvailableFunds,BuyingPower,MaintExcessLiquidity,Leverage,AccountStatusLocked,AccountStatusPendingApproval,Cushion,FullInitMarginReq,FullMaintMarginReq,InitMarginReq,LookAheadAvailableFunds,LookAheadInitMarginReq,SMA")
-	client.ReqPositions()
+	s.requestPositionsAfterConnect()
 
 	go func() {
 		select {
