@@ -215,6 +215,10 @@ type Session struct {
 	tradingAccount string
 	accountsReady  chan []string
 
+	// currentTime receives each CurrentTime reply — the write barrier
+	// teardown waits on before disconnecting (shutdown.go).
+	currentTime chan struct{}
+
 	// reqIDs is the one allocator for every IB request id — see reqids.go.
 	// acctSummaryID is the id of the current connection's account-summary
 	// subscription, drawn from it at connect time; it used to be a fixed
@@ -294,6 +298,7 @@ func NewSession(opts Options, book *quotes.Book, cs *candlestore.Store) *Session
 		reqIDs:         reqIDAllocator{next: reqIDFirst},
 		tradingAccount: opts.TradingAccount,
 		accountsReady:  make(chan []string, 1),
+		currentTime:    make(chan struct{}, 1),
 
 		mktData: marketData{
 			snapReqSymbol: make(map[int64]string),
@@ -567,8 +572,7 @@ func (s *Session) Run(subs []Subscriber, stop time.Time) (bool, error) {
 				if s.opts.OnStall != nil {
 					s.opts.OnStall()
 				}
-				s.cancelAllSubscriptions()
-				client.Disconnect()
+				s.teardown(teardownTimeout)
 				return
 			case <-ctx.Done():
 				return
@@ -581,14 +585,15 @@ func (s *Session) Run(subs []Subscriber, stop time.Time) (bool, error) {
 		return false, nil
 	case <-time.After(time.Until(stop)):
 		s.logger.Println("Stop time reached, shutting down")
-		s.cancelAllSubscriptions()
-		client.Disconnect()
+		s.teardown(teardownTimeout)
 		return true, nil
 	}
 }
 
-// cancelAllSubscriptions issues a broker cancel for every market-data line
-// and keepUpToDate historical-bar stream this session opened.
+// cancelAllSubscriptions issues a broker cancel for every standing request this
+// session opened: market-data lines and keepUpToDate historical-bar streams
+// (the mdlines ledger), the Level II books being sampled, the account summary
+// and the position subscription. Only queues the cancels — see teardown.
 func (s *Session) cancelAllSubscriptions() {
 	lineIDs := s.mdLines.AllReqIDs()
 	histIDs := s.mdLines.AllHistReqIDs()
@@ -598,9 +603,21 @@ func (s *Session) cancelAllSubscriptions() {
 	for _, reqID := range histIDs {
 		s.client.CancelHistoricalData(reqID)
 	}
-	if n := len(lineIDs) + len(histIDs); n > 0 {
-		s.logger.Printf("Teardown: cancelled %d market-data line(s) and %d historical stream(s)", len(lineIDs), len(histIDs))
+	s.depth.mu.Lock()
+	depthIDs := make([]int64, 0, len(s.depth.live))
+	for reqID := range s.depth.live {
+		depthIDs = append(depthIDs, reqID)
 	}
+	s.depth.mu.Unlock()
+	for _, reqID := range depthIDs {
+		s.client.CancelMktDepth(reqID, true)
+	}
+	if s.acctSummaryID != 0 {
+		s.client.CancelAccountSummary(s.acctSummaryID)
+	}
+	s.client.CancelPositions()
+	s.logger.Printf("Teardown: cancelled %d market-data line(s), %d historical stream(s), %d depth book(s), account summary and positions",
+		len(lineIDs), len(histIDs), len(depthIDs))
 }
 
 // publish fans evt out to all subscriber buses.
