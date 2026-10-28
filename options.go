@@ -468,6 +468,13 @@ type optionChainTracker struct {
 	chainByReq map[int64]chainKey
 	conIDs     map[string]int64
 	health     chainHealth
+	// waiting holds the chains an entry was refused for (option_no_chain);
+	// the loader starts them before the rest.
+	waiting map[chainKey]bool
+	loading chainLoading
+	// cacheMu serializes chain-cache writes (chaincache.go). Taken before mu,
+	// never while holding it.
+	cacheMu sync.Mutex
 
 	// legs is the one registry of subscribed option contracts, background and
 	// position-pinned alike, keyed by contract and refcounted across holders.

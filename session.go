@@ -337,6 +337,7 @@ func NewSession(opts Options, book *quotes.Book, cs *candlestore.Store) *Session
 			chains:      make(map[chainKey]*chain),
 			chainByReq:  make(map[int64]chainKey),
 			conIDs:      make(map[string]int64),
+			waiting:     make(map[chainKey]bool),
 			legs:        make(map[legKey]*optLeg),
 			legByReqID:  make(map[int64]legKey),
 			deltaCands:  make(map[int64]*deltaCandidate),
@@ -363,6 +364,7 @@ func NewSession(opts Options, book *quotes.Book, cs *candlestore.Store) *Session
 		acctLog:   writerLogger(opts.AccountLog),
 	}
 	s.mdLines.SetOnEvict(s.evictRecordingLines)
+	s.restoreChainCache()
 	return s
 }
 

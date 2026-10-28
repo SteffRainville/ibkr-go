@@ -110,6 +110,13 @@ const errTypeOptionData = "option_data"
 // errTypeOptionDataOK is the all-clear that ends a declared stall.
 const errTypeOptionDataOK = "option_data_ok"
 
+// errTypeOptionChainsLoading is the ErrorEvent.Type of "chains not loaded for
+// today yet" (chainLoadingLocked); errTypeOptionChainsLoaded ends it.
+const (
+	errTypeOptionChainsLoading = "option_chains_loading"
+	errTypeOptionChainsLoaded  = "option_chains_loaded"
+)
+
 // chainHealth tracks whether IB is answering the chain loader at all — the
 // difference between "this symbol has no chain" and "no option data is coming".
 // Guarded by optionChainTracker.mu.
@@ -191,6 +198,61 @@ func tradingDay(t time.Time) string { return t.Format("20060102") }
 func (s *Session) loadChains() {
 	s.expireChainFetches()
 	s.startChainFetches()
+	s.optChain.mu.Lock()
+	ev := s.chainLoadingLocked(time.Now())
+	s.optChain.mu.Unlock()
+	s.emitChainHealth(ev)
+}
+
+// chainLoading tracks the "chains still loading" warning. Guarded by
+// optionChainTracker.mu.
+//
+// A loader that is merely behind fails entries exactly like a dead one
+// (option_no_chain), and on 2026-10-28 it did so for three minutes after a
+// mid-session restart with nothing on screen saying why.
+type chainLoading struct {
+	announced bool
+	lastAlert time.Time
+}
+
+// chainLoadingRealert spaces the repeats of the loading warning, each with the
+// current count.
+const chainLoadingRealert = 30 * time.Second
+
+// chainLoadingLocked returns the loading warning while some chain a selector
+// needs is not ready for today (repeated every chainLoadingRealert), and the
+// all-clear once every one is, if the warning was raised. A declared stall
+// speaks for the loader instead. Caller holds s.optChain.mu.
+func (s *Session) chainLoadingLocked(now time.Time) *ErrorEvent {
+	needed := make(map[chainKey]bool)
+	for _, sel := range s.optChain.selectors {
+		needed[sel.chainKey()] = true
+	}
+	today := tradingDay(now)
+	ready := 0
+	for key := range needed {
+		if c := s.optChain.chains[key]; c != nil && c.readyOn(today) {
+			ready++
+		}
+	}
+	l := &s.optChain.loading
+	switch {
+	case ready == len(needed):
+		if !l.announced {
+			return nil
+		}
+		l.announced, l.lastAlert = false, time.Time{}
+		return &ErrorEvent{Type: errTypeOptionChainsLoaded, Message: fmt.Sprintf(
+			"Option chains loaded: %d of %d ready — option entries are no longer blocked.", ready, len(needed))}
+	case !s.optChain.health.stalledSince.IsZero():
+		return nil
+	case l.announced && now.Sub(l.lastAlert) < chainLoadingRealert:
+		return nil
+	}
+	l.announced, l.lastAlert = true, now
+	return &ErrorEvent{Type: errTypeOptionChainsLoading, Message: fmt.Sprintf(
+		"Option chains loading: %d of %d ready — option entries on the other %d are skipped (option_no_chain) until they load.",
+		ready, len(needed), len(needed)-ready)}
 }
 
 // startChainFetches begins a fetch for every chain some selector needs that is
@@ -221,6 +283,7 @@ func (s *Session) startChainFetches() {
 		if _, ok := needed[key]; !ok {
 			delete(s.optChain.chainByReq, c.reqID)
 			delete(s.optChain.chains, key)
+			delete(s.optChain.waiting, key)
 		}
 	}
 	keys := make([]chainKey, 0, len(needed))
@@ -240,7 +303,13 @@ func (s *Session) startChainFetches() {
 			keys = append(keys, key)
 		}
 	}
+	// A chain an entry is already waiting for goes first: after a start
+	// mid-session the alphabetical order left MU's entries refused for three
+	// minutes while AAPL..MSTR loaded ahead of it.
 	sort.Slice(keys, func(i, j int) bool {
+		if wi, wj := s.optChain.waiting[keys[i]], s.optChain.waiting[keys[j]]; wi != wj {
+			return wi
+		}
 		if keys[i].symbol != keys[j].symbol {
 			return keys[i].symbol < keys[j].symbol
 		}
@@ -439,12 +508,14 @@ func (s *Session) handleChainContractDetailsEnd(reqID int64) bool {
 		c.day, c.strikes = tradingDay(time.Now()), strikes
 		c.stage, c.reqID, c.failedAt = stageIdle, 0, time.Time{}
 		c.classes, c.class, c.listed = nil, nil, nil
+		delete(s.optChain.waiting, key)
 		expiry := c.expiry
 		allClear := s.optChain.health.progress(time.Now(), true)
 		s.optChain.mu.Unlock()
 		s.emitChainHealth(allClear)
 		s.optionLog.Printf("Option chain listed: %s delay=%d expiry=%s — calls=%d puts=%d strikes",
 			key.symbol, key.optionDelay, expiry, len(strikes["call"]), len(strikes["put"]))
+		s.saveChainCache()
 		s.startChainFetches()
 		return true
 	}
@@ -569,6 +640,7 @@ func (s *Session) dropSymbolChainsLocked(symbol string) {
 		if key.symbol == symbol {
 			delete(s.optChain.chainByReq, c.reqID)
 			delete(s.optChain.chains, key)
+			delete(s.optChain.waiting, key)
 		}
 	}
 }

@@ -91,6 +91,7 @@ func (s *Session) ResolveEntryStrike(sub Subscriber, symbol, right string, timeo
 	}
 	expiry, strikes, ready := s.chainStrikesLocked(sel)
 	if !ready {
+		s.optChain.waiting[sel.chainKey()] = true
 		detail := fmt.Sprintf("option chain for %s (delay %d) is not loaded for today yet", symbol, sel.optionDelay)
 		if stall := s.chainStallDetailLocked(); stall != "" {
 			detail = stall

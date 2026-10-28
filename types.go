@@ -310,6 +310,11 @@ type Options struct {
 	// never fetches one itself. Default 5s.
 	OptionChainRefreshInterval time.Duration
 
+	// ChainCachePath is a file the loader keeps today's chains in
+	// (chaincache.go), so a session started mid-day has them at once instead
+	// of re-listing every expiry from IB. "" = no cache.
+	ChainCachePath string
+
 	Logger                         *log.Logger // default log.Default()
 	ScanLog, OptionLog, AccountLog io.Writer   // default io.Discard
 

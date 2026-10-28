@@ -4,6 +4,9 @@
 package ibkr
 
 import (
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"slices"
 	"testing"
 	"time"
@@ -319,5 +322,91 @@ func TestChainHealth_BackoffWidensAndCapsFetches(t *testing.T) {
 	h.timeouts = 8
 	if h.backoff() != 4*chainRetryBackoff {
 		t.Errorf("8 timeouts: backoff %s", h.backoff())
+	}
+}
+
+// A restart the same day restores the chains from the cache and sends IB
+// nothing for them (2026-10-28: a 09:43 restart re-listed 40 chains for 3 min).
+func TestChainCache_RestartSameDayRestoresWithoutFetching(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "option-chains.json")
+	s := withOfflineClient(NewSession(Options{ChainCachePath: path}, nil, nil))
+	s.optChain.selectors = []selector{{id: 1, symbol: "SPY", right: "put", currency: "USD", targetDelta: 0.40}}
+	s.startChainFetches()
+	expiry := playFullFetch(t, s)
+
+	r := withOfflineClient(NewSession(Options{ChainCachePath: path}, nil, nil))
+	r.optChain.selectors = s.optChain.selectors
+	r.startChainFetches()
+	c := chainOf(r, spyKey)
+	if c == nil || !c.readyOn(tradingDay(time.Now())) || c.stage != stageIdle {
+		t.Fatalf("restored chain not ready or fetched again: %+v", c)
+	}
+	r.optChain.mu.Lock()
+	gotExp, strikes, ok := r.chainStrikesLocked(r.optChain.selectors[0])
+	r.optChain.mu.Unlock()
+	if !ok || gotExp != expiry || !slices.Equal(strikes, []float64{730, 735, 740}) {
+		t.Errorf("restored chainStrikesLocked = (%s, %v, %v)", gotExp, strikes, ok)
+	}
+	if r.optChain.conIDs["SPY"] != 756733 {
+		t.Errorf("conId not restored: %v", r.optChain.conIDs)
+	}
+}
+
+// A cache written on another day is not read.
+func TestChainCache_OtherDayIgnored(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "option-chains.json")
+	yesterday := time.Now().AddDate(0, 0, -1).Format("20060102")
+	data, _ := json.Marshal(chainCacheFile{Day: yesterday, Chains: []chainCacheEntry{
+		{Symbol: "SPY", Expiry: tradingDay(time.Now()), Strikes: map[string][]float64{"put": {735}}},
+	}})
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := withOfflineClient(NewSession(Options{ChainCachePath: path}, nil, nil))
+	if c := chainOf(s, spyKey); c != nil {
+		t.Fatalf("yesterday's cache was restored: %+v", c)
+	}
+}
+
+// A chain an entry was refused for is fetched before the alphabetical rest.
+func TestChainLoader_WaitedForChainFirst(t *testing.T) {
+	s := newChainTestSession()
+	s.optChain.selectors = nil
+	for i, sym := range []string{"A", "B", "C", "D", "E", "F"} {
+		s.optChain.selectors = append(s.optChain.selectors, selector{id: i, symbol: sym, right: "call", targetDelta: 0.4})
+	}
+	s.optChain.waiting[chainKey{symbol: "F"}] = true
+	s.startChainFetches()
+	if c := chainOf(s, chainKey{symbol: "F"}); c == nil || c.stage == stageIdle {
+		t.Fatalf("waited-for chain F not among the first %d fetches: %+v", maxChainFetches, c)
+	}
+	if c := chainOf(s, chainKey{symbol: "D"}); c.stage != stageIdle {
+		t.Error("D started although F took one of the slots")
+	}
+}
+
+// While a needed chain is not ready the loader says so; once all are, it
+// sends the all-clear — once.
+func TestChainLoader_LoadingWarningThenAllClear(t *testing.T) {
+	var got []ErrorEvent
+	s := withOfflineClient(NewSession(Options{OnError: func(e ErrorEvent) { got = append(got, e) }}, nil, nil))
+	s.optChain.selectors = []selector{{id: 1, symbol: "SPY", right: "put", currency: "USD", targetDelta: 0.40}}
+
+	s.loadChains()
+	if len(got) != 1 || got[0].Type != errTypeOptionChainsLoading {
+		t.Fatalf("no loading warning while the chain loads: %+v", got)
+	}
+	s.loadChains()
+	if len(got) != 1 {
+		t.Fatalf("warning repeated inside %s: %+v", chainLoadingRealert, got)
+	}
+	playFullFetch(t, s)
+	s.loadChains()
+	if len(got) != 2 || got[1].Type != errTypeOptionChainsLoaded {
+		t.Fatalf("no all-clear once the chain loaded: %+v", got)
+	}
+	s.loadChains()
+	if len(got) != 2 {
+		t.Fatalf("all-clear repeated: %+v", got)
 	}
 }
