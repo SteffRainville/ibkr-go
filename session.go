@@ -71,6 +71,7 @@ type pendingExec struct {
 	price   float64
 	qty     float64
 	ts      time.Time
+	sent    time.Time // when placeOrder sent the order (subRoute.sent)
 	bus     *eventbus.Bus
 }
 
@@ -81,6 +82,7 @@ type subRoute struct {
 	bus     *eventbus.Bus
 	secType string
 	tag     string
+	sent    time.Time // when placeOrder registered the order, just before sending it
 }
 
 // inFlightSellRef records the option contract key and share quantity a

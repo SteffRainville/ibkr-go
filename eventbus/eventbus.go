@@ -99,7 +99,10 @@ type CommissionReport struct {
 	Tag        string
 	Price      float64 // average fill price
 	Qty        float64
-	Ts         time.Time
+	Ts         time.Time // when this execution was reported
+	// OrderSent is when this session sent the order the execution belongs to —
+	// bot or manual alike. Ts − OrderSent is the order's execution delay.
+	OrderSent  time.Time
 	Commission float64
 	Currency   string
 }

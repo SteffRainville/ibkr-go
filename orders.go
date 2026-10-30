@@ -97,7 +97,7 @@ func (s *Session) placeOrder(r placedOrder) (int64, error) {
 	s.orders.nextOrderID++
 	s.orders.orderSymbol[orderID] = contract.Symbol
 	s.orders.orderAction[orderID] = action
-	s.orders.orderRoutes[orderID] = subRoute{bus: r.bus, secType: r.secType, tag: r.tag}
+	s.orders.orderRoutes[orderID] = subRoute{bus: r.bus, secType: r.secType, tag: r.tag, sent: time.Now()}
 	s.orders.orderQty[orderID] = r.qtyShares
 	s.orders.orderFilled[orderID] = 0
 	if r.sellReserveKey != "" {
@@ -334,7 +334,7 @@ func (s *Session) ExecDetails(reqID int64, contract *ibapi.Contract, execution *
 	s.orders.orderMu.Lock()
 	s.orders.pendingExecs[execution.ExecID] = pendingExec{
 		orderID: execution.OrderID, symbol: sym, action: act, tag: route.tag,
-		price: execution.Price, qty: qty, ts: time.Now(), bus: route.bus,
+		price: execution.Price, qty: qty, ts: time.Now(), sent: route.sent, bus: route.bus,
 	}
 	s.orders.orderMu.Unlock()
 
@@ -365,7 +365,7 @@ func (s *Session) CommissionAndFeesReport(report ibapi.CommissionAndFeesReport) 
 			Kind: eventbus.KindCommissionReport,
 			Payload: eventbus.CommissionReport{
 				OrderID: exec.orderID, ExecID: report.ExecID, Symbol: exec.symbol, Action: exec.action,
-				Tag: exec.tag, Price: exec.price, Qty: exec.qty, Ts: exec.ts,
+				Tag: exec.tag, Price: exec.price, Qty: exec.qty, Ts: exec.ts, OrderSent: exec.sent,
 				Commission: report.CommissionAndFees, Currency: report.Currency,
 			},
 		})
