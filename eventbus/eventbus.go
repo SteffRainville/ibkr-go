@@ -102,7 +102,11 @@ type CommissionReport struct {
 	Ts         time.Time // when this execution was reported
 	// OrderSent is when this session sent the order the execution belongs to —
 	// bot or manual alike. Ts − OrderSent is the order's execution delay.
-	OrderSent  time.Time
+	OrderSent time.Time
+	// OrderBid and OrderAsk are the contract's quote at OrderSent; 0 = no quote on
+	// that side. Price against them is what the order gained or gave up in flight.
+	OrderBid   float64
+	OrderAsk   float64
 	Commission float64
 	Currency   string
 }

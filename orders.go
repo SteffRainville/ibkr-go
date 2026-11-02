@@ -8,6 +8,7 @@ import (
 	"github.com/scmhub/ibapi"
 
 	"github.com/SteffRainville/ibkr-go/eventbus"
+	"github.com/SteffRainville/ibkr-go/quotes"
 )
 
 // contractForSymbol returns the IB contract for a tracked symbol, or nil.
@@ -68,6 +69,29 @@ type placedOrder struct {
 	sellReserveKey string
 }
 
+// quoteAtSend returns the bid and ask standing as an order goes out: the Book's,
+// which every tick writes, or for an option whose line has not reached the Book
+// the quote the caller carried on the request. 0 = no quote on that side.
+func (s *Session) quoteAtSend(r placedOrder) (bid, ask float64) {
+	bid, ask = r.optBid, r.optAsk
+	var bookBid, bookAsk float64
+	if r.secType == "OPT" {
+		key := quotes.ContractKey{Symbol: r.contract.Symbol, Right: r.tag, Strike: r.strike, Expiry: r.expiry}
+		if q, ok := s.book.Option(key); ok {
+			bookBid, bookAsk = q.Bid, q.Ask
+		}
+	} else if q, ok := s.book.Stock(r.contract.Symbol); ok {
+		bookBid, bookAsk = q.Bid, q.Ask
+	}
+	if bookBid > 0 {
+		bid = bookBid
+	}
+	if bookAsk > 0 {
+		ask = bookAsk
+	}
+	return bid, ask
+}
+
 // placeOrder submits an order to TWS. Two modes based on time-of-day:
 //
 //   - RTH (09:30–16:00): Adaptive Algo MKT order via SMART routing.
@@ -92,12 +116,14 @@ func (s *Session) placeOrder(r placedOrder) (int64, error) {
 		ibAction = "BUY"
 	}
 
+	bid, ask := s.quoteAtSend(r)
+
 	s.orders.orderMu.Lock()
 	orderID := s.orders.nextOrderID
 	s.orders.nextOrderID++
 	s.orders.orderSymbol[orderID] = contract.Symbol
 	s.orders.orderAction[orderID] = action
-	s.orders.orderRoutes[orderID] = subRoute{bus: r.bus, secType: r.secType, tag: r.tag, sent: time.Now()}
+	s.orders.orderRoutes[orderID] = subRoute{bus: r.bus, secType: r.secType, tag: r.tag, sent: time.Now(), bid: bid, ask: ask}
 	s.orders.orderQty[orderID] = r.qtyShares
 	s.orders.orderFilled[orderID] = 0
 	if r.sellReserveKey != "" {
@@ -334,7 +360,7 @@ func (s *Session) ExecDetails(reqID int64, contract *ibapi.Contract, execution *
 	s.orders.orderMu.Lock()
 	s.orders.pendingExecs[execution.ExecID] = pendingExec{
 		orderID: execution.OrderID, symbol: sym, action: act, tag: route.tag,
-		price: execution.Price, qty: qty, ts: time.Now(), sent: route.sent, bus: route.bus,
+		price: execution.Price, qty: qty, ts: time.Now(), sent: route.sent, bid: route.bid, ask: route.ask, bus: route.bus,
 	}
 	s.orders.orderMu.Unlock()
 
@@ -366,6 +392,7 @@ func (s *Session) CommissionAndFeesReport(report ibapi.CommissionAndFeesReport) 
 			Payload: eventbus.CommissionReport{
 				OrderID: exec.orderID, ExecID: report.ExecID, Symbol: exec.symbol, Action: exec.action,
 				Tag: exec.tag, Price: exec.price, Qty: exec.qty, Ts: exec.ts, OrderSent: exec.sent,
+				OrderBid: exec.bid, OrderAsk: exec.ask,
 				Commission: report.CommissionAndFees, Currency: report.Currency,
 			},
 		})

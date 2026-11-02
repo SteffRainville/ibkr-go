@@ -72,6 +72,8 @@ type pendingExec struct {
 	qty     float64
 	ts      time.Time
 	sent    time.Time // when placeOrder sent the order (subRoute.sent)
+	bid     float64   // the quote standing at that moment (subRoute.bid/ask)
+	ask     float64
 	bus     *eventbus.Bus
 }
 
@@ -83,6 +85,8 @@ type subRoute struct {
 	secType string
 	tag     string
 	sent    time.Time // when placeOrder registered the order, just before sending it
+	bid     float64   // the contract's quote at that moment; 0 = none (see quoteAtSend)
+	ask     float64
 }
 
 // inFlightSellRef records the option contract key and share quantity a
