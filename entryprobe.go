@@ -217,7 +217,7 @@ func (s *Session) resolveDeltaCandidates(sel selector, cands []*deltaCandidate) 
 	// The bid/ask arrived during this bounded probe, so now is an accurate
 	// freshness stamp for them.
 	now := time.Now()
-	q := OptionQuote{Strike: best.strike, Expiry: best.expiry, Bid: best.bid, Ask: best.ask, Delta: best.delta, IV: best.iv, BidTime: now, AskTime: now}
+	q := OptionQuote{Strike: best.strike, Expiry: best.expiry, Bid: best.bid, Ask: best.ask, Last: best.last, Delta: best.delta, IV: best.iv, BidTime: now, AskTime: now}
 	outcome := EntryStrikeResult{OK: true}
 	if !q.Valid() {
 		// A winner on delta with no two-sided price: the contract IS quoting

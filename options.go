@@ -282,6 +282,7 @@ type deltaCandidate struct {
 	iv         float64
 	bid        float64
 	ask        float64
+	last       float64 // today's LAST tick only — never CLOSE; display only (Failed Buy detail)
 	ready      bool
 
 	// errCode/errMsg record an IB error delivered against this candidate's
@@ -1149,6 +1150,10 @@ func (s *Session) handleOptionTick(reqID int64, tickType int64, price float64) b
 			cand.bid = price
 		case ibapi.ASK, ibapi.DELAYED_ASK:
 			cand.ask = price
+		case ibapi.LAST, ibapi.DELAYED_LAST:
+			// CLOSE is deliberately not here: yesterday's close is not a Last
+			// (see the leg path's prevClose above).
+			cand.last = price
 		}
 		s.optChain.mu.Unlock()
 		return true

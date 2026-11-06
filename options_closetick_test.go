@@ -156,3 +156,23 @@ func TestHandleOptionTick_CloseDoesNotDisplayAnEarlierLast(t *testing.T) {
 		t.Errorf("book Last = %.2f, want 5.47", q.Last)
 	}
 }
+
+// TestHandleOptionTick_EntryCandidateKeepsLastNotClose: an entry-probe
+// candidate records today's LAST (shown on a spread Failed Buy row beside the
+// bid/ask) and, like a leg, never takes the prior session's CLOSE as one.
+func TestHandleOptionTick_EntryCandidateKeepsLastNotClose(t *testing.T) {
+	s := NewSession(Options{TradingAccount: "DU12345"}, quotes.NewBook(), nil)
+	cand := &deltaCandidate{symbol: "TSLA", right: "call", strike: 355, expiry: "20260909", reqID: 7701}
+	s.optChain.mu.Lock()
+	s.optChain.deltaCands[7701] = cand
+	s.optChain.mu.Unlock()
+
+	s.handleOptionTick(7701, ibapi.LAST, 5.47)
+	s.handleOptionTick(7701, ibapi.CLOSE, 23.23)
+
+	s.optChain.mu.Lock()
+	defer s.optChain.mu.Unlock()
+	if cand.last != 5.47 {
+		t.Errorf("candidate last = %.2f, want 5.47 (the real print, not the close)", cand.last)
+	}
+}
